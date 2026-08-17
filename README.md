@@ -89,13 +89,13 @@ Messy aliases (`asset_id`, `temp_c`, `vib`, `rul_days`, …) can be mapped in **
 - **Streamlit** — UI
 - **pandas / numpy / scikit-learn** — clean + Isolation Forest + Random Forest
 - **Plotly** — charts
-- **LlamaIndex / Gemini** — optional retrieval + LLM (rule-based fallback always works)
+- **LlamaIndex / Gemini** — retrieval + LLM (rule-based fallback always works)
 
 ---
 
 ## Deploy
 
-Streamlit Community Cloud: repo `predictive-maintenance-analytics`, branch `main`, file `app.py`. See **[DEPLOY.md](DEPLOY.md)**.
+**Render** (not Streamlit Cloud): repo `predictive-maintenance-analytics`, branch `main`, start `bash start.sh`, Python **3.11.9**. See **[DEPLOY.md](DEPLOY.md)**.
 
 ---
 

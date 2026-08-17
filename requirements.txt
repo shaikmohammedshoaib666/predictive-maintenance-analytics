@@ -8,7 +8,7 @@ altair>=5.0.0,<6.0.0
 openpyxl>=3.1.0
 python-dotenv>=1.0.0
 
-# Optional tuning + SQL lab + LlamaIndex insights
+# Labs + LlamaIndex insights (kept on Render; Streamlit Cloud OOMs this stack)
 optuna>=3.0.0
 duckdb>=0.10.0
 # llama-index-core 0.11+ uses PEP 604 unions (Python 3.10+) at import time

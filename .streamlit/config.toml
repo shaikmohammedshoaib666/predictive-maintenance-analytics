@@ -1,4 +1,4 @@
-# Streamlit Community Cloud / production defaults
+# Production defaults (Render / local)
 # https://docs.streamlit.io/develop/concepts/configuration/options
 
 [theme]

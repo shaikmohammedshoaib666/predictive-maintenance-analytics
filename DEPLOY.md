@@ -1,8 +1,8 @@
-# Deploy to GitHub and Streamlit Community Cloud
+# Deploy to GitHub and Render
 
 Remote: `https://github.com/shaikmohammedshoaib666/predictive-maintenance-analytics.git`
 
-Python **3.9+** (this Mac ships 3.9.6). `requirements.txt` pins pandas / numpy / scikit-learn so 3.9 stays installable.
+Local Python **3.9+** (this Mac ships 3.9.6). **Render uses Python 3.11.9** (`render.yaml` + `runtime.txt`). Do **not** deploy this stack to Streamlit Community Cloud — pip OOM-kills there (Python 3.14 + LlamaIndex / Optuna / sklearn).
 
 ---
 
@@ -33,52 +33,77 @@ git push origin main
 
 ---
 
-## Streamlit Community Cloud
+## Render (recommended public host)
 
-1. Sign in at [https://share.streamlit.io](https://share.streamlit.io) with GitHub.
-2. **Create app** → repo **`predictive-maintenance-analytics`** → branch **`main`** → main file **`app.py`**.
-3. **Deploy**.
+Same pattern as Analytics Forge v2. Free instance has enough RAM to `pip install` the full stack (LlamaIndex, Optuna, sklearn, Gemini).
 
-After deploy, your app URL looks like: `https://YOUR-APP-NAME.streamlit.app`
+### New Web Service (dashboard)
 
-### App settings on Streamlit Cloud
+1. Open **https://dashboard.render.com** → **New** → **Web Service**.
+2. Connect GitHub if asked, then select **`shaikmohammedshoaib666/predictive-maintenance-analytics`**.
+3. Set:
+   - **Branch:** `main`
+   - **Runtime:** Python
+   - **Build command:** `pip install -r requirements.txt`
+   - **Start command:** `bash start.sh`
+   - **Instance type:** Free
+4. Environment:
+   - `PYTHON_VERSION` = `3.11.9`
+   - `GEMINI_API_KEY` = your key
+   - `GEMINI_MODEL` = `gemini-3.6-flash`
+5. Create Web Service. Wait 5–15 minutes on the free plan.
 
-- **Python version:** 3.9 or 3.10 (3.9 is supported).
-- **Dependencies:** `requirements.txt` at repo root.
-- **Entrypoint:** `app.py` at repo root.
+### New Blueprint (uses root `render.yaml`)
 
-Optional secrets:
+1. Open **https://dashboard.render.com/blueprints**
+2. **New Blueprint Instance** → connect GitHub if asked
+3. Select repo: **`shaikmohammedshoaib666/predictive-maintenance-analytics`**
+4. **Branch:** `main`
+5. Blueprint path: `render.yaml` (repo root)
+6. Apply / Create — paste **`GEMINI_API_KEY`** when asked (or add later under Environment)
+7. Wait 5–15 minutes on the free plan
 
-```toml
-GEMINI_API_KEY = "..."
-GEMINI_MODEL = "gemini-3.6-flash"
-EMAIL_DEMO_MODE = "true"
-```
+After it is live, the URL looks like: `https://predictive-maintenance-analytics.onrender.com`
+
+Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s.
+
+### Start command
+
+Render scans `$PORT` (default **10000**). Do **not** put `$PORT` in `render.yaml` — YAML does not expand it, so Streamlit binds **8501** and the deploy fails with *Port scan timeout*.
+
+`start.sh` binds `${PORT:-10000}` on `0.0.0.0`. Blueprint `startCommand` is `bash start.sh`.
+
+If the service already exists, set it in the dashboard too:
+
+1. Service → **Settings** → **Build & Deploy** → **Start Command** → `bash start.sh` → Save
+2. **Manual Deploy** → **Deploy latest commit**
+
+Paste-in-UI Gemini keys are session-only on Render — they do not persist. Use **Environment** + Manual Deploy.
 
 ---
 
-## Optional — SMTP secrets (live email instead of demo mode)
+## Optional — SMTP env (live email instead of demo mode)
 
-By default the app saves emails to `output/emails/` (**demo mode**). For real SMTP on Streamlit Cloud:
+By default the app saves emails to `output/emails/` (**demo mode**). For real SMTP on Render:
 
-1. In your app on [share.streamlit.io](https://share.streamlit.io), open **Settings → Secrets**.
-2. Paste (edit values):
+1. Service → **Environment**.
+2. Add (edit values):
 
-```toml
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = "587"
-SMTP_USER = "your@gmail.com"
-SMTP_PASSWORD = "your-app-password"
-SMTP_USE_TLS = "true"
-EMAIL_FROM = "your@gmail.com"
-EMAIL_DEMO_MODE = "false"
-GEMINI_API_KEY = ""
-GEMINI_MODEL = "gemini-3.6-flash"
+```
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your@gmail.com
+SMTP_PASSWORD=your-app-password
+SMTP_USE_TLS=true
+EMAIL_FROM=your@gmail.com
+EMAIL_DEMO_MODE=false
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-3.6-flash
 ```
 
-3. Save and **Reboot app**.
+3. Save and **Manual Deploy**.
 
-`config.py` reads these via Streamlit secrets when the app runs on Community Cloud, and falls back to environment variables locally.
+`config.py` reads Streamlit secrets when present, and falls back to environment variables (Render + local `.env`).
 
 **Local secrets (never commit):** copy to `.streamlit/secrets.toml` (this path is in `.gitignore`).
 
@@ -91,5 +116,6 @@ GEMINI_MODEL = "gemini-3.6-flash"
 | `git: command not found` | `xcode-select --install` |
 | Gemini 404 | Use **Test Gemini**. Default model is `gemini-3.6-flash`; old aliases remap. |
 | RUL looks too confident | Need a real `failure_within_days` label; sample labels are simulated |
-| Streamlit build fails on import | Check logs; ensure `requirements.txt` is at repo root |
-| Email still in demo mode | Set secrets above and `EMAIL_DEMO_MODE = "false"` |
+| Port scan timeout | Start command must be `bash start.sh` (not `streamlit run app.py`) |
+| Build OOM / Python 3.14 | Confirm `PYTHON_VERSION=3.11.9`; do not use Streamlit Cloud for this repo |
+| Email still in demo mode | Set env above and `EMAIL_DEMO_MODE=false` |
