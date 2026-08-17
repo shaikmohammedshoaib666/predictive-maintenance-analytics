@@ -49,7 +49,7 @@ Copy `.env.example` → `.env` and set `GEMINI_API_KEY` if you want Gemini on In
 2. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label.
 3. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
 4. **Charts** — Sensor over time, anomaly flags, risk by asset (readable Plotly hover / margins).
-5. **Insights** — Rule-based actions + LlamaIndex retrieval; optional Gemini. Errors are shown.
+5. **Insights** — Ranked inspect-this-week list (IF score, sensor spike, low RUL), slow-running assets, optional **$/hour** or **$/unit** impact. Ask is scoped to **this upload** (not a general LLM essay). Errors from Gemini / LlamaIndex are shown. Without a key, Ask still answers from the table and tells you to set `GEMINI_API_KEY`.
 
 Optional labs (joins, SQL) sit beside the pipeline. They are not a second Forge.
 

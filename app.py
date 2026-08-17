@@ -18,7 +18,6 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import config
-from src.ai_assistant import MaintenanceAIAssistant
 from src.dashboard_builder import (
     export_dashboard_html,
     get_graph_folder,
@@ -33,14 +32,19 @@ from src.email_report import generate_email_body, send_email
 from src.graphs import GRAPH_TYPES, PRIMARY_CHARTS
 from src.graphs.layout import style_bar_figure
 from src.insights_engine import (
-    InsightIndex,
+    CHAT_SCOPE_CAPTION,
+    NO_KEY_MESSAGE,
     ask_with_index,
+    attach_rul_columns,
+    build_industrial_brief,
     chart_business_insight,
     generate_business_insights,
+    make_insight_index,
     get_gemini_api_key,
     get_gemini_model,
     mask_key,
     persist_session_gemini_key,
+    polish_brief_with_gemini,
     test_gemini_connection,
 )
 from src.ml.anomaly_detector import AnomalyDetector
@@ -97,6 +101,12 @@ def init_session_state():
         "last_gemini_error": "",
         "last_insight_error": "",
         "rul_used_synthetic": False,
+        "cost_per_hour": 0.0,
+        "cost_per_unit": 0.0,
+        "hours_if_stop": 8.0,
+        "asset_ranking": [],
+        "inspect_list": [],
+        "polished_brief": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -586,17 +596,31 @@ def page_ml_predictions():
                     cont = st.session_state.optuna_anomaly.get("best_contamination", cont)
                 detector = AnomalyDetector(contamination=cont)
                 detector.fit(df)
+                scored = detector.annotate(df)
                 st.session_state.anomaly_detector = detector
-                st.session_state.anomaly_summary = detector.summary(df)
+                st.session_state.anomaly_summary = detector.summary(scored)
                 predictor = RULPredictor()
-                predictor.fit(df)
+                predictor.fit(scored)
                 st.session_state.rul_predictor = predictor
                 st.session_state.rul_used_synthetic = bool(predictor.used_synthetic_labels)
-                st.session_state.predictions = predictor.predict_latest_per_machine(df)
-                st.session_state.business_insights = generate_business_insights(
-                    df, st.session_state.predictions, st.session_state.anomaly_summary
+                st.session_state.predictions = predictor.predict_latest_per_machine(scored)
+                scored = attach_rul_columns(scored, st.session_state.predictions)
+                st.session_state.cleaned_df = scored
+                register_table("cleaned", scored)
+                brief = build_industrial_brief(
+                    scored,
+                    st.session_state.predictions,
+                    st.session_state.anomaly_summary,
+                    cost_per_hour=float(st.session_state.get("cost_per_hour") or 0),
+                    cost_per_unit=float(st.session_state.get("cost_per_unit") or 0),
+                    hours_if_stop=float(st.session_state.get("hours_if_stop") or 8),
+                    used_synthetic=bool(predictor.used_synthetic_labels),
                 )
-                st.success("Models trained.")
+                st.session_state.business_insights = brief["insights"]
+                st.session_state.asset_ranking = brief["ranked"]
+                st.session_state.inspect_list = brief["inspect"]
+                st.session_state.insight_index = None
+                st.success("Models trained. Isolation Forest scores and RUL are on the working table.")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -674,42 +698,195 @@ def page_ml_predictions():
         c3.metric("Anomaly Rate", f"{s.get('anomaly_rate_pct', 0)}%")
 
 
+def _refresh_brief(df: pd.DataFrame) -> dict:
+    brief = build_industrial_brief(
+        df,
+        st.session_state.predictions,
+        st.session_state.anomaly_summary,
+        cost_per_hour=float(st.session_state.get("cost_per_hour") or 0),
+        cost_per_unit=float(st.session_state.get("cost_per_unit") or 0),
+        hours_if_stop=float(st.session_state.get("hours_if_stop") or 8),
+        used_synthetic=bool(st.session_state.get("rul_used_synthetic")),
+    )
+    st.session_state.business_insights = brief["insights"]
+    st.session_state.asset_ranking = brief["ranked"]
+    st.session_state.inspect_list = brief["inspect"]
+    return brief
+
+
+def render_ask_panel(df: pd.DataFrame | None) -> None:
+    st.subheader("Ask this upload")
+    st.caption(CHAT_SCOPE_CAPTION)
+    if df is None:
+        st.warning("Upload and clean a sensor table first. Chat only answers from this upload.")
+        return
+    if not get_gemini_api_key():
+        st.info(NO_KEY_MESSAGE + " Table-grounded answers still run from the scored rows.")
+    if st.session_state.get("last_gemini_error"):
+        _show_gemini_error(st.session_state.last_gemini_error)
+    if st.session_state.get("last_insight_error"):
+        st.caption(f"Retrieval: {st.session_state.last_insight_error}")
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if prompt := st.chat_input("Ask about an asset, inspect list, or $ at risk on this upload…"):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        idx = st.session_state.insight_index
+        if idx is None:
+            idx, meta = make_insight_index(
+                df,
+                st.session_state.predictions,
+                ranked=st.session_state.get("asset_ranking"),
+                inspect=st.session_state.get("inspect_list"),
+            )
+            st.session_state.insight_index = idx
+            if meta.get("error"):
+                st.session_state.last_insight_error = str(meta["error"])
+        result = ask_with_index(
+            prompt,
+            df,
+            idx,
+            st.session_state.predictions,
+            ranked=st.session_state.get("asset_ranking"),
+            inspect=st.session_state.get("inspect_list"),
+        )
+        if result.get("key_missing"):
+            st.session_state.last_gemini_error = ""
+        if result.get("gemini_error"):
+            st.session_state.last_gemini_error = result["gemini_error"]
+        if result.get("index_error"):
+            st.session_state.last_insight_error = result["index_error"]
+        response = result["answer"]
+        if result.get("key_missing"):
+            response = f"{NO_KEY_MESSAGE}\n\n**From this upload:**\n{result.get('offline_answer') or response}"
+        elif result.get("gemini_error"):
+            response = (
+                f"{result['gemini_error']}\n\n**From this upload (offline):**\n"
+                f"{result.get('offline_answer') or response}"
+            )
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+        st.rerun()
+
+    if st.session_state.chat_history and st.button("Clear Ask"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+
 # ── Business Insights ─────────────────────────────────────────────────────────
 def page_business_insights():
     st.markdown('<p class="main-header">5. Insights</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Rule-based maintenance actions, plus LlamaIndex retrieval and optional Gemini.</p>',
+        '<p class="sub-header">Inspect list, slow-running assets, and $ at risk from this table — not generic advice.</p>',
         unsafe_allow_html=True,
     )
     st.caption(config.RUL_HONESTY_CAPTION)
     df = get_active_df()
     if df is None:
-        st.warning("Clean data + run Anomaly & RUL first for best insights.")
+        st.warning("Clean data + run Anomaly & RUL first for a ranked inspect list.")
         return
 
-    if st.button("Refresh insights", type="primary"):
-        st.session_state.business_insights = generate_business_insights(
-            df, st.session_state.predictions, st.session_state.anomaly_summary
+    st.subheader("Optional $ rates")
+    st.caption(
+        "Dollar figures use only the rates you enter. Default 8 h is an assumed stop — not a booked outage."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.session_state.cost_per_hour = st.number_input(
+            "$ / hour downtime",
+            min_value=0.0,
+            value=float(st.session_state.get("cost_per_hour") or 0),
+            step=50.0,
         )
-        idx = InsightIndex()
-        meta = idx.build(df)
+    with c2:
+        st.session_state.cost_per_unit = st.number_input(
+            "$ / unit lost production",
+            min_value=0.0,
+            value=float(st.session_state.get("cost_per_unit") or 0),
+            step=1.0,
+        )
+    with c3:
+        st.session_state.hours_if_stop = st.number_input(
+            "Hours if a high-risk asset stops",
+            min_value=0.0,
+            value=float(st.session_state.get("hours_if_stop") or 8),
+            step=1.0,
+        )
+
+    b1, b2 = st.columns(2)
+    refresh = b1.button("Refresh brief", type="primary")
+    polish = b2.button("Gemini polish (wording only)")
+    brief = _refresh_brief(df)
+    if refresh or st.session_state.insight_index is None:
+        idx, meta = make_insight_index(
+            df,
+            st.session_state.predictions,
+            ranked=brief["ranked"],
+            inspect=brief["inspect"],
+        )
         st.session_state.insight_index = idx
-        st.caption(f"LlamaIndex mode: {meta.get('mode')} ({meta.get('n_docs')} docs)")
+        st.caption(f"Retrieval mode: {meta.get('mode')} ({meta.get('n_docs')} docs)")
         if meta.get("error"):
             st.session_state.last_insight_error = str(meta["error"])
             st.error(f"LlamaIndex vector index unavailable: {meta['error']}")
-            st.caption("Keyword retrieval is used instead.")
+            st.caption("TF-IDF / keyword retrieval is used instead.")
         else:
             st.session_state.last_insight_error = ""
+            if meta.get("note"):
+                st.caption(meta["note"])
+
+    if polish:
+        polished = polish_brief_with_gemini(st.session_state.business_insights or [])
+        if polished.get("key_missing"):
+            st.info(NO_KEY_MESSAGE)
+        elif not polished.get("ok"):
+            st.error(polished.get("error") or "Gemini polish failed.")
+        else:
+            st.session_state.polished_brief = polished.get("text") or ""
+            st.success(f"Polished with `{polished.get('model')}` — numbers taken from the rule-based brief.")
 
     if st.session_state.get("last_insight_error"):
         st.error(st.session_state.last_insight_error)
 
+    ranked = st.session_state.get("asset_ranking") or []
+    if ranked:
+        st.subheader("Asset rank")
+        rank_df = pd.DataFrame(ranked)[
+            [
+                c
+                for c in (
+                    "rank",
+                    "machine_id",
+                    "risk_level",
+                    "predicted_rul_days",
+                    "mean_anomaly_score",
+                    "anomaly_count",
+                    "anomaly_rate_pct",
+                    "n_rows",
+                )
+                if c in pd.DataFrame(ranked).columns
+            ]
+        ]
+        st.dataframe(rank_df, use_container_width=True)
+
+    if st.session_state.get("polished_brief"):
+        st.subheader("Gemini brief")
+        st.markdown(st.session_state.polished_brief)
+
     for item in st.session_state.business_insights or generate_business_insights(
-        df, st.session_state.predictions, st.session_state.anomaly_summary
+        df,
+        st.session_state.predictions,
+        st.session_state.anomaly_summary,
+        cost_per_hour=float(st.session_state.get("cost_per_hour") or 0),
+        cost_per_unit=float(st.session_state.get("cost_per_unit") or 0),
+        hours_if_stop=float(st.session_state.get("hours_if_stop") or 8),
+        used_synthetic=bool(st.session_state.get("rul_used_synthetic")),
     ):
         st.markdown(f"### {item['title']} — `{item['severity']}`")
         st.markdown(item["message"])
+
+    render_ask_panel(df)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -734,62 +911,15 @@ def page_dashboard_builder():
         )
 
 
-# ── AI Assistant (LlamaIndex) ─────────────────────────────────────────────────
+# ── AI Assistant — same Ask box as Insights (one scoped path) ─────────────────
 def page_ai_assistant():
-    st.markdown('<p class="main-header">AI Assistant</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">Ask this upload</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Rule-based + LlamaIndex retrieval (optional Gemini if GEMINI_API_KEY set).</p>',
+        '<p class="sub-header">Same Ask path as Insights: this table + Isolation Forest / RUL columns.</p>',
         unsafe_allow_html=True,
     )
-
-    df = get_active_df()
-    use_llama = st.toggle("Use LlamaIndex retrieval", value=True)
-
-    assistant = MaintenanceAIAssistant(
-        df=df,
-        predictions=st.session_state.predictions,
-        anomaly_summary=st.session_state.anomaly_summary,
-        insights=st.session_state.insights,
-    )
-
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    st.caption("Try: *Which machine needs maintenance?* | *Summarize anomalies*")
-    if st.session_state.get("last_gemini_error"):
-        _show_gemini_error(st.session_state.last_gemini_error)
-    if st.session_state.get("last_insight_error"):
-        st.caption(f"LlamaIndex: {st.session_state.last_insight_error}")
-
-    if prompt := st.chat_input("Ask about maintenance / business impact..."):
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        if use_llama and df is not None:
-            idx = st.session_state.insight_index
-            if idx is None:
-                idx = InsightIndex()
-                meta = idx.build(df)
-                st.session_state.insight_index = idx
-                if meta.get("error"):
-                    st.session_state.last_insight_error = str(meta["error"])
-            result = ask_with_index(prompt, df, idx, st.session_state.predictions)
-            if result.get("gemini_error"):
-                st.session_state.last_gemini_error = result["gemini_error"]
-            if result.get("index_error"):
-                st.session_state.last_insight_error = result["index_error"]
-            response = result["answer"]
-            if result.get("gemini_error"):
-                response = (
-                    f"{result['gemini_error']}\n\n**Offline answer:**\n{result.get('offline_answer') or response}"
-                )
-        else:
-            response = assistant.respond(prompt)
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
-        st.rerun()
-
-    if st.button("Clear Chat"):
-        st.session_state.chat_history = []
-        st.rerun()
+    st.caption(CHAT_SCOPE_CAPTION)
+    render_ask_panel(get_active_df())
 
 
 # ── Email ─────────────────────────────────────────────────────────────────────

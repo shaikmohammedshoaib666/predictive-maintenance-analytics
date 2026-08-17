@@ -9,6 +9,11 @@ from sklearn.ensemble import IsolationForest
 import config
 
 _SKIP_SUFFIXES = ("_bin", "_smooth")
+SCORE_COL = "anomaly_score"
+FLAG_COL = "is_anomaly"
+_EXCLUDE_COLS = frozenset(
+    {"failure_within_days", "predicted_rul_days", SCORE_COL, FLAG_COL, "is_anomaly"}
+)
 
 
 class AnomalyDetector:
@@ -30,7 +35,7 @@ class AnomalyDetector:
             cols = [
                 c
                 for c in df.select_dtypes(include="number").columns.tolist()
-                if not str(c).endswith(_SKIP_SUFFIXES) and c != "failure_within_days"
+                if not str(c).endswith(_SKIP_SUFFIXES) and c not in _EXCLUDE_COLS
             ]
         self.feature_columns = cols
         if not cols:
@@ -57,12 +62,22 @@ class AnomalyDetector:
         X = self._get_features(df)
         return -self.model.score_samples(X)
 
+    def annotate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Attach Isolation Forest score (higher = more anomalous) and flag columns."""
+        out = df.copy()
+        out[SCORE_COL] = self.anomaly_scores(out)
+        out[FLAG_COL] = self.predict(out) == -1
+        return out
+
     def summary(self, df: pd.DataFrame) -> dict:
         labels = self.predict(df)
         n_anomalies = int((labels == -1).sum())
+        scores = self.anomaly_scores(df)
         return {
             "total_records": len(df),
             "anomaly_count": n_anomalies,
             "anomaly_rate_pct": round(n_anomalies / max(len(df), 1) * 100, 2),
             "features_used": self.feature_columns,
+            "score_mean": round(float(np.mean(scores)), 4) if len(scores) else 0.0,
+            "score_max": round(float(np.max(scores)), 4) if len(scores) else 0.0,
         }

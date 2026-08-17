@@ -34,9 +34,15 @@ def main() -> int:
     from src.graphs.time_series import create_time_series_chart
     from src.insights_engine import (
         DEFAULT_GEMINI_MODEL,
+        NO_KEY_MESSAGE,
+        ask_with_index,
+        estimate_dollar_impact,
+        flag_slow_running,
         generate_business_insights,
         get_gemini_model,
         gemini_issue_from_raw,
+        inspect_this_week,
+        rank_assets,
     )
     from src.ml.anomaly_detector import AnomalyDetector
     from src.ml.rul_predictor import RULPredictor
@@ -52,6 +58,7 @@ def main() -> int:
 
     def test_gemini_remap() -> None:
         assert DEFAULT_GEMINI_MODEL == "gemini-3.6-flash"
+        import google.generativeai as genai  # noqa: F401 — Ask path must be importable
         prev = os.environ.get("GEMINI_MODEL")
         try:
             for alias in ("gemini-flash-latest", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-pro"):
@@ -109,6 +116,91 @@ def main() -> int:
         insights = generate_business_insights(cleaned, preds, summary)
         assert insights and insights[0]["title"]
 
+    def test_industrial_brief_tiny_frame() -> None:
+        df = pd.DataFrame(
+            {
+                "machine_id": ["LineA"] * 4 + ["LineB"] * 4 + ["LineC"] * 4,
+                "vibration": [1.0, 1.1, 1.0, 1.2, 8.0, 8.5, 9.0, 8.2, 2.0, 2.1, 1.9, 2.0],
+                "rpm": [1800, 1810, 1790, 1805, 1100, 1080, 1090, 1070, 1750, 1760, 1740, 1755],
+                "temperature": [70, 71, 70, 72, 95, 98, 97, 96, 73, 74, 72, 73],
+                "throughput": [100, 102, 99, 101, 60, 58, 59, 61, 95, 96, 94, 95],
+            }
+        )
+        det = AnomalyDetector(contamination=0.2)
+        det.fit(df)
+        scored = det.annotate(df)
+        assert "anomaly_score" in scored.columns and "is_anomaly" in scored.columns
+
+        preds = [
+            {
+                "machine_id": "LineB",
+                "predicted_rul_days": 3,
+                "risk_level": "High",
+                "message": "LineB ranks High on the remaining-life proxy (~3 days).",
+                "is_proxy": True,
+                "label_source": "synthetic_degradation_proxy",
+            },
+            {
+                "machine_id": "LineC",
+                "predicted_rul_days": 12,
+                "risk_level": "Medium",
+                "message": "LineC remaining-life proxy ~12 days.",
+                "is_proxy": True,
+                "label_source": "synthetic_degradation_proxy",
+            },
+            {
+                "machine_id": "LineA",
+                "predicted_rul_days": 25,
+                "risk_level": "Low",
+                "message": "LineA remaining-life proxy ~25 days.",
+                "is_proxy": True,
+                "label_source": "synthetic_degradation_proxy",
+            },
+        ]
+        ranked = rank_assets(scored, preds)
+        assert ranked[0]["machine_id"] == "LineB"
+        inspect = inspect_this_week(ranked)
+        inspect_blob = " ".join(i["message"] for i in inspect)
+        assert "LineB" in inspect_blob
+        assert "this week" in inspect_blob.lower()
+
+        slow = flag_slow_running(scored)
+        assert any("LineB" in s["message"] and "slow" in s["message"].lower() for s in slow)
+
+        dollars = estimate_dollar_impact(ranked, slow, cost_per_hour=1500, hours_if_stop=8)
+        dollar_blob = " ".join(d["message"] for d in dollars)
+        assert "LineB" in dollar_blob and "$12,000" in dollar_blob
+
+        insights = generate_business_insights(
+            scored,
+            preds,
+            det.summary(scored),
+            cost_per_hour=1500,
+            cost_per_unit=25,
+            hours_if_stop=8,
+            used_synthetic=True,
+        )
+        blob = " ".join(i["message"] for i in insights).lower()
+        assert "degradation proxy" in blob or "not a confirmed failure" in blob
+        assert "will fail on" not in blob
+        assert "lorem" not in blob
+
+        prev_key = os.environ.pop("GEMINI_API_KEY", None)
+        try:
+            result = ask_with_index("Which asset should we inspect this week?", scored, predictions=preds, ranked=ranked, inspect=inspect)
+        finally:
+            if prev_key is not None:
+                os.environ["GEMINI_API_KEY"] = prev_key
+        assert result["key_missing"] is True
+        assert result["gemini_attempted"] is False
+        offline = (result.get("offline_answer") or "").lower()
+        assert "lineb" in offline
+        assert "lorem" not in offline
+        assert NO_KEY_MESSAGE.split("`")[0].strip()  # constant still defined
+
+        named = ask_with_index("Tell me about LineB", scored, predictions=preds, ranked=ranked)
+        assert "LineB" in named["offline_answer"]
+
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
         det = AnomalyDetector()
@@ -135,6 +227,7 @@ def main() -> int:
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
     check("anomaly_rul_insights", test_anomaly_rul_insights)
+    check("industrial_brief_tiny_frame", test_industrial_brief_tiny_frame)
     check("charts_layout", test_charts)
 
     if errors:

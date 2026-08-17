@@ -62,7 +62,15 @@ class RULPredictor:
 
     def _get_feature_matrix(self, df: pd.DataFrame) -> tuple[pd.DataFrame, Optional[pd.Series]]:
         engineered = self._engineer_features(df)
-        exclude = {"failure_within_days", "timestamp", "machine_id"}
+        exclude = {
+            "failure_within_days",
+            "timestamp",
+            "machine_id",
+            "anomaly_score",
+            "is_anomaly",
+            "predicted_rul_days",
+            "risk_level",
+        }
         feature_cols = [
             c
             for c in engineered.columns
@@ -132,21 +140,33 @@ class RULPredictor:
                 X = latest[self.feature_columns].fillna(0)
                 rul = float(self.model.predict(X)[0])
                 rul = max(1, round(rul))
-                predictions.append({
-                    "machine_id": str(machine),
-                    "predicted_rul_days": rul,
-                    "message": f"{machine} will fail in {rul} days",
-                    "risk_level": "High" if rul <= 7 else ("Medium" if rul <= 14 else "Low"),
-                })
+                predictions.append(self._prediction_record(str(machine), rul))
         else:
             latest = engineered.iloc[[-1]]
             X = latest[self.feature_columns].fillna(0)
             rul = max(1, round(float(self.model.predict(X)[0])))
-            predictions.append({
-                "machine_id": "All",
-                "predicted_rul_days": rul,
-                "message": f"Equipment will fail in approximately {rul} days",
-                "risk_level": "High" if rul <= 7 else ("Medium" if rul <= 14 else "Low"),
-            })
+            predictions.append(self._prediction_record("All", rul))
 
         return sorted(predictions, key=lambda x: x["predicted_rul_days"])
+
+    def _prediction_record(self, machine_id: str, rul: float) -> dict[str, Any]:
+        risk = "High" if rul <= 7 else ("Medium" if rul <= 14 else "Low")
+        proxy = bool(self.used_synthetic_labels)
+        if proxy:
+            message = (
+                f"{machine_id} ranks {risk} on the remaining-life proxy (~{int(rul)} days). "
+                "This is a risk / degradation proxy, not a confirmed failure date."
+            )
+        else:
+            message = (
+                f"{machine_id} has predicted remaining useful life of {int(rul)} days "
+                f"({risk} risk). Treat as a model estimate, not a calendar failure date."
+            )
+        return {
+            "machine_id": machine_id,
+            "predicted_rul_days": int(rul),
+            "message": message,
+            "risk_level": risk,
+            "label_source": self.label_source,
+            "is_proxy": proxy,
+        }
