@@ -13,4 +13,5 @@ graphs/*.json
 data/
 *.db
 .DS_Store
+.cursor/
 .streamlit/secrets.toml

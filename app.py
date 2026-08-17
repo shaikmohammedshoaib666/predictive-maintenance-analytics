@@ -1,20 +1,17 @@
 """
 Predictive Maintenance Analytics Platform
-Streamlit entry point for IoT sensor analysis, ML predictions, and reporting.
+Streamlit entry — Forge v2 quality suite + joins, Optuna, LlamaIndex insights, DWDM/SQL.
 """
 
 from __future__ import annotations
 
-import io
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-# Ensure project root is on path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -26,14 +23,23 @@ from src.dashboard_builder import (
     render_dashboard_preview,
     save_graph_to_folder,
 )
-from src.data_cleaner import clean_sensor_data
+from src.data_cleaner import clean_and_quality
 from src.data_insights import analyze_columns, format_insights_markdown
+from src.data_integration import JOIN_TYPES, join_many, join_two, load_tabular_file, suggest_join_keys
+from src.dwdm_sql import DWDM_CONCEPTS, apply_dwdm_transforms, default_sql_examples, run_sql
 from src.email_report import generate_email_body, send_email
 from src.graphs import GRAPH_TYPES
+from src.insights_engine import (
+    InsightIndex,
+    ask_with_index,
+    chart_business_insight,
+    generate_business_insights,
+)
 from src.ml.anomaly_detector import AnomalyDetector
+from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
+from src.quality_checks import QUALITY_STAGE_COUNT
 
-# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=config.APP_TITLE,
     page_icon=config.PAGE_ICON,
@@ -41,46 +47,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
-    .main-header {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #1a1a2e;
-        margin-bottom: 0.25rem;
-    }
-    .sub-header {
-        color: #6c757d;
-        font-size: 1rem;
-        margin-bottom: 1.5rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-    }
-    .graph-type-btn {
-        border: 1px solid #dee2e6;
-        border-radius: 8px;
-        padding: 1rem;
-        margin-bottom: 0.5rem;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-    .graph-type-btn:hover {
-        border-color: #667eea;
-        box-shadow: 0 2px 8px rgba(102,126,234,0.2);
-    }
+    .main-header { font-size: 2rem; font-weight: 700; color: #1a1a2e; margin-bottom: 0.25rem; }
+    .sub-header { color: #6c757d; font-size: 1rem; margin-bottom: 1.5rem; }
     .risk-high { color: #e74c3c; font-weight: bold; }
     .risk-medium { color: #f39c12; font-weight: bold; }
     .risk-low { color: #27ae60; font-weight: bold; }
-    div[data-testid="stSidebar"] {
-        background-color: #f8f9fa;
-    }
+    div[data-testid="stSidebar"] { background-color: #f8f9fa; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -88,12 +63,13 @@ st.markdown(
 
 
 def init_session_state():
-    """Initialize session state variables."""
     defaults = {
         "raw_df": None,
         "cleaned_df": None,
         "cleaning_summary": None,
+        "quality_report": None,
         "insights": None,
+        "business_insights": [],
         "graph_folder": {},
         "anomaly_detector": None,
         "rul_predictor": None,
@@ -101,6 +77,12 @@ def init_session_state():
         "anomaly_summary": {},
         "chat_history": [],
         "data_loaded": False,
+        "uploaded_tables": {},
+        "join_log": [],
+        "optuna_rul": None,
+        "optuna_anomaly": None,
+        "insight_index": None,
+        "sql_result": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -108,7 +90,6 @@ def init_session_state():
 
 
 def get_active_df() -> pd.DataFrame | None:
-    """Return cleaned dataframe if available."""
     return st.session_state.get("cleaned_df")
 
 
@@ -123,101 +104,273 @@ def get_axis_options(df: pd.DataFrame) -> list[str]:
     return cols
 
 
+def register_table(name: str, df: pd.DataFrame):
+    tables = dict(st.session_state.uploaded_tables or {})
+    tables[name] = df
+    st.session_state.uploaded_tables = tables
+
+
 def load_sample_data():
-    """Load bundled sample CSV."""
     if config.SAMPLE_DATA_PATH.exists():
         df = pd.read_csv(config.SAMPLE_DATA_PATH, parse_dates=["timestamp"])
         st.session_state.raw_df = df
         st.session_state.data_loaded = True
+        register_table("sensors", df)
+        # Optional companion tables for join demos
+        maint = PROJECT_ROOT / "sample_data" / "maintenance_logs.csv"
+        costs = PROJECT_ROOT / "sample_data" / "machine_costs.csv"
+        if maint.exists():
+            register_table("maintenance", pd.read_csv(maint))
+        if costs.exists():
+            register_table("costs", pd.read_csv(costs))
         return df
     st.error("Sample data not found. Run: python generate_sample_data.py")
     return None
 
 
-# ── Section: Upload & Clean ───────────────────────────────────────────────────
+# ── Upload & Clean (19-stage quality) ─────────────────────────────────────────
 def page_upload_clean():
     st.markdown('<p class="main-header">Upload & Clean Data</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Upload IoT sensor CSV or use sample data. Clean, inspect, and download.</p>',
+        f'<p class="sub-header">Upload one or many files, run industrial ETL, then '
+        f"<b>{QUALITY_STAGE_COUNT}-stage</b> quality checks (Forge v2 suite).</p>",
         unsafe_allow_html=True,
     )
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        uploaded = st.file_uploader("Upload sensor CSV", type=["csv"])
+        uploaded_files = st.file_uploader(
+            "Upload sensor / ops CSVs (multi-select OK)",
+            type=["csv", "tsv", "xlsx", "json"],
+            accept_multiple_files=True,
+        )
     with col2:
         if st.button("Load Sample Data", use_container_width=True):
             load_sample_data()
-            st.success("Sample data loaded!")
+            st.success("Sample sensors (+ maintenance/costs if present) loaded!")
             st.rerun()
 
-    if uploaded:
-        st.session_state.raw_df = pd.read_csv(uploaded)
-        if "timestamp" in st.session_state.raw_df.columns:
-            st.session_state.raw_df["timestamp"] = pd.to_datetime(
-                st.session_state.raw_df["timestamp"], errors="coerce"
-            )
-        st.session_state.data_loaded = True
+    if uploaded_files:
+        for uf in uploaded_files:
+            try:
+                df = load_tabular_file(uf)
+                stem = Path(uf.name).stem.replace(" ", "_")
+                register_table(stem, df)
+                st.session_state.raw_df = df
+                st.session_state.data_loaded = True
+                st.success(f"Loaded `{uf.name}` → table `{stem}` ({len(df):,} rows)")
+            except Exception as exc:
+                st.error(f"Failed {uf.name}: {exc}")
+
+    if st.session_state.uploaded_tables:
+        st.caption("Registered tables: " + ", ".join(st.session_state.uploaded_tables.keys()))
 
     if st.session_state.raw_df is not None:
         st.subheader("Raw Data Preview")
         st.dataframe(st.session_state.raw_df.head(10), use_container_width=True)
 
-        if st.button("Clean Data", type="primary"):
-            with st.spinner("Cleaning data..."):
-                cleaned, summary = clean_sensor_data(st.session_state.raw_df)
+        if st.button("Run industrial clean + 19 quality checks", type="primary"):
+            with st.spinner("Cleaning + running 19 quality stages..."):
+                cleaned, summary, report = clean_and_quality(st.session_state.raw_df, run_quality=True)
                 insights = analyze_columns(cleaned)
                 st.session_state.cleaned_df = cleaned
                 st.session_state.cleaning_summary = summary
+                st.session_state.quality_report = report
                 st.session_state.insights = insights
+                register_table("cleaned", cleaned)
             st.success(f"Cleaned: {summary['rows_before']} → {summary['rows_after']} rows")
             if summary["actions"]:
-                for action in summary["actions"]:
-                    st.info(action)
+                with st.expander("ETL / DWDM actions"):
+                    for action in summary["actions"]:
+                        st.write(f"- {action}")
 
         if st.session_state.cleaned_df is not None:
             st.subheader("Cleaned Data Preview")
             st.dataframe(st.session_state.cleaned_df.head(10), use_container_width=True)
-
-            # Download
-            csv_buf = st.session_state.cleaned_df.to_csv(index=False)
             st.download_button(
                 "Download Cleaned CSV",
-                csv_buf,
+                st.session_state.cleaned_df.to_csv(index=False),
                 file_name=f"cleaned_sensor_data_{datetime.now().strftime('%Y%m%d')}.csv",
                 mime="text/csv",
             )
 
-            # Insights panel
-            st.subheader("Data Insights")
+            if st.session_state.quality_report:
+                st.subheader(f"{QUALITY_STAGE_COUNT}-Stage Quality Report")
+                checks_df = pd.DataFrame(st.session_state.quality_report["checks"])
+                st.dataframe(checks_df, use_container_width=True)
+                status_counts = checks_df["status"].value_counts().to_dict()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("PASS", status_counts.get("PASS", 0))
+                c2.metric("WARN", status_counts.get("WARN", 0))
+                c3.metric("FAIL", status_counts.get("FAIL", 0))
+                c4.metric("INFO", status_counts.get("INFO", 0))
+
             if st.session_state.insights:
+                st.subheader("Data Insights")
                 st.markdown(format_insights_markdown(st.session_state.insights))
 
-                with st.expander("Detailed Column Analysis"):
-                    for col, info in st.session_state.insights["columns"].items():
-                        st.write(f"**{col}** — {info['type_category']} | Quality: {info['quality_score']}/100")
-                        st.json(info)
+
+# ── Data Integration (SQL joins) ──────────────────────────────────────────────
+def page_data_integration():
+    st.markdown('<p class="main-header">Data Integration (SQL Joins)</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Merge 2 or 3+ tables with INNER / LEFT / RIGHT / FULL OUTER joins '
+        "(new vs Forge v2, which was single-file only).</p>",
+        unsafe_allow_html=True,
+    )
+
+    tables = st.session_state.uploaded_tables or {}
+    if len(tables) < 2:
+        st.warning("Register at least 2 tables (multi-upload or Load Sample Data).")
+        return
+
+    names = list(tables.keys())
+    st.write("Available tables:", ", ".join(f"`{n}` ({len(tables[n])} rows)" for n in names))
+
+    mode = st.radio("Join mode", ["Two tables", "Chain 3+ tables"], horizontal=True)
+
+    if mode == "Two tables":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            left_name = st.selectbox("Left table", names, key="join_left")
+        with c2:
+            right_name = st.selectbox("Right table", [n for n in names if n != left_name], key="join_right")
+        with c3:
+            how = st.selectbox("Join type", list(JOIN_TYPES.keys()), format_func=lambda k: f"{k.upper()} — {JOIN_TYPES[k].split('—')[0].strip()}")
+
+        left, right = tables[left_name], tables[right_name]
+        suggested = suggest_join_keys(left, right)
+        key_mode = st.radio("Keys", ["Common columns", "Different column names"], horizontal=True)
+        if key_mode == "Common columns":
+            on = st.multiselect("Join on", suggested or list(set(left.columns) & set(right.columns)), default=suggested[:1])
+            left_on = right_on = None
+        else:
+            on = None
+            left_on = st.selectbox("Left key", list(left.columns))
+            right_on = st.selectbox("Right key", list(right.columns))
+
+        if st.button("Run join", type="primary"):
+            try:
+                merged, meta = join_two(left, right, how=how, on=on or None, left_on=left_on, right_on=right_on)
+                st.session_state.cleaned_df = merged
+                st.session_state.raw_df = merged
+                register_table("joined", merged)
+                st.session_state.join_log = [meta]
+                st.success(f"Joined → {meta['result_rows']:,} rows")
+                st.json(meta)
+                st.dataframe(merged.head(20), use_container_width=True)
+            except Exception as exc:
+                st.error(str(exc))
+    else:
+        if len(names) < 3:
+            st.info("Need 3+ tables for a chain demo — upload more files or use sample maintenance/costs.")
+        left_name = st.selectbox("Start (left)", names, key="chain_left")
+        right1 = st.selectbox("Join #1 right", [n for n in names if n != left_name], key="chain_r1")
+        how1 = st.selectbox("Join #1 type", list(JOIN_TYPES.keys()), key="how1")
+        keys1 = st.multiselect(
+            "Join #1 keys",
+            suggest_join_keys(tables[left_name], tables[right1]),
+            default=suggest_join_keys(tables[left_name], tables[right1])[:1],
+            key="k1",
+        )
+        remaining = [n for n in names if n not in (left_name, right1)]
+        right2 = st.selectbox("Join #2 right", remaining or names, key="chain_r2")
+        how2 = st.selectbox("Join #2 type", list(JOIN_TYPES.keys()), key="how2")
+        # keys for step 2 chosen after preview of common names with right2
+        keys2_opts = list(tables[right2].columns)
+        keys2 = st.multiselect("Join #2 keys (must exist on interim + right)", keys2_opts, default=[k for k in keys1 if k in keys2_opts][:1], key="k2")
+
+        if st.button("Run join chain", type="primary"):
+            try:
+                steps = [
+                    {"left": left_name, "right": right1, "how": how1, "on": keys1},
+                    {"left": "_result", "right": right2, "how": how2, "on": keys2},
+                ]
+                merged, logs = join_many(tables, steps)
+                st.session_state.cleaned_df = merged
+                st.session_state.raw_df = merged
+                register_table("joined", merged)
+                st.session_state.join_log = logs
+                st.success(f"Chain complete → {len(merged):,} rows")
+                st.json(logs)
+                st.dataframe(merged.head(20), use_container_width=True)
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state.join_log:
+        with st.expander("Last join log"):
+            st.json(st.session_state.join_log)
 
 
-# ── Section: Explore & Graphs ───────────────────────────────────────────────────
+# ── DWDM + SQL Lab ────────────────────────────────────────────────────────────
+def page_dwdm_sql():
+    st.markdown('<p class="main-header">DWDM Concepts & SQL Lab</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Applied data warehousing / mining techniques + read-only SQL over your tables.</p>',
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("DWDM concept map")
+    st.dataframe(pd.DataFrame(DWDM_CONCEPTS), use_container_width=True)
+
+    df = get_active_df()
+    if df is None:
+        st.warning("Clean or join data first.")
+        return
+
+    st.subheader("Apply DWDM transforms")
+    nums = get_numeric_columns(df)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        bin_cols = st.multiselect("Bin columns", nums, default=nums[:1])
+    with c2:
+        smooth_cols = st.multiselect("Smooth columns", nums, default=[c for c in nums if "temp" in c.lower() or "vib" in c.lower()][:1])
+    with c3:
+        norm_cols = st.multiselect("Z-normalize", nums, default=[])
+
+    if st.button("Apply transforms"):
+        out, log = apply_dwdm_transforms(df, bin_cols=bin_cols, smooth_cols=smooth_cols, normalize_cols=norm_cols)
+        st.session_state.cleaned_df = out
+        register_table("cleaned", out)
+        st.success("; ".join(log) if log else "No changes")
+        st.dataframe(out.head(10), use_container_width=True)
+
+    st.subheader("SQL Lab (read-only)")
+    tables = st.session_state.uploaded_tables or {}
+    if "cleaned" not in tables and df is not None:
+        register_table("cleaned", df)
+        tables = st.session_state.uploaded_tables
+    st.caption("Tables: " + ", ".join(tables.keys()))
+    examples = default_sql_examples(list(tables.keys()))
+    st.code("\n\n".join(examples), language="sql")
+    query = st.text_area("SQL", value=examples[0], height=120)
+    if st.button("Run SQL", type="primary"):
+        try:
+            result, engine = run_sql(query, tables)
+            st.session_state.sql_result = result
+            st.caption(f"Engine: {engine}")
+            st.dataframe(result, use_container_width=True)
+        except Exception as exc:
+            st.error(str(exc))
+
+
+# ── Explore & Graphs ──────────────────────────────────────────────────────────
 def page_explore_graphs():
     st.markdown('<p class="main-header">Explore & Graphs</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Configure axes, metrics, and filters. Click a graph type to generate and save to your graph folder.</p>',
+        '<p class="sub-header">Configure axes, metrics, and filters. Business insight text under each chart.</p>',
         unsafe_allow_html=True,
     )
 
     df = get_active_df()
     if df is None:
-        st.warning("Upload and clean data first, or load sample data from Upload & Clean.")
+        st.warning("Upload and clean data first.")
         return
 
-    # Adaptive controls
     st.subheader("Chart Controls")
     ctrl1, ctrl2, ctrl3 = st.columns(3)
     axis_options = get_axis_options(df)
     numeric_cols = get_numeric_columns(df)
-
     with ctrl1:
         x_axis = st.selectbox("X-Axis", axis_options, index=0)
     with ctrl2:
@@ -230,11 +383,10 @@ def page_explore_graphs():
         machines = sorted(df["machine_id"].unique()) if "machine_id" in df.columns else []
         machine_filter = st.multiselect("Filter by Machine", machines, default=machines)
 
-    st.divider()
-    st.subheader("Graph Types — Click to Generate & Save")
-    st.caption(f"Graph folder: {len(get_graph_folder())} saved graph(s)")
+    st.info(chart_business_insight(df, x_axis, y_metric))
 
-    # 6 graph types in a 3x2 grid
+    st.divider()
+    st.subheader("Graph Types")
     graph_keys = list(GRAPH_TYPES.keys())
     for row_start in range(0, 6, 3):
         cols = st.columns(3)
@@ -267,11 +419,10 @@ def page_explore_graphs():
                     st.success(f"Saved: {entry['id']}")
                     st.plotly_chart(fig, use_container_width=True)
 
-    # Preview saved graphs
     folder = get_graph_folder()
     if folder:
         st.divider()
-        st.subheader("Saved Graphs Preview")
+        st.subheader("Saved Graphs")
         for g_id, entry in folder.items():
             with st.expander(f"{entry.get('title', g_id)} — {entry['created_at'][:19]}"):
                 st.plotly_chart(entry["fig"], use_container_width=True)
@@ -280,11 +431,11 @@ def page_explore_graphs():
                     st.rerun()
 
 
-# ── Section: ML Predictions ─────────────────────────────────────────────────────
+# ── ML + Optuna ───────────────────────────────────────────────────────────────
 def page_ml_predictions():
-    st.markdown('<p class="main-header">ML Predictions</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">ML Predictions & Optuna</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Train anomaly detection and RUL models. View failure predictions per machine.</p>',
+        '<p class="sub-header">Isolation Forest + Random Forest RUL, with Optuna hyperparameter search.</p>',
         unsafe_allow_html=True,
     )
 
@@ -293,18 +444,60 @@ def page_ml_predictions():
         st.warning("Upload and clean data first.")
         return
 
-    if st.button("Train Models", type="primary"):
-        with st.spinner("Training Isolation Forest + Random Forest RUL models..."):
-            detector = AnomalyDetector()
+    trials = st.slider("Optuna trials (RUL)", 5, 40, 15)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        train = st.button("Train Models", type="primary", use_container_width=True)
+    with c2:
+        tune_rul = st.button("Optuna tune RUL", use_container_width=True)
+    with c3:
+        tune_iso = st.button("Optuna tune anomalies", use_container_width=True)
+
+    if train:
+        with st.spinner("Training Isolation Forest + Random Forest RUL..."):
+            cont = config.ANOMALY_CONTAMINATION
+            if st.session_state.optuna_anomaly:
+                cont = st.session_state.optuna_anomaly.get("best_contamination", cont)
+            detector = AnomalyDetector(contamination=cont)
             detector.fit(df)
             st.session_state.anomaly_detector = detector
             st.session_state.anomaly_summary = detector.summary(df)
-
             predictor = RULPredictor()
             predictor.fit(df)
             st.session_state.rul_predictor = predictor
             st.session_state.predictions = predictor.predict_latest_per_machine(df)
-        st.success("Models trained successfully!")
+            st.session_state.business_insights = generate_business_insights(
+                df, st.session_state.predictions, st.session_state.anomaly_summary
+            )
+        st.success("Models trained!")
+
+    if tune_rul:
+        with st.spinner(f"Optuna RUL ({trials} trials)..."):
+            try:
+                target = "failure_within_days" if "failure_within_days" in df.columns else None
+                if not target:
+                    st.error("Need failure_within_days column for RUL Optuna.")
+                else:
+                    st.session_state.optuna_rul = tune_rul_model(df, target=target, n_trials=trials)
+                    st.success("Optuna RUL complete")
+            except Exception as exc:
+                st.error(str(exc))
+
+    if tune_iso:
+        with st.spinner("Optuna anomaly contamination..."):
+            try:
+                st.session_state.optuna_anomaly = tune_anomaly_contamination(df, n_trials=min(12, trials))
+                st.success("Optuna anomaly complete — click Train Models to apply")
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state.optuna_rul:
+        st.subheader("Optuna RUL result")
+        st.json(st.session_state.optuna_rul)
+    if st.session_state.optuna_anomaly:
+        st.subheader("Optuna anomaly result")
+        st.json(st.session_state.optuna_anomaly)
 
     if st.session_state.predictions:
         st.subheader("Failure Predictions")
@@ -314,21 +507,16 @@ def page_ml_predictions():
                 f"<p class='{risk_class}'>{p['message']} — Risk: {p['risk_level']}</p>",
                 unsafe_allow_html=True,
             )
-
-        # Metrics
         if st.session_state.rul_predictor and st.session_state.rul_predictor.metrics:
-            st.subheader("RUL Model Metrics")
             m = st.session_state.rul_predictor.metrics
             c1, c2, c3 = st.columns(3)
             c1.metric("MAE (days)", m.get("mae", "N/A"))
             c2.metric("RMSE (days)", m.get("rmse", "N/A"))
             c3.metric("R² Score", m.get("r2", "N/A"))
-
-            # Feature importance
             fi = st.session_state.rul_predictor.feature_importance
             if fi is not None and not fi.empty:
-                st.subheader("Feature Importance")
                 import plotly.express as px
+
                 fig = px.bar(
                     fi.head(10),
                     x="importance",
@@ -348,33 +536,46 @@ def page_ml_predictions():
         c3.metric("Anomaly Rate", f"{s.get('anomaly_rate_pct', 0)}%")
 
 
-# ── Section: Dashboard Builder ──────────────────────────────────────────────────
-def page_dashboard_builder():
-    st.markdown('<p class="main-header">Dashboard Builder</p>', unsafe_allow_html=True)
+# ── Business Insights ─────────────────────────────────────────────────────────
+def page_business_insights():
+    st.markdown('<p class="main-header">Business Insights</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Select saved graphs to compose your final maintenance dashboard.</p>',
+        '<p class="sub-header">Manager-ready actions: which machine needs maintenance, risk to uptime/revenue.</p>',
         unsafe_allow_html=True,
     )
-
-    folder = get_graph_folder()
-    if not folder:
-        st.info("No graphs saved yet. Go to Explore & Graphs to generate charts.")
+    df = get_active_df()
+    if df is None:
+        st.warning("Clean data + train models first for best insights.")
         return
 
-    st.subheader("Select Graphs")
+    if st.button("Refresh insights", type="primary"):
+        st.session_state.business_insights = generate_business_insights(
+            df, st.session_state.predictions, st.session_state.anomaly_summary
+        )
+        idx = InsightIndex()
+        meta = idx.build(df)
+        st.session_state.insight_index = idx
+        st.caption(f"LlamaIndex mode: {meta.get('mode')} ({meta.get('n_docs')} docs)")
+
+    for item in st.session_state.business_insights or generate_business_insights(
+        df, st.session_state.predictions, st.session_state.anomaly_summary
+    ):
+        st.markdown(f"### {item['title']} — `{item['severity']}`")
+        st.markdown(item["message"])
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+def page_dashboard_builder():
+    st.markdown('<p class="main-header">Dashboard Builder</p>', unsafe_allow_html=True)
+    folder = get_graph_folder()
+    if not folder:
+        st.info("No graphs saved yet. Go to Explore & Graphs.")
+        return
     selected = []
     for g_id, entry in folder.items():
-        if st.checkbox(
-            f"{entry.get('title', g_id)} ({entry['graph_type']})",
-            key=f"dash_chk_{g_id}",
-            value=True,
-        ):
+        if st.checkbox(f"{entry.get('title', g_id)} ({entry['graph_type']})", key=f"dash_chk_{g_id}", value=True):
             selected.append(g_id)
-
-    st.divider()
-    st.subheader("Live Dashboard Preview")
     render_dashboard_preview(selected, columns=2)
-
     if selected:
         html = export_dashboard_html(selected)
         st.download_button(
@@ -385,32 +586,42 @@ def page_dashboard_builder():
         )
 
 
-# ── Section: AI Assistant ─────────────────────────────────────────────────────
+# ── AI Assistant (LlamaIndex) ─────────────────────────────────────────────────
 def page_ai_assistant():
     st.markdown('<p class="main-header">AI Assistant</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Ask questions about your data, predictions, and anomalies. Data-aware responses, no API key required.</p>',
+        '<p class="sub-header">Rule-based + LlamaIndex retrieval (optional Gemini if GEMINI_API_KEY set).</p>',
         unsafe_allow_html=True,
     )
 
+    df = get_active_df()
+    use_llama = st.toggle("Use LlamaIndex retrieval", value=True)
+
     assistant = MaintenanceAIAssistant(
-        df=get_active_df(),
+        df=df,
         predictions=st.session_state.predictions,
         anomaly_summary=st.session_state.anomaly_summary,
         insights=st.session_state.insights,
     )
 
-    # Chat history display
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Suggested prompts
-    st.caption("Suggested: *Which machine will fail soonest?* | *What's the anomaly rate?* | *Give me a summary*")
+    st.caption("Try: *Which machine needs maintenance?* | *Will costs drop?* | *Summarize anomalies*")
 
-    if prompt := st.chat_input("Ask about your maintenance data..."):
+    if prompt := st.chat_input("Ask about maintenance / business impact..."):
         st.session_state.chat_history.append({"role": "user", "content": prompt})
-        response = assistant.respond(prompt)
+        if use_llama and df is not None:
+            idx = st.session_state.insight_index
+            if idx is None:
+                idx = InsightIndex()
+                idx.build(df)
+                st.session_state.insight_index = idx
+            result = ask_with_index(prompt, df, idx, st.session_state.predictions)
+            response = result["answer"]
+        else:
+            response = assistant.respond(prompt)
         st.session_state.chat_history.append({"role": "assistant", "content": response})
         st.rerun()
 
@@ -419,14 +630,9 @@ def page_ai_assistant():
         st.rerun()
 
 
-# ── Section: Email Report ───────────────────────────────────────────────────────
+# ── Email ─────────────────────────────────────────────────────────────────────
 def page_email_report():
     st.markdown('<p class="main-header">Email Report</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="sub-header">Auto-generate and send maintenance reports to managers and stakeholders.</p>',
-        unsafe_allow_html=True,
-    )
-
     col1, col2 = st.columns(2)
     with col1:
         recipient = st.text_input("Recipient Email", placeholder="manager@company.com")
@@ -439,12 +645,17 @@ def page_email_report():
         additional_notes = st.text_area("Additional Notes (optional)", height=100)
 
     if st.button("Generate Email Preview", type="primary"):
+        extra = additional_notes or ""
+        if st.session_state.business_insights:
+            extra += "\n\nBusiness insights:\n" + "\n".join(
+                f"- {i['title']}: {i['message']}" for i in st.session_state.business_insights[:5]
+            )
         body = generate_email_body(
             manager_name=manager_name,
             predictions=st.session_state.predictions,
             anomaly_summary=st.session_state.anomaly_summary,
             insights=st.session_state.insights,
-            additional_notes=additional_notes,
+            additional_notes=extra,
         )
         st.session_state.email_preview = body
         st.session_state.email_subject = subject
@@ -453,7 +664,6 @@ def page_email_report():
     if "email_preview" in st.session_state:
         st.subheader("Email Preview")
         st.text(st.session_state.email_preview)
-
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Send Email", type="primary"):
@@ -463,10 +673,7 @@ def page_email_report():
                     body=st.session_state.email_preview,
                     manager_name=manager_name,
                 )
-                if result["success"]:
-                    st.success(result["message"])
-                else:
-                    st.error(result["message"])
+                (st.success if result["success"] else st.error)(result["message"])
         with col2:
             st.download_button(
                 "Download Email as TXT",
@@ -475,23 +682,19 @@ def page_email_report():
                 mime="text/plain",
             )
 
-    st.info(
-        "Demo mode is enabled by default — emails are saved to `output/emails/` when SMTP is not configured. "
-        "Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD environment variables for live sending."
-    )
 
-
-# ── Main App ────────────────────────────────────────────────────────────────────
 def main():
     init_session_state()
-
     st.sidebar.markdown(f"## {config.APP_TITLE}")
     st.sidebar.markdown("---")
 
     pages = {
         "Upload & Clean": page_upload_clean,
+        "Data Integration": page_data_integration,
+        "DWDM & SQL Lab": page_dwdm_sql,
         "Explore & Graphs": page_explore_graphs,
         "ML Predictions": page_ml_predictions,
+        "Business Insights": page_business_insights,
         "Dashboard Builder": page_dashboard_builder,
         "AI Assistant": page_ai_assistant,
         "Email Report": page_email_report,
@@ -499,14 +702,13 @@ def main():
 
     selection = st.sidebar.radio("Navigation", list(pages.keys()))
     st.sidebar.markdown("---")
-
-    # Status indicators
     df = get_active_df()
     if df is not None:
         st.sidebar.success(f"Data: {len(df):,} rows")
     else:
         st.sidebar.warning("No data loaded")
-
+    if st.session_state.uploaded_tables:
+        st.sidebar.info(f"{len(st.session_state.uploaded_tables)} table(s)")
     if st.session_state.predictions:
         st.sidebar.info(f"{len(st.session_state.predictions)} prediction(s)")
     if get_graph_folder():

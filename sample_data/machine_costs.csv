@@ -1,0 +1,6 @@
+machine_id,maintenance_cost,downtime_cost,revenue_impact
+Machine 1,8395,11681,-4334
+Machine 2,8746,7341,-4742
+Machine 3,8263,6815,-7237
+Machine 4,4862,12343,-6106
+Machine 5,4810,3688,-1136

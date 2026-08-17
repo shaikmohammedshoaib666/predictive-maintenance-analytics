@@ -1,0 +1,16 @@
+machine_id,work_order,maintenance_type,hours_downtime,technician
+Machine 1,WO-1000,preventive,3.8,Lee
+Machine 1,WO-1001,corrective,5.7,Lee
+Machine 1,WO-1002,preventive,7.8,Asha
+Machine 2,WO-1010,inspection,6.4,Lee
+Machine 2,WO-1011,corrective,3.9,Asha
+Machine 2,WO-1012,corrective,7.5,Raj
+Machine 3,WO-1020,inspection,6.7,Raj
+Machine 3,WO-1021,corrective,2.2,Raj
+Machine 3,WO-1022,preventive,1.0,Raj
+Machine 4,WO-1030,inspection,5.2,Lee
+Machine 4,WO-1031,preventive,3.2,Lee
+Machine 4,WO-1032,preventive,7.2,Lee
+Machine 5,WO-1040,inspection,2.0,Lee
+Machine 5,WO-1041,corrective,0.8,Raj
+Machine 5,WO-1042,corrective,5.6,Asha
