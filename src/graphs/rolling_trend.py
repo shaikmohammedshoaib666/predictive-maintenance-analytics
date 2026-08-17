@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 import config
+from src.graphs.layout import apply_readable_layout
 
 
 def create_rolling_trend(
@@ -50,12 +51,12 @@ def create_rolling_trend(
         rolling = plot_df[y_metric].rolling(window=min(window, len(plot_df)), min_periods=1).mean()
         fig.add_trace(go.Scatter(x=x_vals, y=rolling, mode="lines", name="Rolling avg"))
 
-    fig.update_layout(
-        title=title or f"Rolling Average Trend — {y_metric.replace('_', ' ').title()} (window={window})",
-        template="plotly_white",
+    fig = apply_readable_layout(
+        fig,
+        title or f"Rolling Average Trend — {y_metric.replace('_', ' ').title()} (window={window})",
+        kind="line",
         height=450,
-        hovermode="x unified",
-        xaxis_title=x_axis.replace("_", " ").title() if x_axis in plot_df.columns else "Index",
-        yaxis_title=y_metric.replace("_", " ").title(),
     )
+    fig.update_xaxes(title=x_axis.replace("_", " ").title() if x_axis in plot_df.columns else "Index")
+    fig.update_yaxes(title=y_metric.replace("_", " ").title())
     return fig

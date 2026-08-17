@@ -24,7 +24,8 @@ RETIRED_GEMINI_ALIASES = frozenset(
 )
 
 
-def _resolve_gemini_model(raw: str = "") -> str:
+def get_gemini_model(raw: str = "") -> str:
+    """Prefer GEMINI_MODEL env/secrets; remap retired aliases to gemini-3.6-flash."""
     name = (raw or os.getenv("GEMINI_MODEL", "") or DEFAULT_GEMINI_MODEL).strip()
     if name.lower().startswith("models/"):
         name = name[7:]
@@ -33,7 +34,28 @@ def _resolve_gemini_model(raw: str = "") -> str:
     return name
 
 
-def _gemini_key() -> str:
+def _resolve_gemini_model(raw: str = "") -> str:
+    return get_gemini_model(raw)
+
+
+def persist_session_gemini_key(key: str) -> None:
+    try:
+        import streamlit as st
+
+        st.session_state.gemini_api_key_override = (key or "").strip()
+    except Exception:
+        pass
+
+
+def get_gemini_api_key() -> str:
+    try:
+        import streamlit as st
+
+        override = str(st.session_state.get("gemini_api_key_override", "") or "").strip()
+        if override:
+            return override
+    except Exception:
+        pass
     key = os.getenv("GEMINI_API_KEY", "")
     if key:
         return key
@@ -43,6 +65,56 @@ def _gemini_key() -> str:
         return str(st.secrets.get("GEMINI_API_KEY", "") or "")
     except Exception:
         return ""
+
+
+def _gemini_key() -> str:
+    return get_gemini_api_key()
+
+
+def mask_key(key: str) -> str:
+    key = (key or "").strip()
+    if len(key) > 12:
+        return key[:6] + "…" + key[-4:]
+    return "set" if key else "missing"
+
+
+def test_gemini_connection(prompt: str = "Reply with OK") -> dict[str, Any]:
+    """Tiny generate_content probe — never swallows 404s or other API errors."""
+    key = get_gemini_api_key()
+    model_name = get_gemini_model()
+    if not key:
+        return {
+            "ok": False,
+            "model": model_name,
+            "error": "No Gemini API key (session, GEMINI_API_KEY env, or Streamlit secrets).",
+        }
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel(model_name)
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", None) or str(resp) or "").strip()
+        if not text:
+            return {
+                "ok": False,
+                "model": model_name,
+                "error": "Gemini returned an empty response. Check quota / model name.",
+            }
+        return {"ok": True, "model": model_name, "text": text[:240]}
+    except Exception as exc:
+        return {"ok": False, "model": model_name, "error": str(exc)}
+
+
+def gemini_issue_from_raw(raw: str, *, attempted: bool) -> Optional[str]:
+    if not attempted:
+        return None
+    text = (raw or "").strip()
+    if not text:
+        return "Gemini returned an empty response. Offline methods continued."
+    if text.startswith("[Gemini error]"):
+        return text
+    return None
 
 
 def chart_business_insight(df: pd.DataFrame, x: str, y: str) -> str:
@@ -218,6 +290,7 @@ class InsightIndex:
         self.docs = _row_documents(df)
         mode = "keyword"
         self.index_obj = None
+        error = ""
         try:
             from llama_index.core import Document, VectorStoreIndex
 
@@ -225,14 +298,17 @@ class InsightIndex:
             try:
                 self.index_obj = VectorStoreIndex.from_documents(documents)
                 mode = "llama_vector"
-            except Exception:
+            except Exception as exc:
                 mode = "keyword"
-        except Exception:
+                error = str(exc)
+        except Exception as exc:
             mode = "keyword"
+            error = str(exc)
         self.meta = {
             "ok": True,
             "n_docs": len(self.docs),
             "mode": mode,
+            "error": error,
             "built_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
         return self.meta
@@ -257,8 +333,14 @@ class InsightIndex:
                     )
                 if hits:
                     return hits[:top_k]
-            except Exception:
-                pass
+            except Exception as exc:
+                hits.append(
+                    {
+                        "score": 0.0,
+                        "text": f"[LlamaIndex query error] {exc}",
+                        "source": "llama_error",
+                    }
+                )
 
         q_tokens = set(re.findall(r"[a-zA-Z0-9_.]+", (query or "").lower()))
         scored = []
@@ -293,28 +375,39 @@ def ask_with_index(
 
     offline = _offline_answer(question, hits, df, predictions)
     gemini_ans = ""
-    key = _gemini_key()
+    gemini_error = None
+    key = get_gemini_api_key()
+    gemini_attempted = bool(key)
     if key:
         try:
             import google.generativeai as genai
 
             genai.configure(api_key=key)
-            model_name = _resolve_gemini_model()
+            model_name = get_gemini_model()
             model = genai.GenerativeModel(model_name)
             prompt = (
                 "You are a predictive maintenance analyst. Use ONLY the context.\n"
                 f"Question: {question}\nContext:\n{context}\n"
                 "Give a short actionable answer for plant managers."
             )
-            gemini_ans = model.generate_content(prompt).text or ""
+            gemini_ans = (model.generate_content(prompt).text or "").strip()
+            if not gemini_ans:
+                gemini_error = "Gemini returned an empty response. Offline answer is shown."
         except Exception as exc:
-            gemini_ans = f"(Gemini unavailable: {exc})"
+            gemini_error = f"[Gemini error] {exc}"
+            gemini_ans = ""
+
+    if gemini_error is None:
+        gemini_error = gemini_issue_from_raw(gemini_ans, attempted=gemini_attempted)
 
     return {
         "answer": gemini_ans or offline,
         "offline_answer": offline,
+        "gemini_error": gemini_error,
+        "gemini_attempted": gemini_attempted,
         "hits": hits,
         "mode": idx.meta.get("mode", "keyword"),
+        "index_error": idx.meta.get("error") or "",
     }
 
 

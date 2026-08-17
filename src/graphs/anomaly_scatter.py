@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from src.graphs.layout import apply_readable_layout
 from src.ml.anomaly_detector import AnomalyDetector
 
 
@@ -46,5 +47,10 @@ def create_anomaly_scatter(
         color_discrete_map={"Normal": "#2ecc71", "Anomaly": "#e74c3c"},
         opacity=0.7,
     )
-    fig.update_layout(template="plotly_white", height=450)
-    return fig
+    fig.update_traces(hovertemplate="%{x}<br>%{y}<br>%{fullData.name}<extra></extra>")
+    return apply_readable_layout(
+        fig,
+        title or f"Anomaly scatter: {x_axis} vs {y_metric}",
+        kind="default",
+        height=450,
+    )

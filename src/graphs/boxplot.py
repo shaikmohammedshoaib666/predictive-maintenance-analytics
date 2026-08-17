@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from src.graphs.layout import apply_readable_layout
+
 
 def create_boxplot_by_machine(
     df: pd.DataFrame,
@@ -36,5 +38,10 @@ def create_boxplot_by_machine(
         title=title or f"{y_metric.replace('_', ' ').title()} by Machine",
         points="outliers",
     )
-    fig.update_layout(template="plotly_white", height=450, showlegend=False)
-    return fig
+    fig.update_layout(showlegend=False)
+    return apply_readable_layout(
+        fig,
+        title or f"{y_metric.replace('_', ' ').title()} by Machine",
+        kind="bar",
+        height=450,
+    )

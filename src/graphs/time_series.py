@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from src.graphs.layout import apply_readable_layout
+
 
 def create_time_series_chart(
     df: pd.DataFrame,
@@ -34,10 +36,10 @@ def create_time_series_chart(
         title=title or f"{y_metric.replace('_', ' ').title()} Over Time",
         labels={x_axis: x_axis.replace("_", " ").title(), y_metric: y_metric.replace("_", " ").title()},
     )
-    fig.update_layout(
-        hovermode="x unified",
-        template="plotly_white",
+    fig.update_traces(hovertemplate="%{x}<br>%{y}<extra></extra>")
+    return apply_readable_layout(
+        fig,
+        title or f"{y_metric.replace('_', ' ').title()} Over Time",
+        kind="line",
         height=450,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
-    return fig

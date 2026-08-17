@@ -6,6 +6,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from src.graphs.layout import apply_readable_layout
+
 
 def create_distribution_histogram(
     df: pd.DataFrame,
@@ -33,5 +35,9 @@ def create_distribution_histogram(
         title=title or f"Distribution of {y_metric.replace('_', ' ').title()}",
         opacity=0.75,
     )
-    fig.update_layout(template="plotly_white", height=450)
-    return fig
+    return apply_readable_layout(
+        fig,
+        title or f"Distribution of {y_metric.replace('_', ' ').title()}",
+        kind="bar",
+        height=450,
+    )

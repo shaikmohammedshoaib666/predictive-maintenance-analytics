@@ -1,7 +1,18 @@
-"""Application configuration for Predictive Maintenance Analytics Platform."""
+"""Application configuration for Predictive Maintenance Analytics."""
+
+from __future__ import annotations
 
 import os
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
+except Exception:
+    pass
 
 
 def _setting(key: str, default: str = "") -> str:
@@ -20,7 +31,6 @@ def _setting(key: str, default: str = "") -> str:
 
 
 # Paths
-PROJECT_ROOT = Path(__file__).parent
 SAMPLE_DATA_PATH = PROJECT_ROOT / "sample_data" / "sensor_readings.csv"
 GRAPHS_DIR = PROJECT_ROOT / "graphs"
 DB_PATH = PROJECT_ROOT / "data" / "maintenance.db"
@@ -44,5 +54,16 @@ SENSOR_COLUMNS = ["temperature", "vibration", "pressure", "rpm"]
 ROLLING_WINDOW = 24
 
 # App settings
-APP_TITLE = "Predictive Maintenance Analytics Platform"
+APP_TITLE = "Predictive Maintenance Analytics"
 PAGE_ICON = "⚙️"
+TAGLINE = (
+    "Reliability add-on: sensor CSV → clean → map sensors → Isolation Forest "
+    "anomalies → RUL/risk → charts → insights. Not a generic sales/churn OS "
+    "and not an OEE cockpit."
+)
+RUL_HONESTY_CAPTION = (
+    "Honest RUL needs real failure labels (`failure_within_days` or an alias). "
+    "Sample CSV labels are simulated. Without a label column the model trains on "
+    "a sensor-degradation proxy — treat days-to-fail as a demo, not a plant forecast."
+)
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"

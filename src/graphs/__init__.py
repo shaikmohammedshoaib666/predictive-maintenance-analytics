@@ -1,19 +1,40 @@
 """Graph generation modules for predictive maintenance analytics."""
 
-from src.graphs.time_series import create_time_series_chart
-from src.graphs.heatmap import create_correlation_heatmap
-from src.graphs.anomaly_scatter import create_anomaly_scatter
-from src.graphs.histogram import create_distribution_histogram
-from src.graphs.boxplot import create_boxplot_by_machine
-from src.graphs.rolling_trend import create_rolling_trend
+from __future__ import annotations
 
-GRAPH_TYPES = {
+from src.graphs.anomaly_flags import create_anomaly_flags_chart
+from src.graphs.anomaly_scatter import create_anomaly_scatter
+from src.graphs.boxplot import create_boxplot_by_machine
+from src.graphs.heatmap import create_correlation_heatmap
+from src.graphs.histogram import create_distribution_histogram
+from src.graphs.risk_by_asset import create_risk_by_asset_chart
+from src.graphs.rolling_trend import create_rolling_trend
+from src.graphs.time_series import create_time_series_chart
+
+# Specialist PdM set — not a generic business dashboard pack.
+PRIMARY_CHARTS = {
     "time_series": {
-        "name": "Time Series Line Chart",
-        "description": "Sensor readings over time",
+        "name": "Sensor over time",
+        "description": "Temperature / vibration / pressure / RPM vs time",
         "icon": "📈",
         "create": create_time_series_chart,
     },
+    "anomaly_flags": {
+        "name": "Anomaly flags",
+        "description": "Isolation Forest flags on the sensor timeline",
+        "icon": "⚠️",
+        "create": create_anomaly_flags_chart,
+    },
+    "risk_by_asset": {
+        "name": "Risk by asset",
+        "description": "Predicted RUL (days) colored by High / Medium / Low risk",
+        "icon": "🔴",
+        "create": create_risk_by_asset_chart,
+    },
+}
+
+GRAPH_TYPES = {
+    **PRIMARY_CHARTS,
     "heatmap": {
         "name": "Sensor Correlation Heatmap",
         "description": "Correlations between sensor metrics",

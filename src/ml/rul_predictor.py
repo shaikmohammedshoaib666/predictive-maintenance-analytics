@@ -28,6 +28,8 @@ class RULPredictor:
         self.is_fitted = False
         self.metrics: dict[str, float] = {}
         self.feature_importance: pd.DataFrame | None = None
+        self.used_synthetic_labels = False
+        self.label_source = "none"
 
     def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create rolling features and degradation indicators per machine."""
@@ -62,8 +64,11 @@ class RULPredictor:
         engineered = self._engineer_features(df)
         exclude = {"failure_within_days", "timestamp", "machine_id"}
         feature_cols = [
-            c for c in engineered.columns
-            if c not in exclude and pd.api.types.is_numeric_dtype(engineered[c])
+            c
+            for c in engineered.columns
+            if c not in exclude
+            and pd.api.types.is_numeric_dtype(engineered[c])
+            and not str(c).endswith(("_bin", "_smooth"))
         ]
         self.feature_columns = feature_cols
         X = engineered[feature_cols].fillna(0)
@@ -86,6 +91,11 @@ class RULPredictor:
         X, y = self._get_feature_matrix(df)
         if y is None or y.isna().all():
             y = self._synthetic_rul(df)
+            self.used_synthetic_labels = True
+            self.label_source = "synthetic_degradation_proxy"
+        else:
+            self.used_synthetic_labels = False
+            self.label_source = "failure_within_days"
 
         mask = y.notna()
         X_train, X_test, y_train, y_test = train_test_split(

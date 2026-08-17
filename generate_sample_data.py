@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate sample IoT sensor readings CSV for predictive maintenance demo."""
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
