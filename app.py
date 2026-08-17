@@ -534,7 +534,7 @@ def page_explore_graphs():
                 with st.spinner(f"Creating {ginfo['name']}..."):
                     fig, entry = _make_chart(gkey)
                 st.success(f"Saved: {entry['id']}")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"primary_{gkey}")
 
     extras = [k for k in GRAPH_TYPES if k not in PRIMARY_CHARTS]
     with st.expander("More sensor views (optional)"):
@@ -544,15 +544,16 @@ def page_explore_graphs():
                 with st.spinner(f"Creating {ginfo['name']}..."):
                     fig, entry = _make_chart(gkey)
                 st.success(f"Saved: {entry['id']}")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"extra_{gkey}")
 
     folder = get_graph_folder()
     if folder:
         st.divider()
         st.subheader("Saved Graphs")
-        for g_id, entry in folder.items():
-            with st.expander(f"{entry.get('title', g_id)} — {entry['created_at'][:19]}"):
-                st.plotly_chart(entry["fig"], use_container_width=True)
+        for i, (g_id, entry) in enumerate(folder.items()):
+            title = entry.get("title", g_id)
+            with st.expander(f"{title} — {entry['created_at'][:19]}"):
+                st.plotly_chart(entry["fig"], use_container_width=True, key=f"explore_{i}_{title}")
                 if st.button(f"Remove {g_id}", key=f"rm_{g_id}"):
                     del st.session_state.graph_folder[g_id]
                     st.rerun()
@@ -687,7 +688,7 @@ def page_ml_predictions():
                 fig = style_bar_figure(
                     fig, n_cats=min(10, len(fi)), horizontal=True, title="Top 10 Features for RUL Prediction"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="rul_feature_importance")
 
     if st.session_state.anomaly_summary:
         st.subheader("Anomaly Detection Summary")
