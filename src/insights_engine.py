@@ -12,6 +12,26 @@ import pandas as pd
 
 from src.quality_checks import find_col
 
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+RETIRED_GEMINI_ALIASES = frozenset(
+    {
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+        "gemini-flash-latest-latest",
+        "gemini-1.5-flash",
+        "gemini-pro",
+    }
+)
+
+
+def _resolve_gemini_model(raw: str = "") -> str:
+    name = (raw or os.getenv("GEMINI_MODEL", "") or DEFAULT_GEMINI_MODEL).strip()
+    if name.lower().startswith("models/"):
+        name = name[7:]
+    if not name or name.lower() in RETIRED_GEMINI_ALIASES:
+        return DEFAULT_GEMINI_MODEL
+    return name
+
 
 def _gemini_key() -> str:
     key = os.getenv("GEMINI_API_KEY", "")
@@ -279,7 +299,7 @@ def ask_with_index(
             import google.generativeai as genai
 
             genai.configure(api_key=key)
-            model_name = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+            model_name = _resolve_gemini_model()
             model = genai.GenerativeModel(model_name)
             prompt = (
                 "You are a predictive maintenance analyst. Use ONLY the context.\n"
