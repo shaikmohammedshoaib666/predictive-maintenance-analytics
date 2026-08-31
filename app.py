@@ -41,6 +41,15 @@ from src.live_connect import (
     poll_url_increment,
     simulate_batch,
 )
+from src.live_sources import (
+    get_source,
+    mqtt_available,
+    opcua_available,
+    parse_node_map,
+    start_mqtt,
+    start_opcua,
+    stop_source,
+)
 from src.url_ingest import (
     build_preset_sql,
     default_ingest_sql,
@@ -146,6 +155,7 @@ def init_session_state():
         "live_cfg": {},
         "live_asset_states": [],
         "live_sensor_view": "temperature",
+        "live_conn_id": None,
         # Cleaning engine (Layer 5)
         "clean_engine": "pandas",
     }
@@ -1273,10 +1283,11 @@ def page_twin_3d():
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
 def _live_body():
     cfg = dict(st.session_state.get("live_cfg") or {})
+    source = st.session_state.get("live_source")
     if st.session_state.get("live_running"):
         tick = int(st.session_state.get("live_tick") or 0)
         batch = pd.DataFrame()
-        if st.session_state.get("live_source") == "poll":
+        if source == "poll":
             try:
                 batch, new_off = poll_url_increment(
                     cfg.get("url", ""), UPLOAD_DIR, int(cfg.get("offset", 0)), int(cfg.get("poll_n", 30))
@@ -1289,6 +1300,18 @@ def _live_body():
             except Exception as exc:
                 st.session_state.live_running = False
                 st.error(f"Poll failed: {exc}")
+        elif source in ("mqtt", "opcua"):
+            src = get_source(st.session_state.get("live_conn_id"))
+            if src is None:
+                st.session_state.live_running = False
+                st.warning("Live connection was lost (server restarted?). Press Start live again.")
+            else:
+                try:
+                    batch = src.drain() if source == "mqtt" else src.poll_once()
+                except Exception as exc:
+                    st.error(f"{source.upper()} read failed: {exc}")
+                if getattr(src, "error", None):
+                    st.caption(f"{source.upper()} note: {src.error}")
         else:
             ramp = max(1, int(cfg.get("ramp_ticks", 40)))
             stress = min(1.0, tick / ramp)
@@ -1301,7 +1324,7 @@ def _live_body():
             )
         if not batch.empty:
             st.session_state.live_buffer = append_to_buffer(st.session_state.get("live_buffer"), batch)
-            st.session_state.live_tick = tick + 1
+        st.session_state.live_tick = tick + 1
 
     buffer = st.session_state.get("live_buffer")
     if buffer is None or buffer.empty:
@@ -1353,16 +1376,30 @@ def page_live_connect():
         unsafe_allow_html=True,
     )
 
-    source = st.radio(
-        "Source",
-        ["Simulator", "Poll CSV URL"],
-        horizontal=True,
-        index=0 if st.session_state.get("live_source", "sim") == "sim" else 1,
-    )
-    st.session_state.live_source = "sim" if source == "Simulator" else "poll"
+    source_labels = ["Simulator", "Poll CSV URL"]
+    mq_ok, mq_msg = mqtt_available()
+    op_ok, op_msg = opcua_available()
+    if mq_ok:
+        source_labels.append("MQTT (live)")
+    if op_ok:
+        source_labels.append("OPC-UA (live)")
+    label_to_code = {
+        "Simulator": "sim",
+        "Poll CSV URL": "poll",
+        "MQTT (live)": "mqtt",
+        "OPC-UA (live)": "opcua",
+    }
+    code_to_label = {v: k for k, v in label_to_code.items()}
+    cur_label = code_to_label.get(st.session_state.get("live_source", "sim"), "Simulator")
+    if cur_label not in source_labels:
+        cur_label = "Simulator"
+    source = st.radio("Source", source_labels, horizontal=True, index=source_labels.index(cur_label))
+    st.session_state.live_source = label_to_code[source]
+    code = st.session_state.live_source
+    st.caption(f"Real-protocol sources — MQTT: {'✓ ' + mq_msg if mq_ok else 'unavailable'} · OPC-UA: {'✓ ' + op_msg if op_ok else 'unavailable'}")
 
     cfg = dict(st.session_state.get("live_cfg") or {})
-    if st.session_state.live_source == "sim":
+    if code == "sim":
         c1, c2, c3 = st.columns(3)
         with c1:
             n_machines = st.slider("Machines", 2, 8, int(cfg.get("n_machines", 4)))
@@ -1375,27 +1412,75 @@ def page_live_connect():
         cfg.update(
             {"n_machines": n_machines, "machines": machines, "failing": failing, "ramp_ticks": ramp, "freq": 5}
         )
-    else:
+    elif code == "poll":
         cfg["url"] = st.text_input(
             "CSV feed URL", value=cfg.get("url", "http://localhost:8000/sensor_readings.csv")
         )
         cfg["poll_n"] = st.slider("Rows per poll", 5, 200, int(cfg.get("poll_n", 30)))
         cfg.setdefault("offset", 0)
+    elif code == "mqtt":
+        c1, c2, c3 = st.columns([2, 1, 2])
+        with c1:
+            cfg["host"] = st.text_input("Broker host", value=cfg.get("host", "127.0.0.1"))
+        with c2:
+            cfg["port"] = int(st.number_input("Port", 1, 65535, int(cfg.get("port", 1883))))
+        with c3:
+            cfg["topic"] = st.text_input("Topic (wildcards OK)", value=cfg.get("topic", "pdm/sensors/#"))
+        c4, c5 = st.columns(2)
+        with c4:
+            cfg["username"] = st.text_input("Username (optional)", value=cfg.get("username", ""))
+        with c5:
+            cfg["password"] = st.text_input(
+                "Password (optional)", value=cfg.get("password", ""), type="password"
+            )
+        st.caption(
+            'Expects JSON payloads like `{"machine_id":"M-001","temperature":72,"vibration":2.1,'
+            '"pressure":100,"rpm":1500}`.'
+        )
+    elif code == "opcua":
+        cfg["endpoint"] = st.text_input(
+            "OPC-UA endpoint", value=cfg.get("endpoint", "opc.tcp://127.0.0.1:4840/freeopcua/server/")
+        )
+        cfg["node_map_text"] = st.text_area(
+            "Node map — `sensor=node_id`, comma-separated",
+            value=cfg.get("node_map_text", "temperature=ns=2;i=2, vibration=ns=2;i=3"),
+            height=80,
+        )
+        cfg["machine_id"] = st.text_input("Machine id label", value=cfg.get("machine_id", "opcua-asset"))
+        st.caption("Each poll reads the listed node IDs. Example node id: `ns=2;i=2`.")
     st.session_state.live_cfg = cfg
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
         if st.button("▶ Start live", type="primary", use_container_width=True):
-            st.session_state.live_running = True
-            if st.session_state.live_source == "poll":
-                cfg["offset"] = 0
-                st.session_state.live_cfg = cfg
+            stop_source(st.session_state.get("live_conn_id"))
+            st.session_state.live_conn_id = None
+            started = True
+            try:
+                if code == "poll":
+                    cfg["offset"] = 0
+                    st.session_state.live_cfg = cfg
+                elif code == "mqtt":
+                    st.session_state.live_conn_id = start_mqtt(cfg)
+                elif code == "opcua":
+                    ocfg = dict(cfg)
+                    ocfg["node_map"] = parse_node_map(cfg.get("node_map_text", ""))
+                    if not ocfg["node_map"]:
+                        raise ValueError("Provide at least one `sensor=node_id` in the node map.")
+                    st.session_state.live_conn_id = start_opcua(ocfg)
+            except Exception as exc:
+                started = False
+                st.error(f"Could not start {code} source: {exc}")
+            if started:
                 st.session_state.live_buffer = None
                 st.session_state.live_tick = 0
-            st.rerun()
+                st.session_state.live_running = True
+                st.rerun()
     with ctrl2:
         if st.button("⏸ Stop", use_container_width=True):
             st.session_state.live_running = False
+            stop_source(st.session_state.get("live_conn_id"))
+            st.session_state.live_conn_id = None
             st.rerun()
     with ctrl3:
         if st.button("Reset buffer", use_container_width=True):
