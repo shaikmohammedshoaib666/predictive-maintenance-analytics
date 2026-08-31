@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -33,6 +34,13 @@ from src.data_insights import analyze_columns, format_insights_markdown
 from src.data_integration import JOIN_TYPES, join_many, join_two, load_tabular_file, suggest_join_keys
 from src.dwdm_sql import DWDM_CONCEPTS, apply_dwdm_transforms, default_sql_examples, run_sql
 from src.email_report import generate_email_body, send_email
+from src.live_connect import (
+    append_to_buffer,
+    compute_live_status,
+    default_machines,
+    poll_url_increment,
+    simulate_batch,
+)
 from src.url_ingest import (
     build_preset_sql,
     default_ingest_sql,
@@ -61,8 +69,10 @@ from src.insights_engine import (
 from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
+from src.twin3d import RISK_COLORS, asset_states_from_predictions, build_twin_html
 from src.quality_checks import QUALITY_STAGE_COUNT
 from src.sensor_map import CANONICAL_FIELDS, apply_mapping, mapping_status, suggest_mapping
+from src.spark_clean import clean_with_spark, spark_available
 
 st.set_page_config(
     page_title=config.APP_TITLE,
@@ -128,6 +138,16 @@ def init_session_state():
         "url_ingest_preset": "filter_machine_id",
         "url_ingest_preset_params": {},
         "maintenance_table_attached": None,
+        # Live Connect (Layer 4)
+        "live_running": False,
+        "live_tick": 0,
+        "live_buffer": None,
+        "live_source": "sim",
+        "live_cfg": {},
+        "live_asset_states": [],
+        "live_sensor_view": "temperature",
+        # Cleaning engine (Layer 5)
+        "clean_engine": "pandas",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -501,16 +521,49 @@ def page_upload_clean():
         st.subheader("Raw Data Preview")
         st.dataframe(st.session_state.raw_df.head(10), use_container_width=True)
 
+        engines = ["pandas"]
+        spark_ok, spark_msg = spark_available()
+        if spark_ok:
+            engines.append("pyspark")
+        eng_col1, eng_col2 = st.columns([1, 2])
+        with eng_col1:
+            clean_engine = st.selectbox(
+                "Cleaning engine",
+                engines,
+                index=engines.index(st.session_state.get("clean_engine", "pandas"))
+                if st.session_state.get("clean_engine", "pandas") in engines
+                else 0,
+                help="PySpark (distributed) appears when pyspark + a JVM are installed.",
+            )
+        with eng_col2:
+            st.caption(
+                f"PySpark: **available** — {spark_msg}"
+                if spark_ok
+                else f"PySpark: not available ({spark_msg}) — pandas engine is used."
+            )
+        st.session_state.clean_engine = clean_engine
+
         if st.button("Run industrial clean + 19 quality checks", type="primary"):
-            with st.spinner("Cleaning + running 19 quality stages..."):
-                cleaned, summary, report = clean_and_quality(st.session_state.raw_df, run_quality=True)
+            with st.spinner(f"Cleaning with {clean_engine} + running 19 quality stages..."):
+                raw = st.session_state.raw_df
+                spark_log: list[str] = []
+                source_df = raw
+                if clean_engine == "pyspark":
+                    try:
+                        source_df, spark_log = clean_with_spark(raw)
+                    except Exception as exc:
+                        st.warning(f"PySpark clean failed — falling back to pandas: {exc}")
+                        source_df = raw
+                cleaned, summary, report = clean_and_quality(source_df, run_quality=True)
+                if spark_log:
+                    summary["actions"] = spark_log + summary.get("actions", [])
                 insights = analyze_columns(cleaned)
                 st.session_state.cleaned_df = cleaned
                 st.session_state.cleaning_summary = summary
                 st.session_state.quality_report = report
                 st.session_state.insights = insights
                 register_table("cleaned", cleaned)
-            st.success(f"Cleaned: {summary['rows_before']} → {summary['rows_after']} rows")
+            st.success(f"Cleaned ({clean_engine}): {summary['rows_before']} → {summary['rows_after']} rows")
             if summary["actions"]:
                 with st.expander("ETL / DWDM actions"):
                     for action in summary["actions"]:
@@ -1159,6 +1212,206 @@ def page_business_insights():
     render_ask_panel(df)
 
 
+# ── 3D Digital Twin (Layer 3) ─────────────────────────────────────────────────
+def page_twin_3d():
+    st.markdown('<p class="main-header">3D Digital Twin</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Rotatable 3D asset. The drive-end bearing turns red and blinks '
+        "when the selected machine's predicted risk is High (amber = Medium, green = Low). "
+        "Asset-agnostic — the same twin serves any rotating machine.</p>",
+        unsafe_allow_html=True,
+    )
+
+    states = asset_states_from_predictions(st.session_state.get("predictions") or [])
+    live_states = st.session_state.get("live_asset_states") or []
+    if live_states and not states:
+        states = live_states
+
+    if states:
+        ids = [s["machine_id"] for s in states]
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            selected = st.selectbox("Asset", ids, key="twin_asset_pick")
+        sel = next((s for s in states if s["machine_id"] == selected), states[0])
+        with c2:
+            st.metric("Predicted risk", sel["risk_level"])
+        components.html(build_twin_html(states, selected_id=selected, height=540), height=560)
+        st.caption(
+            "Risk is read live from **3. Anomaly & RUL** (or Live Connect). "
+            "Rotate with the mouse; scroll to zoom."
+        )
+    else:
+        st.info(
+            "No predictions yet. Run **3. Anomaly & RUL** to drive the twin from real risk, "
+            "or preview it with a manual risk below."
+        )
+        demo_risk = st.selectbox("Preview risk", ["High", "Medium", "Low"], index=0)
+        demo_rul = {"High": 3, "Medium": 12, "Low": 26}[demo_risk]
+        demo = [{"machine_id": "demo-motor", "risk_level": demo_risk, "predicted_rul_days": demo_rul}]
+        components.html(build_twin_html(demo, selected_id="demo-motor", height=540), height=560)
+
+    st.caption(
+        "Legend — "
+        + " · ".join(
+            f"**{k}** {v['hex']}" for k, v in RISK_COLORS.items() if k != "Unknown"
+        )
+    )
+
+
+# ── Live Connect (Layer 4) ────────────────────────────────────────────────────
+def _live_body():
+    cfg = dict(st.session_state.get("live_cfg") or {})
+    if st.session_state.get("live_running"):
+        tick = int(st.session_state.get("live_tick") or 0)
+        batch = pd.DataFrame()
+        if st.session_state.get("live_source") == "poll":
+            try:
+                batch, new_off = poll_url_increment(
+                    cfg.get("url", ""), UPLOAD_DIR, int(cfg.get("offset", 0)), int(cfg.get("poll_n", 30))
+                )
+                cfg["offset"] = new_off
+                st.session_state.live_cfg = cfg
+                if batch.empty:
+                    st.session_state.live_running = False
+                    st.info("Reached end of feed — stopped.")
+            except Exception as exc:
+                st.session_state.live_running = False
+                st.error(f"Poll failed: {exc}")
+        else:
+            ramp = max(1, int(cfg.get("ramp_ticks", 40)))
+            stress = min(1.0, tick / ramp)
+            batch = simulate_batch(
+                cfg.get("machines") or default_machines(),
+                tick,
+                failing=cfg.get("failing"),
+                stress=stress,
+                freq_seconds=int(cfg.get("freq", 5)),
+            )
+        if not batch.empty:
+            st.session_state.live_buffer = append_to_buffer(st.session_state.get("live_buffer"), batch)
+            st.session_state.live_tick = tick + 1
+
+    buffer = st.session_state.get("live_buffer")
+    if buffer is None or buffer.empty:
+        st.info("Press **Start live** to begin streaming sensor data.")
+        return
+
+    status = compute_live_status(buffer)
+    st.session_state.live_asset_states = status
+
+    worst = status[0] if status else None
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Rows buffered", f"{len(buffer):,}")
+    m2.metric("Machines", buffer["machine_id"].nunique() if "machine_id" in buffer.columns else 0)
+    if worst:
+        m3.metric(
+            "Worst asset",
+            f"{worst['machine_id']} · {worst['risk_level']}",
+            f"{worst['anomaly_rate_pct']}% anomalies",
+        )
+
+    st.subheader("Live asset status")
+    st.dataframe(pd.DataFrame(status), use_container_width=True)
+
+    sensor = st.session_state.get("live_sensor_view", "temperature")
+    if sensor in buffer.columns and "timestamp" in buffer.columns:
+        import plotly.express as px
+
+        recent = buffer.tail(300)
+        fig = px.line(
+            recent,
+            x="timestamp",
+            y=sensor,
+            color="machine_id",
+            title=f"Live {sensor} (last {len(recent)} readings)",
+        )
+        fig.update_layout(height=340, margin=dict(l=40, r=20, t=48, b=40))
+        st.plotly_chart(
+            fig, use_container_width=True, key=f"live_chart_{sensor}_{st.session_state.get('live_tick')}"
+        )
+
+    st.caption(f"tick {st.session_state.get('live_tick')} · live risk feeds Insights + 3D Twin")
+
+
+def page_live_connect():
+    st.markdown('<p class="main-header">Live Connect</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Streaming ingest into the PdM pipeline. Simulate live assets or poll a '
+        "remote CSV feed; live risk drives the 3D Twin in near-real-time.</p>",
+        unsafe_allow_html=True,
+    )
+
+    source = st.radio(
+        "Source",
+        ["Simulator", "Poll CSV URL"],
+        horizontal=True,
+        index=0 if st.session_state.get("live_source", "sim") == "sim" else 1,
+    )
+    st.session_state.live_source = "sim" if source == "Simulator" else "poll"
+
+    cfg = dict(st.session_state.get("live_cfg") or {})
+    if st.session_state.live_source == "sim":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            n_machines = st.slider("Machines", 2, 8, int(cfg.get("n_machines", 4)))
+        machines = default_machines(n_machines)
+        with c2:
+            fail_idx = machines.index(cfg["failing"]) if cfg.get("failing") in machines else 0
+            failing = st.selectbox("Failing asset (drifts to failure)", machines, index=fail_idx)
+        with c3:
+            ramp = st.slider("Ramp ticks to failure", 10, 120, int(cfg.get("ramp_ticks", 40)))
+        cfg.update(
+            {"n_machines": n_machines, "machines": machines, "failing": failing, "ramp_ticks": ramp, "freq": 5}
+        )
+    else:
+        cfg["url"] = st.text_input(
+            "CSV feed URL", value=cfg.get("url", "http://localhost:8000/sensor_readings.csv")
+        )
+        cfg["poll_n"] = st.slider("Rows per poll", 5, 200, int(cfg.get("poll_n", 30)))
+        cfg.setdefault("offset", 0)
+    st.session_state.live_cfg = cfg
+
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
+    with ctrl1:
+        if st.button("▶ Start live", type="primary", use_container_width=True):
+            st.session_state.live_running = True
+            if st.session_state.live_source == "poll":
+                cfg["offset"] = 0
+                st.session_state.live_cfg = cfg
+                st.session_state.live_buffer = None
+                st.session_state.live_tick = 0
+            st.rerun()
+    with ctrl2:
+        if st.button("⏸ Stop", use_container_width=True):
+            st.session_state.live_running = False
+            st.rerun()
+    with ctrl3:
+        if st.button("Reset buffer", use_container_width=True):
+            st.session_state.live_buffer = None
+            st.session_state.live_tick = 0
+            st.session_state.live_asset_states = []
+            st.rerun()
+    with ctrl4:
+        st.session_state.live_sensor_view = st.selectbox(
+            "Live chart",
+            ["temperature", "vibration", "pressure", "rpm"],
+            index=["temperature", "vibration", "pressure", "rpm"].index(
+                st.session_state.get("live_sensor_view", "temperature")
+            ),
+        )
+
+    running = bool(st.session_state.get("live_running"))
+    st.caption(("🟢 streaming (auto-refresh ~2s)" if running else "⚪ stopped") + " — open **3D Twin** to see risk in 3D")
+
+    interval = 2.0 if running else None
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=interval)(_live_body)()
+    else:
+        _live_body()
+        if running:
+            st.warning("Auto-refresh needs Streamlit ≥1.37; click Start again to advance a tick.")
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def page_dashboard_builder():
     st.markdown('<p class="main-header">Dashboard Builder</p>', unsafe_allow_html=True)
@@ -1257,6 +1510,8 @@ def main():
         "3. Anomaly & RUL": page_ml_predictions,
         "4. Charts": page_explore_graphs,
         "5. Insights": page_business_insights,
+        "3D Twin": page_twin_3d,
+        "Live Connect": page_live_connect,
         "AI Assistant": page_ai_assistant,
         "Email Report": page_email_report,
         "Dashboard": page_dashboard_builder,
