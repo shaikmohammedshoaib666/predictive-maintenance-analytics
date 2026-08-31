@@ -47,6 +47,14 @@ def main() -> int:
     from src.ml.anomaly_detector import AnomalyDetector
     from src.ml.rul_predictor import RULPredictor
     from src.sensor_map import apply_mapping, suggest_mapping
+    from src.url_ingest import (
+        build_preset_sql,
+        default_ingest_sql,
+        detect_source_kind,
+        list_ingest_presets,
+        resolve_source_to_fetch_url,
+        validate_ingest_sql,
+    )
 
     sample = pd.read_csv(config.SAMPLE_DATA_PATH, parse_dates=["timestamp"])
 
@@ -201,6 +209,30 @@ def main() -> int:
         named = ask_with_index("Tell me about LineB", scored, predictions=preds, ranked=ranked)
         assert "LineB" in named["offline_answer"]
 
+    def test_url_ingest_presets() -> None:
+        # DuckDB URL/cloud ingest + SQL slice presets ported from analytics-forge-v2.
+        presets = list_ingest_presets(domain="predictive_maintenance")
+        ids = {p["id"] for p in presets}
+        assert {"filter_machine_id", "pdm_failure_focus", "last_n_rows"} <= ids
+        sql = build_preset_sql("filter_machine_id", {"machine_id": "M-001", "n": 100})
+        assert "{source}" in sql and "M-001" in sql and "LIMIT 100" in sql
+        assert "LIMIT" not in build_preset_sql("filter_machine_id", {"machine_id": "M-1", "n": 0}).upper()
+        # String params are SQL-escaped (single quote doubled).
+        assert "''" in build_preset_sql("filter_machine_id", {"machine_id": "x' OR '1'='1", "n": 5})
+        assert "{source}" in default_ingest_sql("predictive_maintenance")
+        assert detect_source_kind("https://drive.google.com/file/d/ABC/view") == "google_drive"
+        assert detect_source_kind("kaggle://owner/ds/f.csv") == "kaggle_api"
+        assert detect_source_kind("https://example.com/a.csv") == "https"
+        validate_ingest_sql("SELECT * FROM read_csv_auto('{source}')")
+        for bad in ("DROP TABLE x", "SELECT 1; DELETE FROM y"):
+            try:
+                validate_ingest_sql(bad)
+                raise AssertionError(f"validate_ingest_sql should reject: {bad}")
+            except ValueError:
+                pass
+        target, meta = resolve_source_to_fetch_url("https://www.dropbox.com/s/x/a.csv?dl=0")
+        assert target.endswith("dl=1") and meta["kind"] == "https"
+
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
         det = AnomalyDetector()
@@ -228,6 +260,7 @@ def main() -> int:
     check("map_clean", test_map_clean)
     check("anomaly_rul_insights", test_anomaly_rul_insights)
     check("industrial_brief_tiny_frame", test_industrial_brief_tiny_frame)
+    check("url_ingest_presets", test_url_ingest_presets)
     check("charts_layout", test_charts)
 
     if errors:

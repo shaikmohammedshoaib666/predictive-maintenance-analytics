@@ -10,12 +10,16 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Cache dir for URL / cloud ingest (DuckDB reads large remote files from disk).
+UPLOAD_DIR = PROJECT_ROOT / "output" / "uploads"
 
 import config
 from src.dashboard_builder import (
@@ -29,6 +33,13 @@ from src.data_insights import analyze_columns, format_insights_markdown
 from src.data_integration import JOIN_TYPES, join_many, join_two, load_tabular_file, suggest_join_keys
 from src.dwdm_sql import DWDM_CONCEPTS, apply_dwdm_transforms, default_sql_examples, run_sql
 from src.email_report import generate_email_body, send_email
+from src.url_ingest import (
+    build_preset_sql,
+    default_ingest_sql,
+    friendly_source_label,
+    list_ingest_presets,
+    load_from_url,
+)
 from src.graphs import GRAPH_TYPES, PRIMARY_CHARTS
 from src.graphs.layout import style_bar_figure
 from src.insights_engine import (
@@ -107,6 +118,16 @@ def init_session_state():
         "asset_ranking": [],
         "inspect_list": [],
         "polished_brief": "",
+        # URL / cloud ingest (DuckDB httpfs + SQL slice presets, ported from Forge v2)
+        "url_ingest_source": "",
+        "url_ingest_row_limit": 0,
+        "url_ingest_force_cache": True,
+        "url_ingest_meta": None,
+        "url_ingest_mode": "limit",
+        "url_ingest_sql": default_ingest_sql("predictive_maintenance"),
+        "url_ingest_preset": "filter_machine_id",
+        "url_ingest_preset_params": {},
+        "maintenance_table_attached": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -193,39 +214,285 @@ def load_sample_data():
     return None
 
 
+# PdM app domain — drives which URL SQL slice presets are offered.
+PDM_DOMAIN = "predictive_maintenance"
+
+
+# ── URL / cloud ingest tab (DuckDB httpfs + SQL slice presets, ported from Forge v2) ──
+def _ingest_from_url_tab():
+    st.caption(
+        "Paste a **direct HTTPS CSV/Parquet** link, a **Google Drive** share URL "
+        "(Anyone with the link), or a **Kaggle** dataset page / `kaggle://owner/dataset/file.csv`. "
+        "Kaggle needs `KAGGLE_USERNAME` + `KAGGLE_KEY` secrets. DuckDB streams the slice."
+    )
+    url_val = st.text_input(
+        "Cloud data URL",
+        value=st.session_state.get("url_ingest_source", ""),
+        placeholder="https://drive.google.com/file/d/…/view  or  https://www.kaggle.com/datasets/…",
+        key="upload_url_input",
+    )
+    ingest_mode = st.radio(
+        "Ingest mode",
+        ["Row limit (simple)", "SQL slice (DuckDB)"],
+        index=1 if st.session_state.get("url_ingest_mode") == "sql" else 0,
+        horizontal=True,
+        key="upload_url_ingest_mode",
+        help="For 10M+ row sensor logs: use a SQL slice to filter/limit before Clean → Map → ML.",
+    )
+    st.session_state.url_ingest_mode = "sql" if ingest_mode.startswith("SQL") else "limit"
+
+    row_limit = 0
+    sql_query: Optional[str] = None
+    if st.session_state.url_ingest_mode == "limit":
+        row_limit = st.number_input(
+            "Row limit (0 = all rows — cap on free hosts for multi-GB files)",
+            min_value=0,
+            value=int(st.session_state.get("url_ingest_row_limit") or 0),
+            step=1000,
+            key="upload_url_row_limit",
+        )
+    else:
+        presets = list_ingest_presets(domain=PDM_DOMAIN)
+        preset_ids = [p["id"] for p in presets]
+        preset_labels = {p["id"]: p["label"] for p in presets}
+        cur_preset = st.session_state.get("url_ingest_preset") or preset_ids[0]
+        if cur_preset not in preset_ids:
+            cur_preset = preset_ids[0]
+        preset_pick = st.selectbox(
+            "SQL slice preset (plant / PdM templates)",
+            preset_ids,
+            index=preset_ids.index(cur_preset),
+            format_func=lambda pid: preset_labels.get(pid, pid),
+            key="upload_url_sql_preset",
+        )
+        picked = next(p for p in presets if p["id"] == preset_pick)
+        st.caption(picked.get("description") or "")
+        preset_params: dict[str, Any] = dict(st.session_state.get("url_ingest_preset_params") or {})
+        params_spec = picked.get("params") or []
+        param_cols = st.columns(min(3, max(1, len(params_spec))))
+        for idx, (pname, plabel, pdefault, pkind) in enumerate(params_spec):
+            with param_cols[idx % len(param_cols)]:
+                if pkind == "int":
+                    preset_params[pname] = st.number_input(
+                        plabel,
+                        min_value=0,
+                        value=int(preset_params.get(pname, pdefault) or pdefault),
+                        step=max(1, int(pdefault) // 10) if int(pdefault) > 10 else 1,
+                        key=f"upload_preset_{preset_pick}_{pname}",
+                    )
+                elif pkind == "float":
+                    preset_params[pname] = st.number_input(
+                        plabel,
+                        min_value=0.1,
+                        max_value=100.0,
+                        value=float(preset_params.get(pname, pdefault) or pdefault),
+                        step=0.5,
+                        key=f"upload_preset_{preset_pick}_{pname}",
+                    )
+                else:
+                    preset_params[pname] = st.text_input(
+                        plabel,
+                        value=str(preset_params.get(pname, pdefault) or pdefault),
+                        key=f"upload_preset_{preset_pick}_{pname}",
+                    )
+        if st.button("Apply preset to SQL", key="upload_apply_sql_preset"):
+            try:
+                st.session_state.url_ingest_sql = build_preset_sql(preset_pick, preset_params)
+                st.session_state.url_ingest_preset = preset_pick
+                st.session_state.url_ingest_preset_params = preset_params
+                st.success(f"Applied **{preset_labels[preset_pick]}** template.")
+            except Exception as exc:
+                st.error(str(exc))
+        sql_query = st.text_area(
+            "DuckDB SQL (use `{source}` for the resolved file path/URL)",
+            value=st.session_state.get("url_ingest_sql") or default_ingest_sql(PDM_DOMAIN),
+            height=160,
+            key="upload_url_sql",
+        )
+    force_cache = st.checkbox(
+        "Always download to disk first (recommended for Google Drive / files > 100 MB)",
+        value=bool(st.session_state.get("url_ingest_force_cache", True)),
+        key="upload_url_force_cache",
+    )
+    if st.button("Load from URL", key="upload_url_load", type="primary"):
+        if not (url_val or "").strip():
+            st.warning("Paste a URL first.")
+        else:
+            try:
+                with st.spinner("Resolving link and loading via DuckDB…"):
+                    limit = int(row_limit) if row_limit and row_limit > 0 else None
+                    sql = (sql_query or "").strip() if st.session_state.url_ingest_mode == "sql" else None
+                    loaded, meta = load_from_url(
+                        url_val.strip(),
+                        cache_dir=UPLOAD_DIR,
+                        row_limit=limit,
+                        force_cache=force_cache or bool(sql),
+                        sql_query=sql,
+                    )
+                label = friendly_source_label(meta)
+                st.session_state.raw_df = loaded
+                st.session_state.data_loaded = True
+                register_table(label.replace(":", "_") or "url_data", loaded)
+                st.session_state.url_ingest_source = url_val.strip()
+                st.session_state.url_ingest_row_limit = int(row_limit or 0)
+                st.session_state.url_ingest_force_cache = force_cache
+                if sql_query is not None:
+                    st.session_state.url_ingest_sql = sql_query
+                st.session_state.url_ingest_meta = meta
+                st.session_state.cleaned_df = None  # new source invalidates prior cleaned table
+                eng = meta.get("engine", "duckdb")
+                cached = meta.get("cached_path")
+                extra = f" · cached `{Path(cached).name}`" if cached else ""
+                st.success(
+                    f"Loaded **{label}** via **{eng}** — {len(loaded):,} rows × {loaded.shape[1]} cols{extra}"
+                )
+                if meta.get("stream_error"):
+                    st.caption(f"Stream read fell back to disk cache: {meta['stream_error'][:120]}")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state.get("url_ingest_meta") and st.session_state.raw_df is not None:
+        meta = st.session_state.url_ingest_meta
+        st.caption(
+            f"Current URL source · kind `{meta.get('kind')}` · engine `{meta.get('engine')}` · "
+            f"{meta.get('rows', 0):,} rows"
+        )
+
+
+def _render_maintenance_attach():
+    with st.expander("Attach maintenance table (optional — join on Joins lab)"):
+        st.caption(
+            "Upload a work-order / PM schedule CSV (columns like `machine_id`, `maintenance_date`, "
+            "`work_order`). It registers as `maintenance` for INNER/LEFT joins with sensor data."
+        )
+        maint_file = st.file_uploader(
+            "Maintenance / work-order CSV",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="upload_maintenance_table",
+        )
+        if maint_file is not None:
+            try:
+                maint_df = load_tabular_file(maint_file)
+                register_table("maintenance", maint_df)
+                st.session_state.maintenance_table_attached = maint_file.name
+                st.success(
+                    f"Registered **maintenance** — {len(maint_df):,} rows × {maint_df.shape[1]} cols. "
+                    "Open **Joins (lab)** to merge on `machine_id`."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+        elif st.session_state.get("maintenance_table_attached"):
+            st.write(
+                f"Attached: **{st.session_state.maintenance_table_attached}** (see Joins lab to merge)."
+            )
+
+
+def _render_quality_subreports(report: dict) -> None:
+    """Human-readable GE / ydata / Cleanlab / PCA / association / OPC sub-reports."""
+    ge = report.get("ge") or {}
+    yd = report.get("ydata") or {}
+    cl = report.get("cleanlab") or {}
+    pca = report.get("pca") or {}
+    assoc = report.get("association") or {}
+    flags = report.get("domain_flags")
+
+    with st.expander("Great Expectations — column expectations"):
+        st.caption(
+            f"{ge.get('passed', 0)}/{ge.get('total', 0)} expectations passed · "
+            f"library available: {ge.get('available')}"
+        )
+        results = ge.get("results") or []
+        if results:
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+    with st.expander("ydata / Cleanlab / PCA drift / Association rules"):
+        st.markdown("**ydata-profiling**")
+        if yd.get("ok"):
+            st.success(f"Profile OK — {yd.get('variables', 0)} variables, {yd.get('alerts', 0)} alerts.")
+        else:
+            st.warning(yd.get("error") or "ydata-profiling not installed / did not complete.")
+        if yd.get("high_cardinality"):
+            st.caption("High-cardinality columns: " + ", ".join(yd["high_cardinality"]))
+
+        st.markdown("**Cleanlab — dirty labels / outliers**")
+        if cl.get("ok"):
+            if cl.get("skipped"):
+                st.info(f"Skipped: {cl['skipped']}")
+            else:
+                st.success(f"Outlier issues flagged: {cl.get('outlier_issues', 0)}")
+        else:
+            st.warning(cl.get("error") or "Cleanlab not installed / check failed.")
+        for line in cl.get("dirty_label_flags") or []:
+            st.warning(line)
+
+        st.markdown("**PCA concept drift**")
+        if pca.get("ok"):
+            drift = "yes" if pca.get("concept_drift") else "no"
+            st.write(
+                f"Early var={pca.get('pca_var_early')} · Late var={pca.get('pca_var_late')} · "
+                f"drift={pca.get('drift_score')} · concept drift={drift}"
+            )
+        else:
+            st.caption("PCA drift skipped (need ≥30 rows and 2 numeric columns).")
+
+        st.markdown("**Association rule mining**")
+        if assoc.get("ok"):
+            if assoc.get("suspicious_rules"):
+                st.warning(f"Suspicious HIGH-sensor co-occurrences: {len(assoc['suspicious_rules'])}")
+                for rule in assoc["suspicious_rules"][:5]:
+                    st.write(f"- {rule.get('rule')} (conf={rule.get('confidence')})")
+            else:
+                st.success(f"Mined {assoc.get('rules_found', 0)} rules — none flagged suspicious.")
+        else:
+            st.caption(assoc.get("error") or assoc.get("skipped") or "Association mining skipped.")
+
+    if flags:
+        with st.expander("Domain OPC / physics-rule violations", expanded=True):
+            for flag in flags:
+                st.error(flag)
+
+
 # ── Upload & Clean (19-stage quality) ─────────────────────────────────────────
 def page_upload_clean():
     st.markdown('<p class="main-header">1. Upload & Clean</p>', unsafe_allow_html=True)
     st.markdown(f'<p class="sub-header">{config.TAGLINE}</p>', unsafe_allow_html=True)
     st.caption(
         f"Industrial ETL + {QUALITY_STAGE_COUNT}-stage quality checks on sensor CSVs. "
-        "Next: map columns, then anomaly / RUL."
+        "Load from file, cloud URL, or Kaggle. Next: map columns, then anomaly / RUL."
     )
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded_files = st.file_uploader(
-            "Upload sensor / ops CSVs (multi-select OK)",
-            type=["csv", "tsv", "xlsx", "json"],
-            accept_multiple_files=True,
-        )
-    with col2:
-        if st.button("Load Sample Data", use_container_width=True):
-            load_sample_data()
-            st.success("Sample sensors (+ maintenance/costs if present) loaded!")
-            st.rerun()
+    tab_file, tab_url = st.tabs(["File upload", "From URL (cloud / DuckDB)"])
+    with tab_file:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            uploaded_files = st.file_uploader(
+                "Upload sensor / ops CSVs (multi-select OK)",
+                type=["csv", "tsv", "xlsx", "json"],
+                accept_multiple_files=True,
+            )
+        with col2:
+            if st.button("Load Sample Data", use_container_width=True):
+                load_sample_data()
+                st.success("Sample sensors (+ maintenance/costs if present) loaded!")
+                st.rerun()
 
-    if uploaded_files:
-        for uf in uploaded_files:
-            try:
-                df = load_tabular_file(uf)
-                stem = Path(uf.name).stem.replace(" ", "_")
-                register_table(stem, df)
-                st.session_state.raw_df = df
-                st.session_state.data_loaded = True
-                st.success(f"Loaded `{uf.name}` → table `{stem}` ({len(df):,} rows)")
-            except Exception as exc:
-                st.error(f"Failed {uf.name}: {exc}")
+        if uploaded_files:
+            for uf in uploaded_files:
+                try:
+                    df = load_tabular_file(uf)
+                    stem = Path(uf.name).stem.replace(" ", "_")
+                    register_table(stem, df)
+                    st.session_state.raw_df = df
+                    st.session_state.data_loaded = True
+                    st.success(f"Loaded `{uf.name}` → table `{stem}` ({len(df):,} rows)")
+                except Exception as exc:
+                    st.error(f"Failed {uf.name}: {exc}")
+
+    with tab_url:
+        _ingest_from_url_tab()
+
+    _render_maintenance_attach()
 
     if st.session_state.uploaded_tables:
         st.caption("Registered tables: " + ", ".join(st.session_state.uploaded_tables.keys()))
@@ -269,6 +536,8 @@ def page_upload_clean():
                 c2.metric("WARN", status_counts.get("WARN", 0))
                 c3.metric("FAIL", status_counts.get("FAIL", 0))
                 c4.metric("INFO", status_counts.get("INFO", 0))
+                st.markdown("#### Quality sub-reports")
+                _render_quality_subreports(st.session_state.quality_report)
 
             if st.session_state.insights:
                 st.subheader("Data Insights")
