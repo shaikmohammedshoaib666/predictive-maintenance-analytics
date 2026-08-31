@@ -13,5 +13,8 @@ graphs/*.json
 data/
 *.db
 .DS_Store
-.cursor/
+.cursor/*
+!.cursor/settings.json
+!.cursor/environment.json
+!.cursor/install.sh
 .streamlit/secrets.toml
