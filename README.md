@@ -55,6 +55,20 @@ Optional labs (joins, SQL) sit beside the pipeline. They are not a second Forge.
 
 ---
 
+## Industry-ready layers
+
+Beyond the core pipeline, the app adds five layers aimed at real plant workflows:
+
+1. **DuckDB URL / cloud ingest** — load sensor data from a direct HTTPS CSV/Parquet link, a Google Drive share URL, or a Kaggle dataset (`kaggle://owner/dataset/file.csv`; needs `KAGGLE_USERNAME` + `KAGGLE_KEY`). Large/Drive files are cached to disk so DuckDB scans them out-of-core. See the **From URL (cloud / DuckDB)** tab on *Upload & Clean*.
+2. **SQL slice presets** — filter/limit at the source before ingesting (last N rows/days, by `machine_id` / `asset_id`, date range, random sample %, PdM failure focus). Edit the DuckDB SQL to combine filters; only read-only `SELECT`/`WITH` is allowed.
+3. **3D Digital Twin** — a rotatable 3D motor whose drive-end bearing turns **red and blinks** when the selected asset's predicted risk is High (amber = Medium, green = Low). Risk can come from batch *Anomaly & RUL* or from *Live Connect*.
+4. **Live Connect** — streaming ingest that feeds the anomaly pipeline in near-real-time, via a built-in simulator (a selectable asset drifts to failure) or by polling a remote CSV feed. Live risk drives the 3D Twin.
+5. **PySpark cleaning engine (optional)** — a distributed clean engine for very large files, shown on *Upload & Clean* when `pyspark` + a JVM are installed. Kept out of `requirements.txt` to keep the Render deploy lean; install with `pip install -r requirements-optional.txt` (needs a JVM, e.g. `apt-get install default-jre`).
+
+Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as the `maintenance` table for joins. Quality sub-reports (Great Expectations, ydata, Cleanlab, PCA drift, association rules, OPC physics) render under the 19-stage report.
+
+---
+
 ## ML Models
 
 ### Anomaly Detection — Isolation Forest
