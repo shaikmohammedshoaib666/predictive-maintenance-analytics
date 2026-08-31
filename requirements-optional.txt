@@ -1,0 +1,9 @@
+# Optional / heavy engines — NOT installed on Render free tier (keeps the deploy lean).
+# Install locally to enable the Layer 5 distributed cleaning engine:
+#   pip install -r requirements-optional.txt   (needs a JVM, e.g. `apt-get install default-jre`)
+pyspark>=3.5.0,<3.6.0
+# PySpark 3.5 imports the stdlib `distutils`, removed in Python 3.12 — setuptools restores the shim.
+setuptools<81
+
+# Kaggle URL ingest (Layer 1) — enable Kaggle dataset links; needs KAGGLE_USERNAME/KAGGLE_KEY.
+kaggle>=1.6.0

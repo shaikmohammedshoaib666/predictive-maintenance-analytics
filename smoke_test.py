@@ -47,6 +47,14 @@ def main() -> int:
     from src.ml.anomaly_detector import AnomalyDetector
     from src.ml.rul_predictor import RULPredictor
     from src.sensor_map import apply_mapping, suggest_mapping
+    from src.url_ingest import (
+        build_preset_sql,
+        default_ingest_sql,
+        detect_source_kind,
+        list_ingest_presets,
+        resolve_source_to_fetch_url,
+        validate_ingest_sql,
+    )
 
     sample = pd.read_csv(config.SAMPLE_DATA_PATH, parse_dates=["timestamp"])
 
@@ -201,6 +209,79 @@ def main() -> int:
         named = ask_with_index("Tell me about LineB", scored, predictions=preds, ranked=ranked)
         assert "LineB" in named["offline_answer"]
 
+    def test_url_ingest_presets() -> None:
+        # DuckDB URL/cloud ingest + SQL slice presets ported from analytics-forge-v2.
+        presets = list_ingest_presets(domain="predictive_maintenance")
+        ids = {p["id"] for p in presets}
+        assert {"filter_machine_id", "pdm_failure_focus", "last_n_rows"} <= ids
+        sql = build_preset_sql("filter_machine_id", {"machine_id": "M-001", "n": 100})
+        assert "{source}" in sql and "M-001" in sql and "LIMIT 100" in sql
+        assert "LIMIT" not in build_preset_sql("filter_machine_id", {"machine_id": "M-1", "n": 0}).upper()
+        # String params are SQL-escaped (single quote doubled).
+        assert "''" in build_preset_sql("filter_machine_id", {"machine_id": "x' OR '1'='1", "n": 5})
+        assert "{source}" in default_ingest_sql("predictive_maintenance")
+        assert detect_source_kind("https://drive.google.com/file/d/ABC/view") == "google_drive"
+        assert detect_source_kind("kaggle://owner/ds/f.csv") == "kaggle_api"
+        assert detect_source_kind("https://example.com/a.csv") == "https"
+        validate_ingest_sql("SELECT * FROM read_csv_auto('{source}')")
+        for bad in ("DROP TABLE x", "SELECT 1; DELETE FROM y"):
+            try:
+                validate_ingest_sql(bad)
+                raise AssertionError(f"validate_ingest_sql should reject: {bad}")
+            except ValueError:
+                pass
+        target, meta = resolve_source_to_fetch_url("https://www.dropbox.com/s/x/a.csv?dl=0")
+        assert target.endswith("dl=1") and meta["kind"] == "https"
+
+    def test_twin3d() -> None:
+        # Layer 3 — 3D digital twin HTML builder + risk mapping.
+        from src.twin3d import asset_states_from_predictions, build_twin_html, normalize_risk
+
+        assert normalize_risk("HIGH") == "High"
+        assert normalize_risk("warn") == "Medium"
+        assert normalize_risk("healthy") == "Low"
+        assert normalize_risk(None) == "Unknown"
+        states = asset_states_from_predictions(
+            [{"machine_id": "M-1", "risk_level": "High", "predicted_rul_days": 3}]
+        )
+        assert states[0]["risk_level"] == "High"
+        html = build_twin_html(states, selected_id="M-1", height=400)
+        assert "three.module.js" in html and "OrbitControls" in html
+        assert "M-1" in html and "__DATA__" not in html  # tokens fully substituted
+        # empty asset list still renders a demo twin
+        assert "demo-asset" in build_twin_html([], selected_id=None)
+
+    def test_live_connect() -> None:
+        # Layer 4 — live simulator + rolling buffer + IsolationForest status.
+        from src.live_connect import (
+            append_to_buffer,
+            compute_live_status,
+            default_machines,
+            simulate_batch,
+        )
+
+        machines = default_machines(3)
+        assert machines == ["M-001", "M-002", "M-003"]
+        buf = None
+        for tick in range(40):
+            stress = min(1.0, tick / 20.0)
+            batch = simulate_batch(machines, tick, failing="M-001", stress=stress)
+            assert list(batch["machine_id"]) == machines
+            buf = append_to_buffer(buf, batch, max_rows=200)
+        assert len(buf) == 120  # 40 ticks × 3 machines, under cap
+        status = compute_live_status(buf)
+        assert status and {s["machine_id"] for s in status} == set(machines)
+        # The stressed machine should carry the highest anomaly rate → sorts first.
+        assert status[0]["machine_id"] == "M-001"
+        assert status[0]["risk_level"] in {"High", "Medium"}
+
+    def test_spark_engine_gate() -> None:
+        # Layer 5 — availability gate must never raise (graceful even without a JVM).
+        from src.spark_clean import spark_available
+
+        ok, msg = spark_available()
+        assert isinstance(ok, bool) and isinstance(msg, str) and msg
+
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
         det = AnomalyDetector()
@@ -228,6 +309,10 @@ def main() -> int:
     check("map_clean", test_map_clean)
     check("anomaly_rul_insights", test_anomaly_rul_insights)
     check("industrial_brief_tiny_frame", test_industrial_brief_tiny_frame)
+    check("url_ingest_presets", test_url_ingest_presets)
+    check("twin3d", test_twin3d)
+    check("live_connect", test_live_connect)
+    check("spark_engine_gate", test_spark_engine_gate)
     check("charts_layout", test_charts)
 
     if errors:
