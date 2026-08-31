@@ -246,7 +246,12 @@ def main() -> int:
         )
         assert states[0]["risk_level"] == "High"
         html = build_twin_html(states, selected_id="M-1", height=400)
-        assert "three.module.js" in html and "OrbitControls" in html
+        # Offline twin: three.js is inlined, not loaded from a CDN / importmap.
+        assert "OrbitControls" in html and "THREE" in html
+        assert 'type="importmap"' not in html and "jsdelivr" not in html
+        import re as _re
+
+        assert not _re.search(r'src\s*=\s*["\']https?://', html)  # no external script loads
         assert "M-1" in html and "__DATA__" not in html  # tokens fully substituted
         # empty asset list still renders a demo twin
         assert "demo-asset" in build_twin_html([], selected_id=None)
@@ -275,12 +280,42 @@ def main() -> int:
         assert status[0]["machine_id"] == "M-001"
         assert status[0]["risk_level"] in {"High", "Medium"}
 
+    def test_live_sources() -> None:
+        # Upgrade 2 — MQTT / OPC-UA helpers (gates + payload parsing, offline).
+        from src.live_sources import _coerce_row, mqtt_available, opcua_available, parse_node_map
+
+        ok_m, _ = mqtt_available()
+        ok_o, _ = opcua_available()
+        assert isinstance(ok_m, bool) and isinstance(ok_o, bool)
+        nm = parse_node_map("temperature=ns=2;i=2, vibration=ns=2;i=3")
+        assert nm == {"temperature": "ns=2;i=2", "vibration": "ns=2;i=3"}
+        row = _coerce_row(
+            {"machine_id": "M-9", "temperature": "70.5", "vibration": 2.1},
+            machine_field="machine_id",
+            ts_field="timestamp",
+            fallback_machine="x",
+        )
+        assert row["machine_id"] == "M-9" and row["temperature"] == 70.5 and "timestamp" in row
+        row2 = _coerce_row({"temperature": 10}, machine_field="machine_id", ts_field="timestamp", fallback_machine="fb")
+        assert row2["machine_id"] == "fb"
+
     def test_spark_engine_gate() -> None:
         # Layer 5 — availability gate must never raise (graceful even without a JVM).
         from src.spark_clean import spark_available
 
         ok, msg = spark_available()
         assert isinstance(ok, bool) and isinstance(msg, str) and msg
+
+    def test_aps_viewer() -> None:
+        # Upgrade 3 — APS gate never raises; viewer HTML builder is pure (no network).
+        from src.aps_viewer import aps_available, build_viewer_html
+
+        ok, msg = aps_available()
+        assert isinstance(ok, bool) and isinstance(msg, str)
+        html = build_viewer_html("TOKEN123", "dXJuOmFkc2sx", asset="M-1", risk="High", height=500)
+        assert "TOKEN123" in html and "dXJuOmFkc2sx" in html and "GuiViewer3D" in html
+        assert "__TOKEN__" not in html and "__URN__" not in html
+        assert "Unknown" in build_viewer_html("t", "u", asset="a", risk="bogus")
 
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
@@ -312,7 +347,9 @@ def main() -> int:
     check("url_ingest_presets", test_url_ingest_presets)
     check("twin3d", test_twin3d)
     check("live_connect", test_live_connect)
+    check("live_sources", test_live_sources)
     check("spark_engine_gate", test_spark_engine_gate)
+    check("aps_viewer", test_aps_viewer)
     check("charts_layout", test_charts)
 
     if errors:

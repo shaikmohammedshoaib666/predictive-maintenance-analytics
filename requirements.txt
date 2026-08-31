@@ -9,6 +9,10 @@ openpyxl>=3.1.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 
+# Live Connect real sources (Upgrade 2) — pure-python, light enough for Render.
+paho-mqtt>=1.6.1,<2.0.0
+asyncua>=1.0.0,<2.0.0
+
 # Labs + LlamaIndex insights (kept on Render; Streamlit Cloud OOMs this stack)
 optuna>=3.0.0
 duckdb>=0.10.0
