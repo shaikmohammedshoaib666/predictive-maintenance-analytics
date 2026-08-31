@@ -75,6 +75,7 @@ from src.insights_engine import (
     polish_brief_with_gemini,
     test_gemini_connection,
 )
+from src.aps_viewer import aps_available, build_viewer_html, get_access_token
 from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
@@ -158,6 +159,8 @@ def init_session_state():
         "live_conn_id": None,
         # Cleaning engine (Layer 5)
         "clean_engine": "pandas",
+        # Autodesk APS CAD twin (Upgrade 3)
+        "aps_urn": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1280,6 +1283,62 @@ def page_twin_3d():
     )
 
 
+# ── CAD Twin — Autodesk APS (Upgrade 3) ───────────────────────────────────────
+def page_cad_twin():
+    st.markdown('<p class="main-header">CAD Twin (Autodesk APS)</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Load a real translated CAD model (Revit / Fusion / IFC → SVF) via Autodesk '
+        "Platform Services and tint it red when the selected asset's predicted risk is High.</p>",
+        unsafe_allow_html=True,
+    )
+
+    ok, msg = aps_available()
+    if not ok:
+        st.info(
+            "Autodesk APS isn't configured yet. This premium viewer needs your Autodesk credentials and a "
+            "translated model — until then, the credential-free **3D Twin** page gives the same red-bearing "
+            "failure cue."
+        )
+        with st.expander("How to enable (bring your own Autodesk account)", expanded=True):
+            st.markdown(
+                "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) → get a **Client ID** + **Client Secret**.\n"
+                "2. Add them in the **Secrets** panel (right side) as `APS_CLIENT_ID` and `APS_CLIENT_SECRET`.\n"
+                "3. Upload a CAD model to an APS bucket and translate it to **SVF**, then copy its base64 **URN**.\n"
+                "4. Reload this page, paste the URN, pick the asset, and load the model."
+            )
+        st.caption(f"Status: {msg}")
+        return
+
+    st.success(f"APS: {msg}")
+    states = asset_states_from_predictions(st.session_state.get("predictions") or []) or (
+        st.session_state.get("live_asset_states") or []
+    )
+    ids = [s["machine_id"] for s in states] or ["asset"]
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        urn = st.text_input(
+            "Translated model URN (base64)", value=st.session_state.get("aps_urn", ""), key="aps_urn_input"
+        )
+        st.session_state.aps_urn = urn
+    with c2:
+        selected = st.selectbox("Asset", ids, key="aps_asset_pick")
+    sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
+
+    if not urn.strip():
+        st.warning("Paste a translated SVF model URN to load the CAD viewer.")
+        return
+    if st.button("Load CAD model", type="primary"):
+        try:
+            with st.spinner("Fetching APS token and loading model…"):
+                token = get_access_token()
+                html = build_viewer_html(
+                    token["access_token"], urn.strip(), asset=selected, risk=sel.get("risk_level", "Unknown")
+                )
+            components.html(html, height=620)
+        except Exception as exc:
+            st.error(f"APS error: {exc}")
+
+
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
 def _live_body():
     cfg = dict(st.session_state.get("live_cfg") or {})
@@ -1608,6 +1667,7 @@ def main():
         "4. Charts": page_explore_graphs,
         "5. Insights": page_business_insights,
         "3D Twin": page_twin_3d,
+        "CAD Twin (APS)": page_cad_twin,
         "Live Connect": page_live_connect,
         "AI Assistant": page_ai_assistant,
         "Email Report": page_email_report,

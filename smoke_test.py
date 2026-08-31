@@ -306,6 +306,17 @@ def main() -> int:
         ok, msg = spark_available()
         assert isinstance(ok, bool) and isinstance(msg, str) and msg
 
+    def test_aps_viewer() -> None:
+        # Upgrade 3 — APS gate never raises; viewer HTML builder is pure (no network).
+        from src.aps_viewer import aps_available, build_viewer_html
+
+        ok, msg = aps_available()
+        assert isinstance(ok, bool) and isinstance(msg, str)
+        html = build_viewer_html("TOKEN123", "dXJuOmFkc2sx", asset="M-1", risk="High", height=500)
+        assert "TOKEN123" in html and "dXJuOmFkc2sx" in html and "GuiViewer3D" in html
+        assert "__TOKEN__" not in html and "__URN__" not in html
+        assert "Unknown" in build_viewer_html("t", "u", asset="a", risk="bogus")
+
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
         det = AnomalyDetector()
@@ -338,6 +349,7 @@ def main() -> int:
     check("live_connect", test_live_connect)
     check("live_sources", test_live_sources)
     check("spark_engine_gate", test_spark_engine_gate)
+    check("aps_viewer", test_aps_viewer)
     check("charts_layout", test_charts)
 
     if errors:

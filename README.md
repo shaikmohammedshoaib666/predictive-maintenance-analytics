@@ -67,6 +67,12 @@ Beyond the core pipeline, the app adds five layers aimed at real plant workflows
 
 Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as the `maintenance` table for joins. Quality sub-reports (Great Expectations, ydata, Cleanlab, PCA drift, association rules, OPC physics) render under the 19-stage report.
 
+### Upgrades
+
+- **Offline 3D twin** — three.js + OrbitControls are vendored in `src/vendor/three` and inlined, so the *3D Twin* renders with **no internet/CDN**.
+- **Real live sources** — *Live Connect* adds **MQTT** and **OPC-UA** sources (alongside the simulator and CSV polling). MQTT expects JSON sensor payloads; OPC-UA reads a set of node IDs each poll. Requires `paho-mqtt` / `asyncua` (both in `requirements.txt`).
+- **CAD Twin (Autodesk APS)** — optional *CAD Twin* page renders a real translated CAD model (Revit/Fusion/IFC → SVF) via Autodesk Platform Services and tints it red on High risk. Availability-gated: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (secrets) and a translated model URN to enable; otherwise it shows setup steps and the app is unaffected.
+
 ---
 
 ## ML Models
