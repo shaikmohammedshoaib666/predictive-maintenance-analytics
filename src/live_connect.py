@@ -96,20 +96,33 @@ def risk_from_rate(rate_pct: float) -> str:
 
 
 def compute_live_status(buffer: pd.DataFrame, *, contamination: float = 0.08) -> list[dict[str, Any]]:
-    """Per-machine live status via IsolationForest anomaly rate on the buffer."""
+    """Per-machine live status.
+
+    IsolationForest is fit **jointly** across the whole buffer so a genuinely
+    failing asset captures a disproportionate share of the anomalies (its own
+    flagged fraction can climb well past 15% → High) while healthy assets stay
+    near 0% — instead of every machine sitting at the fixed contamination rate.
+    """
     if buffer is None or buffer.empty or "machine_id" not in buffer.columns:
         return []
     from sklearn.ensemble import IsolationForest
 
     sensor_cols = [c for c in SENSOR_COLS if c in buffer.columns]
+    rates: dict[str, float] = {}
+    if sensor_cols:
+        work = buffer[["machine_id", *sensor_cols]].copy()
+        for c in sensor_cols:
+            work[c] = pd.to_numeric(work[c], errors="coerce")
+        work = work.dropna(subset=sensor_cols)
+        if len(work) >= 12 and len(sensor_cols) >= 2:
+            iso = IsolationForest(contamination=contamination, random_state=42)
+            flagged = iso.fit_predict(work[sensor_cols].values) == -1
+            work = work.assign(_anom=flagged)
+            rates = (work.groupby("machine_id")["_anom"].mean() * 100.0).round(2).to_dict()
+
     out: list[dict[str, Any]] = []
     for m, grp in buffer.groupby("machine_id"):
-        num = grp[sensor_cols].apply(pd.to_numeric, errors="coerce").dropna() if sensor_cols else pd.DataFrame()
-        rate = 0.0
-        if len(num) >= 12 and num.shape[1] >= 2:
-            iso = IsolationForest(contamination=contamination, random_state=42)
-            labels = iso.fit_predict(num.values)
-            rate = round(100.0 * float((labels == -1).mean()), 2)
+        rate = float(rates.get(m, 0.0))
         last = grp.iloc[-1]
         out.append(
             {

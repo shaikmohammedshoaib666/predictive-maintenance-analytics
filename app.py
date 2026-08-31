@@ -1222,22 +1222,34 @@ def page_twin_3d():
         unsafe_allow_html=True,
     )
 
-    states = asset_states_from_predictions(st.session_state.get("predictions") or [])
+    batch_states = asset_states_from_predictions(st.session_state.get("predictions") or [])
     live_states = st.session_state.get("live_asset_states") or []
-    if live_states and not states:
-        states = live_states
+    sources: dict[str, list] = {}
+    if batch_states:
+        sources["Anomaly & RUL (batch)"] = batch_states
+    if live_states:
+        sources["Live Connect (streaming)"] = live_states
 
-    if states:
+    if sources:
+        source_names = list(sources.keys())
+        default_idx = (
+            source_names.index("Live Connect (streaming)")
+            if ("Live Connect (streaming)" in sources and st.session_state.get("live_running"))
+            else 0
+        )
+        c0, c1, c2 = st.columns([1.4, 1.6, 1])
+        with c0:
+            src_name = st.radio("Risk source", source_names, index=default_idx, key="twin_source")
+        states = sources[src_name]
         ids = [s["machine_id"] for s in states]
-        c1, c2 = st.columns([2, 1])
         with c1:
             selected = st.selectbox("Asset", ids, key="twin_asset_pick")
         sel = next((s for s in states if s["machine_id"] == selected), states[0])
         with c2:
-            st.metric("Predicted risk", sel["risk_level"])
+            st.metric("Risk", sel["risk_level"])
         components.html(build_twin_html(states, selected_id=selected, height=540), height=560)
         st.caption(
-            "Risk is read live from **3. Anomaly & RUL** (or Live Connect). "
+            "Risk is read from **3. Anomaly & RUL** or **Live Connect** (pick the source above). "
             "Rotate with the mouse; scroll to zoom."
         )
     else:
