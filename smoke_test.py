@@ -246,7 +246,12 @@ def main() -> int:
         )
         assert states[0]["risk_level"] == "High"
         html = build_twin_html(states, selected_id="M-1", height=400)
-        assert "three.module.js" in html and "OrbitControls" in html
+        # Offline twin: three.js is inlined, not loaded from a CDN / importmap.
+        assert "OrbitControls" in html and "THREE" in html
+        assert 'type="importmap"' not in html and "jsdelivr" not in html
+        import re as _re
+
+        assert not _re.search(r'src\s*=\s*["\']https?://', html)  # no external script loads
         assert "M-1" in html and "__DATA__" not in html  # tokens fully substituted
         # empty asset list still renders a demo twin
         assert "demo-asset" in build_twin_html([], selected_id=None)
