@@ -12,12 +12,25 @@ from typing import Any, Optional
 import config
 
 
+def high_risk_predictions(predictions: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """Assets whose risk_level maps to High. Used for the urgent email line."""
+    from src.twin3d import normalize_risk
+
+    out: list[dict[str, Any]] = []
+    for p in predictions or []:
+        if normalize_risk(p.get("risk_level")) == "High":
+            out.append(p)
+    out.sort(key=lambda p: float(p.get("predicted_rul_days") or 10**9))
+    return out
+
+
 def generate_email_body(
     manager_name: str,
     predictions: list[dict[str, Any]],
     anomaly_summary: Optional[dict] = None,
     insights: Optional[dict] = None,
     additional_notes: str = "",
+    pack_kpis: Optional[dict[str, Any]] = None,
 ) -> str:
     """Auto-generate email body with failure predictions and data insights."""
     today = datetime.now().strftime("%B %d, %Y")
@@ -25,6 +38,8 @@ def generate_email_body(
         f"Dear {manager_name},",
         "",
         f"Please find below the Predictive Maintenance Analytics report for {today}.",
+        "",
+        "This is a risk / degradation brief, not a confirmed failure date.",
         "",
         "━━━ FAILURE PREDICTIONS ━━━",
         "",
@@ -36,14 +51,36 @@ def generate_email_body(
             lines.append(
                 f"  {risk_icon} {p.get('message', 'N/A')} — Risk Level: {p.get('risk_level', 'Unknown')}"
             )
-        urgent = predictions[0]
-        lines.extend([
-            "",
-            f"⚠️  IMMEDIATE ACTION REQUIRED: {urgent.get('machine_id')} "
-            f"predicted to fail in {urgent.get('predicted_rul_days')} days.",
-        ])
+        urgent = high_risk_predictions(predictions)
+        if urgent:
+            top = urgent[0]
+            lines.extend(
+                [
+                    "",
+                    f"⚠️  IMMEDIATE ACTION REQUIRED: {top.get('machine_id')} "
+                    f"is High risk (predicted RUL {top.get('predicted_rul_days')} days). "
+                    "Treat as inspect-this-week, not a calendar failure date.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "No High-risk assets in this run. Continue routine monitoring.",
+                ]
+            )
     else:
         lines.append("  No predictions available — please run ML model training.")
+
+    bundle = pack_kpis or {}
+    if bundle.get("kpis"):
+        label = bundle.get("label") or "Pack"
+        sih = f" ({bundle['sih']})" if bundle.get("sih") else ""
+        lines.extend(["", f"━━━ {label.upper()} KPIs{sih} ━━━", ""])
+        for k in bundle["kpis"]:
+            lines.append(f"  • {k.get('label')}: {k.get('value')} {k.get('unit') or ''}".rstrip())
+        if bundle.get("narrative"):
+            lines.append(f"  • {bundle['narrative']}")
 
     if anomaly_summary:
         lines.extend([
@@ -72,13 +109,29 @@ def generate_email_body(
     if additional_notes:
         lines.extend(["", "━━━ ADDITIONAL NOTES ━━━", "", additional_notes])
 
+    high = high_risk_predictions(predictions)
     lines.extend([
         "",
         "━━━ RECOMMENDED ACTIONS ━━━",
         "",
-        "  1. Schedule preventive maintenance for high-risk machines within predicted RUL window.",
-        "  2. Investigate anomalous sensor readings for root cause analysis.",
-        "  3. Review full dashboard in the Predictive Maintenance Analytics Platform.",
+    ])
+    if high:
+        lines.extend(
+            [
+                "  1. Inspect High-risk assets this week (see IMMEDIATE ACTION above).",
+                "  2. Investigate anomalous sensor readings for root cause.",
+                "  3. Review the reliability dashboard (KPIs, 3D twin, charts).",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "  1. No High-risk assets — keep the current PM cadence.",
+                "  2. Review pack KPIs and the 3D twin on the dashboard.",
+                "  3. Re-run Anomaly & RUL after the next sensor drop.",
+            ]
+        )
+    lines.extend([
         "",
         "Best regards,",
         "Predictive Maintenance Analytics Platform",

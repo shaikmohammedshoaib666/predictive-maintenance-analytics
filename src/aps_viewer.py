@@ -18,21 +18,36 @@ from typing import Any
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/token"
 
 
+def _aps_setting(key: str) -> str:
+    """Read APS secrets at call time (env or Streamlit secrets). Safe after Render deploy."""
+    try:
+        import config as _cfg
+
+        return str(_cfg._setting(key, "") or "").strip()
+    except Exception:
+        return (os.getenv(key) or "").strip()
+
+
 def aps_available() -> tuple[bool, str]:
-    """True when APS client credentials are present in the environment."""
-    cid = (os.getenv("APS_CLIENT_ID") or "").strip()
-    sec = (os.getenv("APS_CLIENT_SECRET") or "").strip()
+    """True when APS client credentials are present in the environment or secrets."""
+    cid = _aps_setting("APS_CLIENT_ID")
+    sec = _aps_setting("APS_CLIENT_SECRET")
     if not cid or not sec:
-        return False, "APS_CLIENT_ID / APS_CLIENT_SECRET not set"
+        return False, "APS_CLIENT_ID / APS_CLIENT_SECRET not set (add on Render anytime)"
     return True, "APS credentials detected"
+
+
+def aps_model_urn() -> str:
+    """Optional translated-model URN from env/secrets so CAD can light up without a UI paste."""
+    return _aps_setting("APS_MODEL_URN")
 
 
 def get_access_token(scope: str = "viewables:read data:read") -> dict[str, Any]:
     """2-legged OAuth token for the APS Viewer (client_credentials)."""
     import requests
 
-    cid = (os.getenv("APS_CLIENT_ID") or "").strip()
-    sec = (os.getenv("APS_CLIENT_SECRET") or "").strip()
+    cid = _aps_setting("APS_CLIENT_ID")
+    sec = _aps_setting("APS_CLIENT_SECRET")
     if not cid or not sec:
         raise RuntimeError("APS_CLIENT_ID / APS_CLIENT_SECRET not set")
     resp = requests.post(
