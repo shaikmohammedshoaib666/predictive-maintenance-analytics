@@ -105,6 +105,14 @@ GEMINI_MODEL=gemini-3.6-flash
 
 `config.py` reads Streamlit secrets when present, and falls back to environment variables (Render + local `.env`).
 
+Optional **after deploy** (CAD tile turns on without a code change):
+
+```
+APS_CLIENT_ID=...
+APS_CLIENT_SECRET=...
+APS_MODEL_URN=...
+```
+
 **Local secrets (never commit):** copy to `.streamlit/secrets.toml` (this path is in `.gitignore`).
 
 ---

@@ -45,13 +45,15 @@ Copy `.env.example` → `.env` and set `GEMINI_API_KEY` if you want Gemini on In
 
 ## Sample workflow
 
-1. **Upload & Clean** — Load sample CSV or upload sensors. Run industrial clean + quality checks.
-2. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label.
-3. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
-4. **Charts** — Sensor over time, anomaly flags, risk by asset (readable Plotly hover / margins). Pack KPIs (mission reliability, powertrain health, fillage, …) sit above the primary charts.
-5. **Insights** — Ranked inspect-this-week list (IF score, sensor spike, low RUL), slow-running assets, optional **$/hour** or **$/unit** impact, plus pack-specific KPI cards. Ask is scoped to **this upload** (not a general LLM essay). Errors from Gemini / LlamaIndex are shown. Without a key, Ask still answers from the table and tells you to set `GEMINI_API_KEY`.
+1. **Upload & Clean** — Load sample CSV or upload sensors. Run industrial clean + quality checks (pandas or Polars).
+2. **Joins** — Optional: sensor ⋈ maintenance ⋈ cost on `machine_id` (I4.0 integrate). Skip if you only have one CSV.
+3. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label + pack extras.
+4. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
+5. **Charts** — Sensor over time, anomaly flags, risk by asset. Pack KPIs sit above the primary charts.
+6. **Insights** — Inspect-this-week list, slow-running assets, optional $ impact, pack KPI cards. Ask is scoped to this upload.
+7. **Dashboard** — Power BI-style board: KPI strip, charts, insights, 3D twin, CAD slot (APS when secrets exist). Export HTML.
 
-Optional labs (joins, SQL) sit beside the pipeline. They are not a second Forge.
+3D Twin, CAD Twin (APS), Live Connect, Email, and SQL lab sit beside that numbered path. SQL lab is the power-user workbench, not a shift-manager step.
 
 ---
 
@@ -63,7 +65,7 @@ Beyond the core pipeline, the app adds five layers aimed at real plant workflows
 2. **SQL slice presets** — filter/limit at the source before ingesting (last N rows/days, by `machine_id` / `asset_id`, date range, random sample %, PdM failure focus). Edit the DuckDB SQL to combine filters; only read-only `SELECT`/`WITH` is allowed.
 3. **3D Digital Twin** — a rotatable pack-specific mesh (Plant motor by default; UAV + piston engine; generic ICE car; SRP beam pump) whose hotspot turns **red and blinks** when the selected asset's predicted risk is High (amber = Medium, green = Low). Risk can come from batch *Anomaly & RUL* or from *Live Connect*.
 4. **Live Connect** — streaming ingest that feeds the anomaly pipeline in near-real-time, via a built-in simulator (a selectable asset drifts to failure) or by polling a remote CSV feed. Live risk drives the 3D Twin.
-5. **PySpark cleaning engine (optional)** — a distributed clean engine for very large files, shown on *Upload & Clean* when `pyspark` + a JVM are installed. Kept out of `requirements.txt` to keep the Render deploy lean; install with `pip install -r requirements-optional.txt` (needs a JVM, e.g. `apt-get install default-jre`).
+5. **Polars cleaning engine** — fast columnar ETL on *Upload & Clean* next to pandas. No JVM. PySpark was removed.
 
 Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as the `maintenance` table for joins. Quality sub-reports (Great Expectations, ydata, Cleanlab, PCA drift, association rules, OPC physics) render under the 19-stage report.
 
@@ -71,7 +73,7 @@ Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as 
 
 - **Offline 3D twin** — three.js + OrbitControls are vendored in `src/vendor/three` and inlined, so the *3D Twin* renders with **no internet/CDN**. The mesh follows the **industry pack** (sidebar).
 - **Real live sources** — *Live Connect* adds **MQTT** and **OPC-UA** sources (alongside the simulator and CSV polling). MQTT expects JSON sensor payloads; OPC-UA reads a set of node IDs each poll. Requires `paho-mqtt` / `asyncua` (both in `requirements.txt`).
-- **CAD Twin (Autodesk APS)** — optional *CAD Twin* page renders a real translated CAD model (Revit/Fusion/IFC → SVF) via Autodesk Platform Services and tints it red on High risk. Availability-gated: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (secrets) and a translated model URN to enable; otherwise it shows setup steps and the app is unaffected.
+- **CAD Twin (Autodesk APS)** — *CAD Twin* page + dashboard CAD tile. Availability-gated at **runtime**: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional `APS_MODEL_URN`) on Render after deploy and reload — no code change. Until then the 3D twin is the credential-free mesh.
 
 ---
 

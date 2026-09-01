@@ -314,19 +314,24 @@ def main() -> int:
         row2 = _coerce_row({"temperature": 10}, machine_field="machine_id", ts_field="timestamp", fallback_machine="fb")
         assert row2["machine_id"] == "fb"
 
-    def test_spark_engine_gate() -> None:
-        # Layer 5 — availability gate must never raise (graceful even without a JVM).
-        from src.spark_clean import spark_available
+    def test_polars_engine() -> None:
+        from src.polars_clean import clean_with_polars, polars_available
 
-        ok, msg = spark_available()
+        ok, msg = polars_available()
         assert isinstance(ok, bool) and isinstance(msg, str) and msg
+        assert ok is True  # polars is a core requirement
+        cleaned, log = clean_with_polars(sample.head(200))
+        assert len(cleaned) > 0
+        assert any("Polars" in line or "polars" in line.lower() for line in log)
+        assert "temperature" in cleaned.columns
 
     def test_aps_viewer() -> None:
         # Upgrade 3 — APS gate never raises; viewer HTML builder is pure (no network).
-        from src.aps_viewer import aps_available, build_viewer_html
+        from src.aps_viewer import aps_available, aps_model_urn, build_viewer_html
 
         ok, msg = aps_available()
         assert isinstance(ok, bool) and isinstance(msg, str)
+        assert isinstance(aps_model_urn(), str)
         html = build_viewer_html("TOKEN123", "dXJuOmFkc2sx", asset="M-1", risk="High", height=500)
         assert "TOKEN123" in html and "dXJuOmFkc2sx" in html and "GuiViewer3D" in html
         assert "__TOKEN__" not in html and "__URN__" not in html
@@ -555,6 +560,84 @@ def main() -> int:
         mapped = apply_mapping(pd.DataFrame({c: [1] for c in cols}), mapping)
         assert "egt" in mapped.columns and "temperature" in mapped.columns
 
+    def test_email_honesty() -> None:
+        from src.email_report import generate_email_body, high_risk_predictions, send_email
+        from src.pack_kpis import compute_pack_kpis
+
+        lows = [
+            {"machine_id": "M-1", "risk_level": "Low", "predicted_rul_days": 26, "message": "M-1 ok"},
+        ]
+        assert high_risk_predictions(lows) == []
+        low_body = generate_email_body("Manager", lows)
+        assert "IMMEDIATE ACTION REQUIRED" not in low_body
+        assert "No High-risk" in low_body
+        assert "not a confirmed failure date" in low_body.lower()
+
+        mixed = lows + [
+            {"machine_id": "UAV-03", "risk_level": "High", "predicted_rul_days": 4, "message": "UAV-03 High"},
+        ]
+        high_body = generate_email_body("Manager", mixed)
+        assert "IMMEDIATE ACTION REQUIRED" in high_body
+        assert "UAV-03" in high_body
+        assert "predicted to fail in" not in high_body  # no fake calendar date
+
+        bundle = compute_pack_kpis(
+            "aviation_uav_piston",
+            pd.DataFrame({"machine_id": ["UAV-03"], "egt": [800], "vibration": [5]}),
+            mixed,
+        )
+        packed = generate_email_body("Manager", mixed, pack_kpis=bundle)
+        assert "MISSION RELIABILITY" in packed.upper() or "Piston-engine" in packed or "KPIs" in packed
+        sent = send_email("ops@example.com", "t", packed)
+        assert sent["success"] is True and sent["mode"] == "demo"
+
+    def test_dashboard_composer() -> None:
+        from src.dashboard_composer import (
+            cad_placeholder_html,
+            cad_slot_status,
+            compose_dashboard_html,
+            board_twin_html,
+            board_pack_charts,
+        )
+        from src.pack_kpis import compute_pack_kpis
+
+        status = cad_slot_status("")
+        assert status["credentials"] is False
+        assert status["ready"] is False
+        ph = cad_placeholder_html(status=status)
+        assert "APS_CLIENT_ID" in ph and "post-deploy" in ph.lower() or "Render" in ph or "credentials" in ph.lower()
+
+        preds = [{"machine_id": "UAV-03", "risk_level": "High", "predicted_rul_days": 4}]
+        bundle = compute_pack_kpis("aviation_uav_piston", pd.DataFrame({"machine_id": ["UAV-03"], "egt": [800]}), preds)
+        twin = board_twin_html(preds, "aviation_uav_piston", selected_id="UAV-03")
+        figs = board_pack_charts(bundle)
+        html = compose_dashboard_html(
+            tiles=["kpis", "charts", "insights", "twin3d", "cad"],
+            pack_id="aviation_uav_piston",
+            kpi_bundle=bundle,
+            insight_cards=[{"title": "Inspect UAV-03", "severity": "high", "message": "High risk"}],
+            chart_figs=figs,
+            twin_html=twin,
+            cad_html="",
+            cad_status=status,
+            title="test board",
+        )
+        assert "test board" in html
+        assert "SIH26054" in html or "Aviation" in html
+        assert '"kind": "aviation_uav"' in html or "aviation_uav" in html
+        assert "jsdelivr" not in twin
+        assert "Waiting for credentials" in html or "CAD TWIN" in html
+        assert "pyspark" not in html.lower()
+
+    def test_joins_step() -> None:
+        from src.data_integration import join_two
+
+        left = pd.DataFrame({"machine_id": ["A", "B"], "vibration": [1.0, 2.0]})
+        right = pd.DataFrame({"machine_id": ["A"], "work_order": ["WO-1"]})
+        merged, meta = join_two(left, right, how="left", on=["machine_id"])
+        assert len(merged) == 2 and "work_order" in merged.columns
+        assert meta["how"] == "left"
+
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
@@ -564,13 +647,16 @@ def main() -> int:
     check("twin3d", test_twin3d)
     check("live_connect", test_live_connect)
     check("live_sources", test_live_sources)
-    check("spark_engine_gate", test_spark_engine_gate)
+    check("polars_engine", test_polars_engine)
     check("aps_viewer", test_aps_viewer)
     check("charts_layout", test_charts)
     check("industry_packs", test_industry_packs)
     check("pack_kpis_every_function", test_pack_kpis_every_function)
     check("pack_samples_pipeline", test_pack_samples_pipeline)
     check("pack_mapping_does_not_steal_core", test_pack_mapping_does_not_steal_core)
+    check("email_honesty", test_email_honesty)
+    check("dashboard_composer", test_dashboard_composer)
+    check("joins_step", test_joins_step)
 
     if errors:
         print(f"\n{len(errors)} FAIL")
