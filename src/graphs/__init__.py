@@ -7,6 +7,7 @@ from src.graphs.anomaly_scatter import create_anomaly_scatter
 from src.graphs.boxplot import create_boxplot_by_machine
 from src.graphs.heatmap import create_correlation_heatmap
 from src.graphs.histogram import create_distribution_histogram
+from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.graphs.risk_by_asset import create_risk_by_asset_chart
 from src.graphs.rolling_trend import create_rolling_trend
 from src.graphs.time_series import create_time_series_chart

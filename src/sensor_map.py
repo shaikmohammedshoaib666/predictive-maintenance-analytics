@@ -10,6 +10,8 @@ from typing import Optional
 
 import pandas as pd
 
+from src.industry_packs import extra_aliases_for
+
 CANONICAL_FIELDS: list[tuple[str, str]] = [
     ("timestamp", "Reading timestamp"),
     ("machine_id", "Machine / asset id"),
@@ -43,6 +45,11 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "unit_id",
         "asset_tag",
         "device_id",
+        "uav_id",
+        "aircraft_id",
+        "well_id",
+        "vehicle_id",
+        "engine_id",
     ),
     "temperature": ("temperature", "temp", "temp_c", "temp_celsius", "oil_temp", "bearing_temp"),
     "vibration": ("vibration", "vib", "vibration_rms", "accel", "acceleration", "rms_vib"),
@@ -66,13 +73,34 @@ def _norm(name: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name)).strip("_")
 
 
-def suggest_mapping(columns: list[str]) -> dict[str, Optional[str]]:
-    """Best-effort header match. Unmatched canonical fields map to None."""
+def suggest_mapping(
+    columns: list[str],
+    extra_aliases: Optional[dict[str, tuple[str, ...]]] = None,
+    pack_id: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    """Best-effort header match. Unmatched canonical fields map to None.
+
+    Optional pack extras (EGT, fillage, …) are mapped only after core PdM fields
+    so they cannot steal timestamp / machine_id / the four plant sensors.
+    """
     remaining = list(columns)
+    if extra_aliases is not None:
+        extras = dict(extra_aliases)
+    elif pack_id:
+        extras = extra_aliases_for(pack_id)
+    else:
+        extras = {}
     mapping: dict[str, Optional[str]] = {name: None for name in CANONICAL_NAMES}
+    for name in extras:
+        mapping[name] = None
     by_norm = {_norm(c): c for c in columns}
 
-    for canonical, aliases in ALIASES.items():
+    ordered: list[tuple[str, tuple[str, ...]]] = list(ALIASES.items())
+    for name, aliases in extras.items():
+        if name not in ALIASES:
+            ordered.append((name, tuple(aliases)))
+
+    for canonical, aliases in ordered:
         hit = None
         for alias in aliases:
             key = _norm(alias)

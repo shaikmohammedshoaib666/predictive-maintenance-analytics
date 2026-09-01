@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 import config
+from src.industry_packs import OPTIONAL_IF_SENSORS
 
 _SKIP_SUFFIXES = ("_bin", "_smooth")
 SCORE_COL = "anomaly_score"
@@ -31,6 +32,9 @@ class AnomalyDetector:
 
     def _get_features(self, df: pd.DataFrame) -> pd.DataFrame:
         cols = [c for c in config.SENSOR_COLUMNS if c in df.columns]
+        for extra in OPTIONAL_IF_SENSORS:
+            if extra in df.columns and extra not in cols:
+                cols.append(extra)
         if not cols:
             cols = [
                 c
