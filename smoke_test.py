@@ -638,6 +638,54 @@ def main() -> int:
         assert len(merged) == 2 and "work_order" in merged.columns
         assert meta["how"] == "left"
 
+    def test_streamlit_widget_keys_unique() -> None:
+        """Literal Streamlit `key=` values must be unique within a page/helper.
+
+        Duplicate keys crash Streamlit with StreamlitDuplicateElementKey (seen
+        live when `_render_maintenance_attach` pasted the same uploader twice).
+        """
+        import ast
+        from collections import Counter
+
+        src = (ROOT / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        def literal_keys(node: ast.AST) -> list[str]:
+            found: list[str] = []
+            for n in ast.walk(node):
+                if not isinstance(n, ast.Call):
+                    continue
+                for kw in n.keywords:
+                    if kw.arg != "key":
+                        continue
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        found.append(kw.value.value)
+            return found
+
+        attach_keys: list[str] | None = None
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_maintenance_attach":
+                attach_keys = literal_keys(node)
+                break
+        assert attach_keys is not None, "_render_maintenance_attach missing from app.py"
+        dupes = [k for k, n in Counter(attach_keys).items() if n > 1]
+        assert not dupes, f"duplicate Streamlit keys in _render_maintenance_attach: {dupes}"
+        assert attach_keys.count("upload_maintenance_table") == 1
+
+        # Page-level: only one page runs per Streamlit script run, so uniqueness
+        # is required within each page function (plus the shared sidebar).
+        page_dupes: list[str] = []
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not (node.name.startswith("page_") or node.name == "_render_maintenance_attach"):
+                continue
+            counts = Counter(literal_keys(node))
+            for key, n in counts.items():
+                if n > 1:
+                    page_dupes.append(f"{node.name}:{key}×{n}")
+        assert not page_dupes, "duplicate Streamlit keys: " + ", ".join(page_dupes)
+
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
@@ -657,6 +705,7 @@ def main() -> int:
     check("email_honesty", test_email_honesty)
     check("dashboard_composer", test_dashboard_composer)
     check("joins_step", test_joins_step)
+    check("streamlit_widget_keys_unique", test_streamlit_widget_keys_unique)
 
     if errors:
         print(f"\n{len(errors)} FAIL")

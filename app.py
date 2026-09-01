@@ -501,26 +501,6 @@ def _render_maintenance_attach():
             st.write(
                 f"Attached: **{st.session_state.maintenance_table_attached}** (see **2. Joins** to merge)."
             )
-        maint_file = st.file_uploader(
-            "Maintenance / work-order CSV",
-            type=["csv", "tsv", "xlsx", "xls"],
-            key="upload_maintenance_table",
-        )
-        if maint_file is not None:
-            try:
-                maint_df = load_tabular_file(maint_file)
-                register_table("maintenance", maint_df)
-                st.session_state.maintenance_table_attached = maint_file.name
-                st.success(
-                    f"Registered **maintenance** — {len(maint_df):,} rows × {maint_df.shape[1]} cols. "
-                    "Open **2. Joins** to merge on `machine_id`."
-                )
-            except Exception as exc:
-                st.error(str(exc))
-        elif st.session_state.get("maintenance_table_attached"):
-            st.write(
-                f"Attached: **{st.session_state.maintenance_table_attached}** (see **2. Joins** to merge)."
-            )
 
 
 def _render_quality_subreports(report: dict) -> None:
