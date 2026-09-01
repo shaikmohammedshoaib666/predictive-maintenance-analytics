@@ -33,7 +33,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open **http://localhost:8501**. Sample data: `sample_data/sensor_readings.csv`.
+Open **http://localhost:8501**. Default demo: `sample_data/sensor_readings.csv` (Plant pack). Aviation / auto / oil demos are on *Upload & Clean*.
 
 ```bash
 python smoke_test.py
@@ -48,8 +48,8 @@ Copy `.env.example` → `.env` and set `GEMINI_API_KEY` if you want Gemini on In
 1. **Upload & Clean** — Load sample CSV or upload sensors. Run industrial clean + quality checks.
 2. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label.
 3. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
-4. **Charts** — Sensor over time, anomaly flags, risk by asset (readable Plotly hover / margins).
-5. **Insights** — Ranked inspect-this-week list (IF score, sensor spike, low RUL), slow-running assets, optional **$/hour** or **$/unit** impact. Ask is scoped to **this upload** (not a general LLM essay). Errors from Gemini / LlamaIndex are shown. Without a key, Ask still answers from the table and tells you to set `GEMINI_API_KEY`.
+4. **Charts** — Sensor over time, anomaly flags, risk by asset (readable Plotly hover / margins). Pack KPIs (mission reliability, powertrain health, fillage, …) sit above the primary charts.
+5. **Insights** — Ranked inspect-this-week list (IF score, sensor spike, low RUL), slow-running assets, optional **$/hour** or **$/unit** impact, plus pack-specific KPI cards. Ask is scoped to **this upload** (not a general LLM essay). Errors from Gemini / LlamaIndex are shown. Without a key, Ask still answers from the table and tells you to set `GEMINI_API_KEY`.
 
 Optional labs (joins, SQL) sit beside the pipeline. They are not a second Forge.
 
@@ -61,7 +61,7 @@ Beyond the core pipeline, the app adds five layers aimed at real plant workflows
 
 1. **DuckDB URL / cloud ingest** — load sensor data from a direct HTTPS CSV/Parquet link, a Google Drive share URL, or a Kaggle dataset (`kaggle://owner/dataset/file.csv`; needs `KAGGLE_USERNAME` + `KAGGLE_KEY`). Large/Drive files are cached to disk so DuckDB scans them out-of-core. See the **From URL (cloud / DuckDB)** tab on *Upload & Clean*.
 2. **SQL slice presets** — filter/limit at the source before ingesting (last N rows/days, by `machine_id` / `asset_id`, date range, random sample %, PdM failure focus). Edit the DuckDB SQL to combine filters; only read-only `SELECT`/`WITH` is allowed.
-3. **3D Digital Twin** — a rotatable 3D motor whose drive-end bearing turns **red and blinks** when the selected asset's predicted risk is High (amber = Medium, green = Low). Risk can come from batch *Anomaly & RUL* or from *Live Connect*.
+3. **3D Digital Twin** — a rotatable pack-specific mesh (Plant motor by default; UAV + piston engine; generic ICE car; SRP beam pump) whose hotspot turns **red and blinks** when the selected asset's predicted risk is High (amber = Medium, green = Low). Risk can come from batch *Anomaly & RUL* or from *Live Connect*.
 4. **Live Connect** — streaming ingest that feeds the anomaly pipeline in near-real-time, via a built-in simulator (a selectable asset drifts to failure) or by polling a remote CSV feed. Live risk drives the 3D Twin.
 5. **PySpark cleaning engine (optional)** — a distributed clean engine for very large files, shown on *Upload & Clean* when `pyspark` + a JVM are installed. Kept out of `requirements.txt` to keep the Render deploy lean; install with `pip install -r requirements-optional.txt` (needs a JVM, e.g. `apt-get install default-jre`).
 
@@ -69,9 +69,34 @@ Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as 
 
 ### Upgrades
 
-- **Offline 3D twin** — three.js + OrbitControls are vendored in `src/vendor/three` and inlined, so the *3D Twin* renders with **no internet/CDN**.
+- **Offline 3D twin** — three.js + OrbitControls are vendored in `src/vendor/three` and inlined, so the *3D Twin* renders with **no internet/CDN**. The mesh follows the **industry pack** (sidebar).
 - **Real live sources** — *Live Connect* adds **MQTT** and **OPC-UA** sources (alongside the simulator and CSV polling). MQTT expects JSON sensor payloads; OPC-UA reads a set of node IDs each poll. Requires `paho-mqtt` / `asyncua` (both in `requirements.txt`).
 - **CAD Twin (Autodesk APS)** — optional *CAD Twin* page renders a real translated CAD model (Revit/Fusion/IFC → SVF) via Autodesk Platform Services and tints it red on High risk. Availability-gated: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (secrets) and a translated model URN to enable; otherwise it shows setup steps and the app is unaffected.
+
+---
+
+## Industry packs (one file → one pack)
+
+Plant / rotating machines is the **default**. Switching the sidebar pack switches KPIs, extra column mapping, default charts, and the 3D mesh. A CSV does not magically become an airplane vs a car from `machine_id` alone — pick the pack (or use **Suggest pack from columns**).
+
+| Pack | 3D mesh | Hero / SIH | Demo CSV |
+|------|---------|------------|----------|
+| **Plant / rotating machines** (default) | Generic motor, drive-end bearing hotspot | — | `sample_data/sensor_readings.csv` |
+| **Aviation / aero piston / MALE UAV** | UAV airframe + piston engine | **SIH26054** (DRDO) | `sample_data/aviation_uav_piston.csv` |
+| **Automotive powertrain** | One generic ICE car + engine/gearbox | — | `sample_data/automotive_powertrain.csv` |
+| **Oil well / sucker-rod pump** | Beam pump / wellhead | **SIH26120** (Oil India) | `sample_data/oil_srp.csv` |
+
+### What “not every OEM / trim / EV architecture” means
+
+The automotive pack is **one generic car + ICE powertrain**, not a vehicle catalog:
+
+- **OEM** — manufacturer (BMW vs Toyota vs Ford). No per-brand body CAD or health model.
+- **Trim** — model grade (LX vs Sport vs Limited). One silhouette, not option packages.
+- **EV architecture** — battery-electric skateboard vs hybrid vs ICE. This pack is a piston engine + gearbox/driveline. Separate BEV / hybrid twins are out of scope.
+
+Aviation is a **MALE UAV + aero piston engine**, not an airliner cabin or a turbofan catalog. Oil is **one SRP / CSS well**, not every completion type.
+
+Regenerate demos: `python generate_sample_data.py` (plant + three pack CSVs). To skip rewriting the plant file, call the pack generators directly.
 
 ---
 

@@ -235,7 +235,13 @@ def main() -> int:
 
     def test_twin3d() -> None:
         # Layer 3 — 3D digital twin HTML builder + risk mapping.
-        from src.twin3d import asset_states_from_predictions, build_twin_html, normalize_risk
+        from src.twin3d import (
+            TWIN_KINDS,
+            asset_states_from_predictions,
+            build_twin_html,
+            normalize_risk,
+            normalize_twin_kind,
+        )
 
         assert normalize_risk("HIGH") == "High"
         assert normalize_risk("warn") == "Medium"
@@ -255,6 +261,15 @@ def main() -> int:
         assert "M-1" in html and "__DATA__" not in html  # tokens fully substituted
         # empty asset list still renders a demo twin
         assert "demo-asset" in build_twin_html([], selected_id=None)
+        assert normalize_twin_kind("aviation_uav_piston") == "aviation_uav"
+        assert normalize_twin_kind("bogus") == "plant_motor"
+        for kind in TWIN_KINDS:
+            kind_html = build_twin_html(states, selected_id="M-1", kind=kind, hotspot="test-hot")
+            assert f'"kind": "{kind}"' in kind_html or f'"kind":"{kind}"' in kind_html
+            assert "test-hot" in kind_html
+            assert f"scene:{kind}" in kind_html
+            assert "jsdelivr" not in kind_html
+            assert "__DATA__" not in kind_html
 
     def test_live_connect() -> None:
         # Layer 4 — live simulator + rolling buffer + IsolationForest status.
@@ -339,6 +354,207 @@ def main() -> int:
         assert float(styled.layout.xaxis.tickangle) == -40
         assert int(styled.layout.margin.b or 0) >= 120
 
+    def test_industry_packs() -> None:
+        from src.industry_packs import (
+            AUTOMOTIVE_OEM_TRIM_EV_NOTE,
+            DEFAULT_PACK_ID,
+            PACKS,
+            extra_aliases_for,
+            extra_field_defs,
+            get_pack,
+            list_packs,
+            preferred_y_metric,
+            sample_path_for,
+            suggest_pack,
+            twin_kind_for,
+            validate_packs,
+        )
+
+        assert not validate_packs()
+        packs = list_packs()
+        assert packs[0]["id"] == DEFAULT_PACK_ID == "plant_rotating"
+        assert [p["id"] for p in packs] == [
+            "plant_rotating",
+            "aviation_uav_piston",
+            "automotive_powertrain",
+            "oil_srp",
+        ]
+        assert get_pack("missing")["id"] == DEFAULT_PACK_ID
+        assert twin_kind_for("aviation_uav_piston") == "aviation_uav"
+        assert twin_kind_for("automotive_powertrain") == "auto_car"
+        assert twin_kind_for("oil_srp") == "oil_srp"
+        assert PACKS["aviation_uav_piston"]["sih"] == "SIH26054"
+        assert PACKS["oil_srp"]["sih"] == "SIH26120"
+        assert PACKS["aviation_uav_piston"]["hero"] is True
+        for token in ("OEM", "trim", "EV"):
+            assert token in AUTOMOTIVE_OEM_TRIM_EV_NOTE
+            assert token in PACKS["automotive_powertrain"]["not_in_scope"]
+        assert extra_field_defs("plant_rotating") == []
+        assert "egt" in extra_aliases_for("aviation_uav_piston")
+        assert "pump_fillage" in extra_aliases_for("oil_srp")
+        assert sample_path_for("aviation_uav_piston").name == "aviation_uav_piston.csv"
+
+        av = suggest_pack(["timestamp", "egt", "cht", "flight_hours"], filename="uav_sortie.csv")
+        assert av["pack_id"] == "aviation_uav_piston"
+        auto = suggest_pack(["coolant_temp", "engine_load", "vehicle_speed"], machine_ids=["ENG-01"])
+        assert auto["pack_id"] == "automotive_powertrain"
+        oil = suggest_pack(["pump_fillage", "polish_rod_load"], machine_ids=["WELL-03"])
+        assert oil["pack_id"] == "oil_srp"
+        plant = suggest_pack(["timestamp", "machine_id", "temperature", "vibration", "pressure", "rpm"])
+        assert plant["pack_id"] == DEFAULT_PACK_ID
+        empty = suggest_pack([])
+        assert empty["pack_id"] == DEFAULT_PACK_ID
+        # numpy unique() arrays must not raise (truth-value ambiguity).
+        import numpy as np
+
+        np_ids = suggest_pack(["egt", "cht"], machine_ids=np.array(["UAV-01", "UAV-02"]))
+        assert np_ids["pack_id"] == "aviation_uav_piston"
+        df_av = pd.DataFrame({"egt": [1.0], "vibration": [2.0]})
+        assert preferred_y_metric(df_av, "aviation_uav_piston") == "egt"
+
+    def test_pack_kpis_every_function() -> None:
+        from src.pack_kpis import (
+            compute_pack_kpis,
+            empty_bundle,
+            insight_cards_from_kpis,
+            mission_reliability_pct,
+            remaining_mission_hours,
+            risk_to_health,
+        )
+
+        assert risk_to_health("High") < risk_to_health("Medium") < risk_to_health("Low")
+        assert remaining_mission_hours(10, duty_cycle=0.5) == 120.0
+        assert remaining_mission_hours(None) == 0.0
+        assert remaining_mission_hours(-1) == 0.0
+        lows = [{"machine_id": "A", "risk_level": "Low", "predicted_rul_days": 30}]
+        highs = [{"machine_id": "A", "risk_level": "High", "predicted_rul_days": 2}]
+        assert mission_reliability_pct(lows) > mission_reliability_pct(highs)
+        assert mission_reliability_pct([]) == 0.0
+        empty = empty_bundle("aviation_uav_piston")
+        assert empty["pack_id"] == "aviation_uav_piston" and empty["kpis"]
+
+        mixed = [
+            {"machine_id": "UAV-01", "risk_level": "Low", "predicted_rul_days": 20},
+            {"machine_id": "UAV-03", "risk_level": "High", "predicted_rul_days": 3},
+        ]
+        df = pd.DataFrame(
+            {
+                "machine_id": ["UAV-01"] * 4 + ["UAV-03"] * 4,
+                "egt": [700, 702, 701, 703, 820, 830, 825, 840],
+                "oil_pressure": [60, 61, 59, 60, 28, 26, 27, 25],
+                "vibration": [1.2, 1.1, 1.3, 1.2, 5.0, 5.4, 5.1, 5.6],
+                "temperature": [170, 171, 169, 170, 210, 215, 212, 218],
+            }
+        )
+        bundle = compute_pack_kpis("aviation_uav_piston", df, mixed)
+        ids = {k["id"] for k in bundle["kpis"]}
+        assert {"engine_health_index", "mission_reliability_pct", "remaining_mission_hours", "egt_margin"} <= ids
+        by_id = {a["machine_id"]: a for a in bundle["by_asset"]}
+        assert by_id["UAV-03"]["health_index"] < by_id["UAV-01"]["health_index"]
+        cards = insight_cards_from_kpis(bundle)
+        assert cards and "SIH26054" in cards[0]["title"]
+        assert any("UAV-03" in c["message"] for c in cards)
+
+        auto_preds = [
+            {"machine_id": "ENG-01", "risk_level": "Low", "predicted_rul_days": 18},
+            {"machine_id": "ENG-03", "risk_level": "High", "predicted_rul_days": 4},
+        ]
+        auto_df = pd.DataFrame(
+            {
+                "machine_id": ["ENG-01"] * 3 + ["ENG-03"] * 3,
+                "coolant_temp": [90, 91, 89, 108, 110, 109],
+                "oil_pressure": [42, 41, 43, 12, 11, 10],
+                "engine_load": [40, 42, 41, 80, 82, 85],
+                "vibration": [1.5, 1.4, 1.6, 4.8, 5.0, 5.1],
+            }
+        )
+        auto_b = compute_pack_kpis("automotive_powertrain", auto_df, auto_preds)
+        assert {k["id"] for k in auto_b["kpis"]} >= {"powertrain_health_index", "oil_pressure_status", "thermal_headroom"}
+        assert auto_b["by_asset"][0]["machine_id"] == "ENG-03"
+
+        oil_preds = [
+            {"machine_id": "WELL-01", "risk_level": "Low", "predicted_rul_days": 16},
+            {"machine_id": "WELL-03", "risk_level": "High", "predicted_rul_days": 5},
+        ]
+        oil_df = pd.DataFrame(
+            {
+                "machine_id": ["WELL-01"] * 3 + ["WELL-03"] * 3,
+                "pump_fillage": [92, 91, 93, 58, 55, 52],
+                "polish_rod_load": [14000, 14100, 13900, 19000, 19500, 19800],
+                "production_bbl": [45, 46, 44, 18, 16, 15],
+                "vibration": [2.0, 2.1, 1.9, 6.0, 6.2, 6.4],
+            }
+        )
+        oil_b = compute_pack_kpis("oil_srp", oil_df, oil_preds)
+        assert {k["id"] for k in oil_b["kpis"]} >= {"well_health_index", "pump_fillage_pct", "production_rate"}
+        assert oil_b["by_asset"][0]["machine_id"] == "WELL-03"
+
+        plant_b = compute_pack_kpis(
+            "plant_rotating",
+            pd.DataFrame({"machine_id": ["M-1"], "vibration": [1.0], "temperature": [70]}),
+            [{"machine_id": "M-1", "risk_level": "Low", "predicted_rul_days": 25}],
+        )
+        assert {k["id"] for k in plant_b["kpis"]} >= {"asset_health_index", "high_risk_assets"}
+
+    def test_pack_samples_pipeline() -> None:
+        from src.data_cleaner import clean_and_quality
+        from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
+        from src.industry_packs import PACK_ORDER, sample_path_for
+        from src.ml.anomaly_detector import AnomalyDetector
+        from src.ml.rul_predictor import RULPredictor
+        from src.pack_kpis import compute_pack_kpis
+        from src.sensor_map import suggest_mapping
+        from src.twin3d import build_twin_html
+        from src.industry_packs import twin_kind_for as kind_for
+
+        for pid in PACK_ORDER:
+            path = sample_path_for(pid)
+            assert path.exists(), f"missing demo CSV for {pid}: {path}"
+            df = pd.read_csv(path, parse_dates=["timestamp"])
+            mapping = suggest_mapping(list(df.columns), pack_id=pid)
+            assert mapping["machine_id"] == "machine_id"
+            assert mapping["temperature"] == "temperature"
+            if pid == "aviation_uav_piston":
+                assert mapping.get("egt") == "egt"
+                assert mapping.get("flight_hours") == "flight_hours"
+            if pid == "automotive_powertrain":
+                assert mapping.get("coolant_temp") == "coolant_temp"
+            if pid == "oil_srp":
+                assert mapping.get("pump_fillage") == "pump_fillage"
+            cleaned, _, _ = clean_and_quality(df, run_quality=False)
+            det = AnomalyDetector(contamination=0.08)
+            det.fit(cleaned)
+            if pid == "aviation_uav_piston":
+                assert "egt" in det.feature_columns
+            rul = RULPredictor()
+            rul.fit(cleaned)
+            preds = rul.predict_latest_per_machine(cleaned)
+            assert preds
+            bundle = compute_pack_kpis(pid, cleaned, preds)
+            assert bundle["kpis"] and bundle["by_asset"]
+            fig_h = create_asset_health_chart(bundle["by_asset"])
+            fig_k = create_pack_kpi_bars(bundle["kpis"])
+            assert fig_h.layout.title.text or fig_h.data
+            assert fig_k is not None
+            html = build_twin_html(preds, selected_id=preds[0]["machine_id"], kind=kind_for(pid))
+            assert f'"kind": "{kind_for(pid)}"' in html or f'"kind":"{kind_for(pid)}"' in html
+            assert "jsdelivr" not in html
+
+    def test_pack_mapping_does_not_steal_core() -> None:
+        from src.sensor_map import apply_mapping, suggest_mapping
+
+        cols = ["time", "uav_id", "temp_c", "vib", "press_psi", "egt_c", "oil_psi"]
+        mapping = suggest_mapping(cols, pack_id="aviation_uav_piston")
+        assert mapping["timestamp"] == "time"
+        assert mapping["machine_id"] == "uav_id"
+        assert mapping["temperature"] == "temp_c"
+        assert mapping["vibration"] == "vib"
+        assert mapping["pressure"] == "press_psi"
+        assert mapping["egt"] == "egt_c"
+        assert mapping["oil_pressure"] == "oil_psi"
+        mapped = apply_mapping(pd.DataFrame({c: [1] for c in cols}), mapping)
+        assert "egt" in mapped.columns and "temperature" in mapped.columns
+
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
@@ -351,6 +567,10 @@ def main() -> int:
     check("spark_engine_gate", test_spark_engine_gate)
     check("aps_viewer", test_aps_viewer)
     check("charts_layout", test_charts)
+    check("industry_packs", test_industry_packs)
+    check("pack_kpis_every_function", test_pack_kpis_every_function)
+    check("pack_samples_pipeline", test_pack_samples_pipeline)
+    check("pack_mapping_does_not_steal_core", test_pack_mapping_does_not_steal_core)
 
     if errors:
         print(f"\n{len(errors)} FAIL")
