@@ -76,9 +76,23 @@ from src.insights_engine import (
     test_gemini_connection,
 )
 from src.aps_viewer import aps_available, build_viewer_html, get_access_token
+from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
+from src.industry_packs import (
+    AUTOMOTIVE_OEM_TRIM_EV_NOTE,
+    DEFAULT_PACK_ID,
+    extra_field_defs,
+    get_pack,
+    list_packs,
+    pack_label,
+    preferred_y_metric,
+    sample_path_for,
+    suggest_pack,
+    twin_kind_for,
+)
 from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
+from src.pack_kpis import compute_pack_kpis, insight_cards_from_kpis
 from src.twin3d import RISK_COLORS, asset_states_from_predictions, build_twin_html
 from src.quality_checks import QUALITY_STAGE_COUNT
 from src.sensor_map import CANONICAL_FIELDS, apply_mapping, mapping_status, suggest_mapping
@@ -161,6 +175,10 @@ def init_session_state():
         "clean_engine": "pandas",
         # Autodesk APS CAD twin (Upgrade 3)
         "aps_urn": "",
+        # Industry pack (Plant is the default; 3D + KPIs switch with this)
+        "industry_pack": DEFAULT_PACK_ID,
+        "pack_kpis": {},
+        "pack_suggest": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -229,22 +247,77 @@ def register_table(name: str, df: pd.DataFrame):
     st.session_state.uploaded_tables = tables
 
 
+def active_pack_id() -> str:
+    return str(st.session_state.get("industry_pack") or DEFAULT_PACK_ID)
+
+
+def active_pack() -> dict:
+    return get_pack(active_pack_id())
+
+
+def render_pack_sidebar() -> None:
+    st.sidebar.markdown("### Industry pack")
+    packs = list_packs()
+    ids = [p["id"] for p in packs]
+    current = active_pack_id()
+    if current not in ids:
+        current = DEFAULT_PACK_ID
+        st.session_state.industry_pack = current
+    labels = {p["id"]: (p["short"] + ("  ★ SIH" if p.get("hero") else "") + ("  (default)" if p["default"] else "")) for p in packs}
+    picked = st.sidebar.selectbox(
+        "Field",
+        ids,
+        index=ids.index(current),
+        format_func=lambda pid: labels.get(pid, pid),
+        key="industry_pack",
+        help="One file → one pack. Plant is default. 3D mesh, KPIs, and extra sensor map follow the pack.",
+    )
+    pack = get_pack(picked)
+    st.sidebar.caption(pack["label"] + (f" · {pack['sih']}" if pack.get("sih") else ""))
+    df = get_active_df() if "cleaned_df" in st.session_state else None
+    if df is None:
+        df = st.session_state.get("raw_df")
+    if st.sidebar.button("Suggest pack from columns", use_container_width=True):
+        cols = list(df.columns) if df is not None else []
+        mids = df["machine_id"].astype(str).unique().tolist() if df is not None and "machine_id" in df.columns else []
+        suggestion = suggest_pack(cols, machine_ids=mids)
+        st.session_state.pack_suggest = suggestion
+        st.session_state.industry_pack = suggestion["pack_id"]
+        st.rerun()
+    sug = st.session_state.get("pack_suggest")
+    if sug:
+        st.sidebar.caption("Suggested **" + sug["label"] + "**: " + "; ".join(sug.get("reasons") or []))
+    with st.sidebar.expander("What this pack covers"):
+        st.write(pack["scope"])
+        st.caption("Not in scope: " + pack["not_in_scope"])
+        if pack["id"] == "automotive_powertrain":
+            st.caption(AUTOMOTIVE_OEM_TRIM_EV_NOTE)
+
+
 def load_sample_data():
-    if config.SAMPLE_DATA_PATH.exists():
-        df = pd.read_csv(config.SAMPLE_DATA_PATH, parse_dates=["timestamp"])
-        st.session_state.raw_df = df
-        st.session_state.data_loaded = True
-        register_table("sensors", df)
-        # Optional companion tables for join demos
-        maint = PROJECT_ROOT / "sample_data" / "maintenance_logs.csv"
-        costs = PROJECT_ROOT / "sample_data" / "machine_costs.csv"
-        if maint.exists():
-            register_table("maintenance", pd.read_csv(maint))
-        if costs.exists():
-            register_table("costs", pd.read_csv(costs))
-        return df
-    st.error("Sample data not found. Run: python generate_sample_data.py")
-    return None
+    return load_pack_sample(DEFAULT_PACK_ID)
+
+
+def load_pack_sample(pack_id: str):
+    path = sample_path_for(pack_id, root=PROJECT_ROOT)
+    if not path.exists():
+        st.error(f"Demo CSV missing: {path.name}. Run `python generate_sample_data.py`.")
+        return None
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    st.session_state.raw_df = df
+    st.session_state.data_loaded = True
+    st.session_state.industry_pack = pack_id
+    st.session_state.cleaned_df = None
+    st.session_state.predictions = []
+    st.session_state.pack_kpis = {}
+    register_table("sensors", df)
+    maint = PROJECT_ROOT / "sample_data" / "maintenance_logs.csv"
+    costs = PROJECT_ROOT / "sample_data" / "machine_costs.csv"
+    if pack_id == DEFAULT_PACK_ID and maint.exists():
+        register_table("maintenance", pd.read_csv(maint))
+    if pack_id == DEFAULT_PACK_ID and costs.exists():
+        register_table("costs", pd.read_csv(costs))
+    return df
 
 
 # PdM app domain — drives which URL SQL slice presets are offered.
@@ -505,9 +578,19 @@ def page_upload_clean():
                 accept_multiple_files=True,
             )
         with col2:
-            if st.button("Load Sample Data", use_container_width=True):
-                load_sample_data()
-                st.success("Sample sensors (+ maintenance/costs if present) loaded!")
+            if st.button("Load Plant sample (default)", use_container_width=True):
+                load_pack_sample(DEFAULT_PACK_ID)
+                st.success("Plant sample sensors (+ maintenance/costs if present) loaded.")
+                st.rerun()
+            demo_pack = st.selectbox(
+                "Or load a pack demo CSV",
+                [p["id"] for p in list_packs() if p["id"] != DEFAULT_PACK_ID],
+                format_func=lambda pid: pack_label(pid),
+                key="upload_demo_pack",
+            )
+            if st.button("Load pack demo", use_container_width=True):
+                load_pack_sample(demo_pack)
+                st.success(f"Loaded {pack_label(demo_pack)} demo and switched the industry pack.")
                 st.rerun()
 
         if uploaded_files:
@@ -627,9 +710,10 @@ def page_map_sensors():
         st.warning("Upload (and preferably clean) a sensor CSV first.")
         return
 
-    suggested = suggest_mapping(list(df.columns))
+    suggested = suggest_mapping(list(df.columns), pack_id=active_pack_id())
     saved = st.session_state.get("sensor_mapping") or {}
     status = mapping_status(df)
+    pack = active_pack()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Sensors mapped", status["sensor_count"])
     c2.metric("Timestamp", "yes" if status["has_timestamp"] else "no")
@@ -641,11 +725,21 @@ def page_map_sensors():
     cols = [""] + list(df.columns)
     mapping: dict[str, str | None] = {}
     st.subheader("Column map")
+    st.caption(f"Core PdM fields, then optional **{pack['short']}** extras. Pack: {pack['label']}.")
     for canonical, label in CANONICAL_FIELDS:
         default_src = saved.get(canonical) or suggested.get(canonical) or ""
         idx = cols.index(default_src) if default_src in cols else 0
         picked = st.selectbox(label, cols, index=idx, key=f"map_{canonical}")
         mapping[canonical] = picked or None
+
+    extras = extra_field_defs(active_pack_id())
+    if extras:
+        st.subheader(f"{pack['short']} extras (optional)")
+        for canonical, label in extras:
+            default_src = saved.get(canonical) or suggested.get(canonical) or ""
+            idx = cols.index(default_src) if default_src in cols else 0
+            picked = st.selectbox(label, cols, index=idx, key=f"map_{canonical}")
+            mapping[canonical] = picked or None
 
     if st.button("Apply mapping", type="primary"):
         mapped = apply_mapping(df, mapping)
@@ -819,20 +913,41 @@ def page_explore_graphs():
         return
 
     st.subheader("Chart Controls")
+    pack = active_pack()
     ctrl1, ctrl2, ctrl3 = st.columns(3)
     axis_options = get_axis_options(df)
     numeric_cols = get_numeric_columns(df)
+    prefer = preferred_y_metric(df, active_pack_id())
+    y_default = 0
+    if prefer and prefer in numeric_cols:
+        y_default = numeric_cols.index(prefer)
+    elif "temperature" in numeric_cols:
+        y_default = numeric_cols.index("temperature")
     with ctrl1:
         x_axis = st.selectbox("X-Axis", axis_options, index=0)
     with ctrl2:
         y_metric = st.selectbox(
             "Sensor / metric",
             numeric_cols,
-            index=numeric_cols.index("temperature") if "temperature" in numeric_cols else 0,
+            index=y_default,
         )
     with ctrl3:
         machines = sorted(df["machine_id"].unique()) if "machine_id" in df.columns else []
         machine_filter = st.multiselect("Filter by Machine", machines, default=machines)
+
+    bundle = compute_pack_kpis(active_pack_id(), df, st.session_state.get("predictions") or [])
+    st.session_state.pack_kpis = bundle
+    st.subheader(f"{pack['short']} KPIs" + (f" · {pack['sih']}" if pack.get("sih") else ""))
+    st.caption(pack["scope"])
+    kpi_cols = st.columns(max(len(bundle["kpis"]), 1))
+    for col, kpi in zip(kpi_cols, bundle["kpis"]):
+        with col:
+            st.metric(kpi["label"], f"{kpi['value']} {kpi['unit']}".strip(), help=kpi["hint"])
+    if bundle["by_asset"]:
+        health_fig = create_asset_health_chart(bundle["by_asset"], title=f"{pack['short']} health by asset")
+        st.plotly_chart(health_fig, use_container_width=True, key="pack_health_chart")
+        kpi_fig = create_pack_kpi_bars(bundle["kpis"], title=f"{pack['short']} KPIs")
+        st.plotly_chart(kpi_fig, use_container_width=True, key="pack_kpi_bars")
 
     st.info(chart_business_insight(df, x_axis, y_metric))
 
@@ -1044,6 +1159,9 @@ def _refresh_brief(df: pd.DataFrame) -> dict:
         hours_if_stop=float(st.session_state.get("hours_if_stop") or 8),
         used_synthetic=bool(st.session_state.get("rul_used_synthetic")),
     )
+    bundle = compute_pack_kpis(active_pack_id(), df, st.session_state.predictions)
+    st.session_state.pack_kpis = bundle
+    brief["insights"] = list(brief["insights"]) + insight_cards_from_kpis(bundle)
     st.session_state.business_insights = brief["insights"]
     st.session_state.asset_ranking = brief["ranked"]
     st.session_state.inspect_list = brief["inspect"]
@@ -1127,17 +1245,18 @@ def page_business_insights():
     st.caption(
         "Dollar figures use only the rates you enter. Default 8 h is an assumed stop — not a booked outage."
     )
+    pack = active_pack()
     c1, c2, c3 = st.columns(3)
     with c1:
         st.session_state.cost_per_hour = st.number_input(
-            "$ / hour downtime",
+            pack["cost_hour_label"],
             min_value=0.0,
             value=float(st.session_state.get("cost_per_hour") or 0),
             step=50.0,
         )
     with c2:
         st.session_state.cost_per_unit = st.number_input(
-            "$ / unit lost production",
+            pack["cost_unit_label"],
             min_value=0.0,
             value=float(st.session_state.get("cost_per_unit") or 0),
             step=1.0,
@@ -1227,14 +1346,20 @@ def page_business_insights():
 
 # ── 3D Digital Twin (Layer 3) ─────────────────────────────────────────────────
 def page_twin_3d():
+    pack = active_pack()
     st.markdown('<p class="main-header">3D Digital Twin</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Rotatable 3D asset. The drive-end bearing turns red and blinks '
-        "when the selected machine's predicted risk is High (amber = Medium, green = Low). "
-        "Asset-agnostic — the same twin serves any rotating machine.</p>",
+        f'<p class="sub-header">{pack["label"]}: rotatable 3D mesh. The '
+        f'<b>{pack["hotspot"]}</b> turns red and blinks when the selected asset\'s '
+        "predicted risk is High (amber = Medium, green = Low). "
+        "Switch the industry pack in the sidebar to change the mesh.</p>",
         unsafe_allow_html=True,
     )
+    st.caption(pack["scope"])
+    if pack["id"] == "automotive_powertrain":
+        st.info(AUTOMOTIVE_OEM_TRIM_EV_NOTE)
 
+    kind = twin_kind_for(pack["id"])
     batch_states = asset_states_from_predictions(st.session_state.get("predictions") or [])
     live_states = st.session_state.get("live_asset_states") or []
     sources: dict[str, list] = {}
@@ -1242,6 +1367,17 @@ def page_twin_3d():
         sources["Anomaly & RUL (batch)"] = batch_states
     if live_states:
         sources["Live Connect (streaming)"] = live_states
+
+    def _render_twin(states: list, selected_id: str, height: int = 540) -> None:
+        html = build_twin_html(
+            states,
+            selected_id=selected_id,
+            height=height,
+            kind=kind,
+            hotspot=pack["hotspot"],
+            pack_label=pack["label"],
+        )
+        components.html(html, height=height + 20)
 
     if sources:
         source_names = list(sources.keys())
@@ -1260,10 +1396,10 @@ def page_twin_3d():
         sel = next((s for s in states if s["machine_id"] == selected), states[0])
         with c2:
             st.metric("Risk", sel["risk_level"])
-        components.html(build_twin_html(states, selected_id=selected, height=540), height=560)
+        _render_twin(states, selected, 540)
         st.caption(
             "Risk is read from **3. Anomaly & RUL** or **Live Connect** (pick the source above). "
-            "Rotate with the mouse; scroll to zoom."
+            "Rotate with the mouse; scroll to zoom. Mesh follows the industry pack."
         )
     else:
         st.info(
@@ -1272,14 +1408,17 @@ def page_twin_3d():
         )
         demo_risk = st.selectbox("Preview risk", ["High", "Medium", "Low"], index=0)
         demo_rul = {"High": 3, "Medium": 12, "Low": 26}[demo_risk]
-        demo = [{"machine_id": "demo-motor", "risk_level": demo_risk, "predicted_rul_days": demo_rul}]
-        components.html(build_twin_html(demo, selected_id="demo-motor", height=540), height=560)
+        demo_id = {"plant_rotating": "demo-motor", "aviation_uav_piston": "demo-UAV",
+                   "automotive_powertrain": "demo-ENG", "oil_srp": "demo-WELL"}.get(pack["id"], "demo-asset")
+        demo = [{"machine_id": demo_id, "risk_level": demo_risk, "predicted_rul_days": demo_rul}]
+        _render_twin(demo, demo_id, 540)
 
     st.caption(
         "Legend — "
         + " · ".join(
             f"**{k}** {v['hex']}" for k, v in RISK_COLORS.items() if k != "Unknown"
         )
+        + f" · hotspot: **{pack['hotspot']}**"
     )
 
 
@@ -1296,8 +1435,8 @@ def page_cad_twin():
     if not ok:
         st.info(
             "Autodesk APS isn't configured yet. This premium viewer needs your Autodesk credentials and a "
-            "translated model — until then, the credential-free **3D Twin** page gives the same red-bearing "
-            "failure cue."
+            "translated model — until then, the credential-free **3D Twin** page (pack-specific mesh) "
+            "gives the same red-hotspot failure cue."
         )
         with st.expander("How to enable (bring your own Autodesk account)", expanded=True):
             st.markdown(
@@ -1659,6 +1798,8 @@ def main():
     st.sidebar.markdown(f"## {config.APP_TITLE}")
     st.sidebar.caption(config.TAGLINE)
     st.sidebar.markdown("---")
+    render_pack_sidebar()
+    st.sidebar.markdown("---")
 
     pages = {
         "1. Upload & Clean": page_upload_clean,
@@ -1683,8 +1824,9 @@ def main():
     if df is not None:
         st.sidebar.success(f"Data: {len(df):,} rows")
         status = mapping_status(df)
+        pack = active_pack()
         st.sidebar.caption(
-            f"Sensors: {status['sensor_count']} · "
+            f"Pack: {pack['short']} · Sensors: {status['sensor_count']} · "
             f"RUL label: {'yes' if status['has_rul_label'] else 'no'}"
         )
     else:
