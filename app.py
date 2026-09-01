@@ -24,10 +24,18 @@ UPLOAD_DIR = PROJECT_ROOT / "output" / "uploads"
 
 import config
 from src.dashboard_builder import (
-    export_dashboard_html,
     get_graph_folder,
-    render_dashboard_preview,
     save_graph_to_folder,
+)
+from src.dashboard_composer import (
+    TILE_SPECS,
+    board_cad_html,
+    board_pack_charts,
+    board_twin_html,
+    cad_placeholder_html,
+    cad_slot_status,
+    compose_dashboard_html,
+    default_tile_state,
 )
 from src.data_cleaner import clean_and_quality
 from src.data_insights import analyze_columns, format_insights_markdown
@@ -75,7 +83,7 @@ from src.insights_engine import (
     polish_brief_with_gemini,
     test_gemini_connection,
 )
-from src.aps_viewer import aps_available, build_viewer_html, get_access_token
+from src.aps_viewer import aps_available, aps_model_urn, build_viewer_html, get_access_token
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
     AUTOMOTIVE_OEM_TRIM_EV_NOTE,
@@ -96,7 +104,7 @@ from src.pack_kpis import compute_pack_kpis, insight_cards_from_kpis
 from src.twin3d import RISK_COLORS, asset_states_from_predictions, build_twin_html
 from src.quality_checks import QUALITY_STAGE_COUNT
 from src.sensor_map import CANONICAL_FIELDS, apply_mapping, mapping_status, suggest_mapping
-from src.spark_clean import clean_with_spark, spark_available
+from src.polars_clean import clean_with_polars, polars_available
 
 st.set_page_config(
     page_title=config.APP_TITLE,
@@ -171,9 +179,10 @@ def init_session_state():
         "live_asset_states": [],
         "live_sensor_view": "temperature",
         "live_conn_id": None,
-        # Cleaning engine (Layer 5)
+        # Cleaning engine (pandas | Polars)
         "clean_engine": "pandas",
-        # Autodesk APS CAD twin (Upgrade 3)
+        "dashboard_tiles": None,
+        # Autodesk APS CAD twin — URN also accepted from APS_MODEL_URN after deploy
         "aps_urn": "",
         # Industry pack (Plant is the default; 3D + KPIs switch with this)
         "industry_pack": DEFAULT_PACK_ID,
@@ -467,7 +476,7 @@ def _ingest_from_url_tab():
 
 
 def _render_maintenance_attach():
-    with st.expander("Attach maintenance table (optional — join on Joins lab)"):
+    with st.expander("Attach maintenance table (optional — join in step 2)"):
         st.caption(
             "Upload a work-order / PM schedule CSV (columns like `machine_id`, `maintenance_date`, "
             "`work_order`). It registers as `maintenance` for INNER/LEFT joins with sensor data."
@@ -484,13 +493,33 @@ def _render_maintenance_attach():
                 st.session_state.maintenance_table_attached = maint_file.name
                 st.success(
                     f"Registered **maintenance** — {len(maint_df):,} rows × {maint_df.shape[1]} cols. "
-                    "Open **Joins (lab)** to merge on `machine_id`."
+                    "Open **2. Joins** to merge on `machine_id`."
                 )
             except Exception as exc:
                 st.error(str(exc))
         elif st.session_state.get("maintenance_table_attached"):
             st.write(
-                f"Attached: **{st.session_state.maintenance_table_attached}** (see Joins lab to merge)."
+                f"Attached: **{st.session_state.maintenance_table_attached}** (see **2. Joins** to merge)."
+            )
+        maint_file = st.file_uploader(
+            "Maintenance / work-order CSV",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="upload_maintenance_table",
+        )
+        if maint_file is not None:
+            try:
+                maint_df = load_tabular_file(maint_file)
+                register_table("maintenance", maint_df)
+                st.session_state.maintenance_table_attached = maint_file.name
+                st.success(
+                    f"Registered **maintenance** — {len(maint_df):,} rows × {maint_df.shape[1]} cols. "
+                    "Open **2. Joins** to merge on `machine_id`."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+        elif st.session_state.get("maintenance_table_attached"):
+            st.write(
+                f"Attached: **{st.session_state.maintenance_table_attached}** (see **2. Joins** to merge)."
             )
 
 
@@ -618,9 +647,9 @@ def page_upload_clean():
         st.dataframe(st.session_state.raw_df.head(10), use_container_width=True)
 
         engines = ["pandas"]
-        spark_ok, spark_msg = spark_available()
-        if spark_ok:
-            engines.append("pyspark")
+        polars_ok, polars_msg = polars_available()
+        if polars_ok:
+            engines.append("polars")
         eng_col1, eng_col2 = st.columns([1, 2])
         with eng_col1:
             clean_engine = st.selectbox(
@@ -629,30 +658,30 @@ def page_upload_clean():
                 index=engines.index(st.session_state.get("clean_engine", "pandas"))
                 if st.session_state.get("clean_engine", "pandas") in engines
                 else 0,
-                help="PySpark (distributed) appears when pyspark + a JVM are installed.",
+                help="pandas is the default. Polars is the fast columnar engine for larger CSVs (no JVM).",
             )
         with eng_col2:
             st.caption(
-                f"PySpark: **available** — {spark_msg}"
-                if spark_ok
-                else f"PySpark: not available ({spark_msg}) — pandas engine is used."
+                f"Polars: **available** — {polars_msg}"
+                if polars_ok
+                else f"Polars: not available ({polars_msg}) — pandas engine is used."
             )
         st.session_state.clean_engine = clean_engine
 
         if st.button("Run industrial clean + 19 quality checks", type="primary"):
             with st.spinner(f"Cleaning with {clean_engine} + running 19 quality stages..."):
                 raw = st.session_state.raw_df
-                spark_log: list[str] = []
+                engine_log: list[str] = []
                 source_df = raw
-                if clean_engine == "pyspark":
+                if clean_engine == "polars":
                     try:
-                        source_df, spark_log = clean_with_spark(raw)
+                        source_df, engine_log = clean_with_polars(raw)
                     except Exception as exc:
-                        st.warning(f"PySpark clean failed — falling back to pandas: {exc}")
+                        st.warning(f"Polars clean failed — falling back to pandas: {exc}")
                         source_df = raw
                 cleaned, summary, report = clean_and_quality(source_df, run_quality=True)
-                if spark_log:
-                    summary["actions"] = spark_log + summary.get("actions", [])
+                if engine_log:
+                    summary["actions"] = engine_log + summary.get("actions", [])
                 insights = analyze_columns(cleaned)
                 st.session_state.cleaned_df = cleaned
                 st.session_state.cleaning_summary = summary
@@ -695,7 +724,7 @@ def page_upload_clean():
 
 # ── Map sensors ───────────────────────────────────────────────────────────────
 def page_map_sensors():
-    st.markdown('<p class="main-header">2. Map sensors</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">3. Map sensors</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="sub-header">Point messy CSV headers at timestamp, asset, and sensor columns. '
         "RUL labels are optional.</p>",
@@ -755,16 +784,19 @@ def page_map_sensors():
 
 # ── Data Integration (SQL joins) ──────────────────────────────────────────────
 def page_data_integration():
-    st.markdown('<p class="main-header">Joins (lab)</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">2. Joins</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Optional: merge sensor + maintenance/cost tables. '
-        "Not required for the core PdM pipeline.</p>",
+        '<p class="sub-header">Integrate tables before mapping: sensor ⋈ maintenance ⋈ cost on '
+        "<code>machine_id</code>. I4.0 ingest → integrate → contextualize. Optional if you only have one CSV.</p>",
         unsafe_allow_html=True,
     )
 
     tables = st.session_state.uploaded_tables or {}
     if len(tables) < 2:
-        st.warning("Register at least 2 tables (multi-upload or Load Sample Data).")
+        st.warning(
+            "Register at least 2 tables. On **1. Upload & Clean**, load the Plant sample "
+            "(sensors + maintenance + costs) or attach a maintenance CSV, then join here."
+        )
         return
 
     names = list(tables.keys())
@@ -900,7 +932,7 @@ def page_dwdm_sql():
 
 # ── Explore & Graphs ──────────────────────────────────────────────────────────
 def page_explore_graphs():
-    st.markdown('<p class="main-header">4. Charts</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">5. Charts</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="sub-header">PdM charts: sensor over time, anomaly flags, risk by asset. '
         "Readable Plotly hover / margins (same idea as Forge, PdM metrics only).</p>",
@@ -1011,7 +1043,7 @@ def page_explore_graphs():
 
 # ── ML + Optuna ───────────────────────────────────────────────────────────────
 def page_ml_predictions():
-    st.markdown('<p class="main-header">3. Anomaly & RUL</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">4. Anomaly & RUL</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="sub-header">Isolation Forest anomalies, then Random Forest remaining useful life / risk.</p>',
         unsafe_allow_html=True,
@@ -1230,7 +1262,7 @@ def render_ask_panel(df: pd.DataFrame | None) -> None:
 
 # ── Business Insights ─────────────────────────────────────────────────────────
 def page_business_insights():
-    st.markdown('<p class="main-header">5. Insights</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">6. Insights</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="sub-header">Inspect list, slow-running assets, and $ at risk from this table — not generic advice.</p>',
         unsafe_allow_html=True,
@@ -1398,12 +1430,12 @@ def page_twin_3d():
             st.metric("Risk", sel["risk_level"])
         _render_twin(states, selected, 540)
         st.caption(
-            "Risk is read from **3. Anomaly & RUL** or **Live Connect** (pick the source above). "
+            "Risk is read from **4. Anomaly & RUL** or **Live Connect** (pick the source above). "
             "Rotate with the mouse; scroll to zoom. Mesh follows the industry pack."
         )
     else:
         st.info(
-            "No predictions yet. Run **3. Anomaly & RUL** to drive the twin from real risk, "
+            "No predictions yet. Run **4. Anomaly & RUL** to drive the twin from real risk, "
             "or preview it with a manual risk below."
         )
         demo_risk = st.selectbox("Preview risk", ["High", "Medium", "Low"], index=0)
@@ -1426,29 +1458,35 @@ def page_twin_3d():
 def page_cad_twin():
     st.markdown('<p class="main-header">CAD Twin (Autodesk APS)</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Load a real translated CAD model (Revit / Fusion / IFC → SVF) via Autodesk '
-        "Platform Services and tint it red when the selected asset's predicted risk is High.</p>",
+        '<p class="sub-header">Real translated CAD (Revit / Fusion / IFC → SVF). Credentials are '
+        "runtime secrets — add them on Render after deploy; this page and the dashboard CAD tile "
+        "turn on without a code change.</p>",
         unsafe_allow_html=True,
     )
 
     ok, msg = aps_available()
-    if not ok:
+    env_urn = aps_model_urn()
+    if not st.session_state.get("aps_urn") and env_urn:
+        st.session_state.aps_urn = env_urn
+
+    status = cad_slot_status(st.session_state.get("aps_urn") or "")
+    if ok:
+        st.success(f"APS: {msg}")
+    else:
         st.info(
-            "Autodesk APS isn't configured yet. This premium viewer needs your Autodesk credentials and a "
-            "translated model — until then, the credential-free **3D Twin** page (pack-specific mesh) "
-            "gives the same red-hotspot failure cue."
+            "APS credentials are not on this deploy yet. The **3D Twin** (pack mesh) is the "
+            "credential-free twin. Add `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional "
+            "`APS_MODEL_URN`) on Render, reload, and this tile loads."
         )
-        with st.expander("How to enable (bring your own Autodesk account)", expanded=True):
+        with st.expander("How to enable after deploy", expanded=True):
             st.markdown(
-                "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) → get a **Client ID** + **Client Secret**.\n"
-                "2. Add them in the **Secrets** panel (right side) as `APS_CLIENT_ID` and `APS_CLIENT_SECRET`.\n"
-                "3. Upload a CAD model to an APS bucket and translate it to **SVF**, then copy its base64 **URN**.\n"
-                "4. Reload this page, paste the URN, pick the asset, and load the model."
+                "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) → **Client ID** + **Client Secret**.\n"
+                "2. On Render → Environment, set `APS_CLIENT_ID`, `APS_CLIENT_SECRET`, optional `APS_MODEL_URN`.\n"
+                "3. Translate a CAD model to **SVF**, paste the base64 URN here if not in env.\n"
+                "4. Reload — dashboard CAD tile uses the same gate."
             )
         st.caption(f"Status: {msg}")
-        return
 
-    st.success(f"APS: {msg}")
     states = asset_states_from_predictions(st.session_state.get("predictions") or []) or (
         st.session_state.get("live_asset_states") or []
     )
@@ -1456,15 +1494,21 @@ def page_cad_twin():
     c1, c2 = st.columns([2, 1])
     with c1:
         urn = st.text_input(
-            "Translated model URN (base64)", value=st.session_state.get("aps_urn", ""), key="aps_urn_input"
+            "Translated model URN (base64)",
+            value=st.session_state.get("aps_urn", "") or env_urn,
+            key="aps_urn_input",
+            help="Also accepted from env APS_MODEL_URN after Render deploy.",
         )
         st.session_state.aps_urn = urn
     with c2:
         selected = st.selectbox("Asset", ids, key="aps_asset_pick")
     sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
 
-    if not urn.strip():
-        st.warning("Paste a translated SVF model URN to load the CAD viewer.")
+    if not ok:
+        components.html(cad_placeholder_html(status=status, height=280), height=300)
+        return
+    if not (urn or "").strip():
+        st.warning("Paste a translated SVF model URN, or set APS_MODEL_URN on Render.")
         return
     if st.button("Load CAD model", type="primary"):
         try:
@@ -1709,24 +1753,129 @@ def page_live_connect():
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def page_dashboard_builder():
-    st.markdown('<p class="main-header">Dashboard Builder</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-header">7. Dashboard</p>', unsafe_allow_html=True)
+    pack = active_pack()
+    st.markdown(
+        f'<p class="sub-header">Reliability board for <b>{pack["label"]}</b> — KPI strip, charts, '
+        "insights, 3D twin, CAD slot. Toggle tiles like a Power BI canvas, then export HTML.</p>",
+        unsafe_allow_html=True,
+    )
+    st.caption(pack["scope"])
+
+    if st.session_state.get("dashboard_tiles") is None:
+        st.session_state.dashboard_tiles = default_tile_state()
+
+    tile_cols = st.columns(len(TILE_SPECS))
+    enabled: list[str] = []
+    for col, spec in zip(tile_cols, TILE_SPECS):
+        with col:
+            on = st.checkbox(
+                spec["label"],
+                value=bool(st.session_state.dashboard_tiles.get(spec["id"], True)),
+                key=f"dash_tile_{spec['id']}",
+                help=spec["hint"],
+            )
+            st.session_state.dashboard_tiles[spec["id"]] = on
+            if on:
+                enabled.append(spec["id"])
+
+    df = get_active_df()
+    preds = list(st.session_state.get("predictions") or [])
+    bundle = compute_pack_kpis(active_pack_id(), df if df is not None else pd.DataFrame(), preds)
+    st.session_state.pack_kpis = bundle
+    insight_cards = list(st.session_state.get("business_insights") or [])
+    if not insight_cards:
+        insight_cards = insight_cards_from_kpis(bundle)
+
+    live_states = st.session_state.get("live_asset_states") or []
+    twin_source = preds or live_states
+    selected_id = None
+    if twin_source:
+        selected_id = str(twin_source[0].get("machine_id"))
+    twin_html = board_twin_html(twin_source, active_pack_id(), selected_id=selected_id, height=480)
+
+    cad_status = cad_slot_status(st.session_state.get("aps_urn") or "")
+    cad_html = ""
+    cad_asset = selected_id or "asset"
+    cad_risk = "Unknown"
+    if twin_source:
+        cad_risk = str(twin_source[0].get("risk_level") or "Unknown")
+    if cad_status.get("ready"):
+        try:
+            token = get_access_token()
+            cad_html = board_cad_html(
+                token=token["access_token"],
+                urn=cad_status["urn"],
+                asset=cad_asset,
+                risk=cad_risk,
+                height=480,
+            )
+        except Exception as exc:
+            cad_status = dict(cad_status)
+            cad_status["ready"] = False
+            cad_status["message"] = f"APS token failed: {exc}"
+
+    pack_figs = board_pack_charts(bundle)
     folder = get_graph_folder()
-    if not folder:
-        st.info("No graphs saved yet. Go to Explore & Graphs.")
-        return
-    selected = []
-    for g_id, entry in folder.items():
-        if st.checkbox(f"{entry.get('title', g_id)} ({entry['graph_type']})", key=f"dash_chk_{g_id}", value=True):
-            selected.append(g_id)
-    render_dashboard_preview(selected, columns=2)
-    if selected:
-        html = export_dashboard_html(selected)
-        st.download_button(
-            "Export Dashboard (HTML)",
-            html,
-            file_name=f"maintenance_dashboard_{datetime.now().strftime('%Y%m%d')}.html",
-            mime="text/html",
-        )
+    saved_figs = [entry["fig"] for entry in folder.values()] if folder else []
+    chart_figs = pack_figs + saved_figs
+
+    if "kpis" in enabled:
+        st.subheader("KPI strip")
+        kpi_cols = st.columns(max(len(bundle["kpis"]), 1))
+        for col, kpi in zip(kpi_cols, bundle["kpis"]):
+            with col:
+                st.metric(kpi["label"], f"{kpi['value']} {kpi['unit']}".strip(), help=kpi.get("hint"))
+        st.caption(bundle.get("narrative") or "")
+
+    if "charts" in enabled:
+        st.subheader("Charts")
+        if chart_figs:
+            cols = st.columns(2)
+            for i, fig in enumerate(chart_figs):
+                with cols[i % 2]:
+                    st.plotly_chart(fig, use_container_width=True, key=f"board_chart_{i}")
+        else:
+            st.info("No charts yet. Run **4. Anomaly & RUL** or generate a view on **5. Charts**.")
+
+    if "insights" in enabled:
+        st.subheader("Insights")
+        if insight_cards:
+            for item in insight_cards[:8]:
+                st.markdown(f"**{item.get('title')}** — `{item.get('severity')}`")
+                st.caption(item.get("message") or "")
+        else:
+            st.info("Open **6. Insights** after Anomaly & RUL for the inspect list.")
+
+    if "twin3d" in enabled:
+        st.subheader("3D twin")
+        components.html(twin_html, height=500)
+        st.caption(f"Pack mesh: {pack['short']} · hotspot {pack['hotspot']}")
+
+    if "cad" in enabled:
+        st.subheader("CAD twin (APS)")
+        if cad_status.get("ready") and cad_html:
+            components.html(cad_html, height=500)
+        else:
+            components.html(cad_placeholder_html(status=cad_status, height=280), height=300)
+
+    export = compose_dashboard_html(
+        tiles=enabled,
+        pack_id=active_pack_id(),
+        kpi_bundle=bundle,
+        insight_cards=insight_cards,
+        chart_figs=chart_figs,
+        twin_html=twin_html,
+        cad_html=cad_html,
+        cad_status=cad_status,
+        title=f"{pack['short']} reliability dashboard",
+    )
+    st.download_button(
+        "Export dashboard (HTML) — KPIs + charts + 3D" + (" + CAD" if cad_status.get("ready") else " (CAD slot placeholder)"),
+        export,
+        file_name=f"reliability_dashboard_{datetime.now().strftime('%Y%m%d')}.html",
+        mime="text/html",
+    )
 
 
 # ── AI Assistant — same Ask box as Insights (one scoped path) ─────────────────
@@ -1766,6 +1915,8 @@ def page_email_report():
             anomaly_summary=st.session_state.anomaly_summary,
             insights=st.session_state.insights,
             additional_notes=extra,
+            pack_kpis=st.session_state.get("pack_kpis")
+            or compute_pack_kpis(active_pack_id(), get_active_df(), st.session_state.predictions),
         )
         st.session_state.email_preview = body
         st.session_state.email_subject = subject
@@ -1803,17 +1954,17 @@ def main():
 
     pages = {
         "1. Upload & Clean": page_upload_clean,
-        "2. Map sensors": page_map_sensors,
-        "3. Anomaly & RUL": page_ml_predictions,
-        "4. Charts": page_explore_graphs,
-        "5. Insights": page_business_insights,
+        "2. Joins": page_data_integration,
+        "3. Map sensors": page_map_sensors,
+        "4. Anomaly & RUL": page_ml_predictions,
+        "5. Charts": page_explore_graphs,
+        "6. Insights": page_business_insights,
         "3D Twin": page_twin_3d,
         "CAD Twin (APS)": page_cad_twin,
         "Live Connect": page_live_connect,
-        "AI Assistant": page_ai_assistant,
+        "7. Dashboard": page_dashboard_builder,
         "Email Report": page_email_report,
-        "Dashboard": page_dashboard_builder,
-        "Joins (lab)": page_data_integration,
+        "Ask": page_ai_assistant,
         "SQL lab": page_dwdm_sql,
     }
 
