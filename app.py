@@ -299,14 +299,12 @@ def render_pack_sidebar() -> None:
     st.sidebar.markdown("### Industry pack")
     packs = list_packs()
     ids = [p["id"] for p in packs]
-    current = active_pack_id()
-    if current not in ids:
-        current = DEFAULT_PACK_ID
     labels = {p["id"]: (p["short"] + ("  ★ SIH" if p.get("hero") else "") + ("  (default)" if p["default"] else "")) for p in packs}
+    # No index=/value= — industry_pack is widget-bound; apply_pending_industry_pack()
+    # sets it before this selectbox so Streamlit will not warn or throw.
     picked = st.sidebar.selectbox(
         "Field",
         ids,
-        index=ids.index(current),
         format_func=lambda pid: labels.get(pid, pid),
         key="industry_pack",
         help="One file → one pack. Plant is default. 3D mesh, KPIs, and extra sensor map follow the pack.",
