@@ -638,53 +638,269 @@ def main() -> int:
         assert len(merged) == 2 and "work_order" in merged.columns
         assert meta["how"] == "left"
 
+    def _app_ast():
+        import ast
+
+        src = (ROOT / "app.py").read_text(encoding="utf-8")
+        return src, ast.parse(src)
+
+    def _literal_widget_keys(node) -> list[tuple[int, str]]:
+        import ast
+
+        found: list[tuple[int, str]] = []
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Call):
+                continue
+            for kw in n.keywords:
+                if kw.arg != "key":
+                    continue
+                if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    found.append((n.lineno, kw.value.value))
+        return found
+
+    def _is_st_session_state(node) -> bool:
+        import ast
+
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "session_state"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "st"
+        )
+
+    def _session_state_writes(node) -> list[tuple[int, str]]:
+        """Literal ``st.session_state.X =`` / ``st.session_state['X'] =`` writes."""
+        import ast
+
+        found: list[tuple[int, str]] = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assign):
+                targets = n.targets
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and n.target is not None:
+                targets = [n.target]
+            else:
+                continue
+            for t in targets:
+                if isinstance(t, ast.Attribute) and _is_st_session_state(t.value):
+                    found.append((n.lineno, t.attr))
+                elif isinstance(t, ast.Subscript) and _is_st_session_state(t.value):
+                    sl = t.slice
+                    if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                        found.append((n.lineno, sl.value))
+        return found
+
+    def _fn_named(tree, name):
+        import ast
+
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    def _pre_widget_funcs(tree) -> set[str]:
+        import ast
+
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if "PRE_WIDGET_SESSION_FUNCS" not in names:
+                continue
+            val = node.value
+            if isinstance(val, ast.Call) and isinstance(val.func, ast.Name) and val.func.id == "frozenset":
+                arg = val.args[0]
+                if isinstance(arg, (ast.Set, ast.List, ast.Tuple)):
+                    return {elt.value for elt in arg.elts if isinstance(elt, ast.Constant)}
+        raise AssertionError("app.py must define PRE_WIDGET_SESSION_FUNCS frozenset")
+
+    def _on_click_callbacks(tree) -> set[str]:
+        import ast
+
+        names: set[str] = set()
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            for kw in n.keywords:
+                if kw.arg != "on_click":
+                    continue
+                if isinstance(kw.value, ast.Name):
+                    names.add(kw.value.id)
+        return names
+
     def test_streamlit_widget_keys_unique() -> None:
-        """Literal Streamlit `key=` values must be unique within a page/helper.
+        """Literal Streamlit `key=` values must be unique within a script run.
 
         Duplicate keys crash Streamlit with StreamlitDuplicateElementKey (seen
         live when `_render_maintenance_attach` pasted the same uploader twice).
+        Pages are mutually exclusive; sidebar + helpers run with every page.
         """
-        import ast
         from collections import Counter
 
-        src = (ROOT / "app.py").read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        _, tree = _app_ast()
 
-        def literal_keys(node: ast.AST) -> list[str]:
-            found: list[str] = []
-            for n in ast.walk(node):
-                if not isinstance(n, ast.Call):
-                    continue
-                for kw in n.keywords:
-                    if kw.arg != "key":
-                        continue
-                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
-                        found.append(kw.value.value)
-            return found
-
-        attach_keys: list[str] | None = None
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == "_render_maintenance_attach":
-                attach_keys = literal_keys(node)
-                break
-        assert attach_keys is not None, "_render_maintenance_attach missing from app.py"
+        attach = _fn_named(tree, "_render_maintenance_attach")
+        assert attach is not None, "_render_maintenance_attach missing from app.py"
+        attach_keys = [k for _, k in _literal_widget_keys(attach)]
         dupes = [k for k, n in Counter(attach_keys).items() if n > 1]
         assert not dupes, f"duplicate Streamlit keys in _render_maintenance_attach: {dupes}"
         assert attach_keys.count("upload_maintenance_table") == 1
 
-        # Page-level: only one page runs per Streamlit script run, so uniqueness
-        # is required within each page function (plus the shared sidebar).
+        shared: list[str] = []
         page_dupes: list[str] = []
         for node in tree.body:
+            if not hasattr(node, "name"):
+                continue
+            keys = [k for _, k in _literal_widget_keys(node)]
+            if node.name.startswith("page_"):
+                counts = Counter(keys)
+                for key, n in counts.items():
+                    if n > 1:
+                        page_dupes.append(f"{node.name}:{key}×{n}")
+            else:
+                shared.extend(keys)
+
+        shared_dupes = [k for k, n in Counter(shared).items() if n > 1]
+        assert not shared_dupes, "duplicate Streamlit keys in sidebar/helpers: " + ", ".join(shared_dupes)
+        assert not page_dupes, "duplicate Streamlit keys: " + ", ".join(page_dupes)
+
+        collisions: list[str] = []
+        for node in tree.body:
+            if not hasattr(node, "name") or not node.name.startswith("page_"):
+                continue
+            combo = shared + [k for _, k in _literal_widget_keys(node)]
+            for key, n in Counter(combo).items():
+                if n > 1:
+                    collisions.append(f"{node.name}:{key}×{n}")
+        assert not collisions, "page key collides with sidebar/helper: " + ", ".join(collisions)
+
+    def test_no_widget_key_writes_after_instantiate() -> None:
+        """Do not assign ``st.session_state.<key>`` after a widget with that key exists.
+
+        StreamlitAPIException: ``st.session_state.X cannot be modified after the
+        widget with key X is instantiated`` — even when writing the same value
+        (Load Plant sample / Load pack demo / Suggest pack on Render).
+
+        Heuristic (static, whole app.py):
+        - Collect every literal ``key="..."``.
+        - Flag ``st.session_state.<same> =`` / ``st.session_state["same"] =``.
+        Allowed:
+        1. Functions in ``PRE_WIDGET_SESSION_FUNCS`` (run at top of ``main()``
+           before sidebar widgets) — currently ``init_session_state`` and
+           ``apply_pending_industry_pack``.
+        2. Functions passed as ``on_click=`` (Streamlit runs those before widgets).
+        3. Same function as the widget, assignment line **before** the widget.
+        """
+        import ast
+
+        _, tree = _app_ast()
+        all_widget_keys = {k for _, k in _literal_widget_keys(tree)}
+        safe = _pre_widget_funcs(tree) | _on_click_callbacks(tree)
+        assert "apply_pending_industry_pack" in safe
+        assert "init_session_state" in safe
+
+        main_fn = _fn_named(tree, "main")
+        assert main_fn is not None
+        apply_line = None
+        sidebar_line = None
+        for n in ast.walk(main_fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id == "apply_pending_industry_pack":
+                    apply_line = n.lineno
+                elif n.func.id == "render_pack_sidebar":
+                    sidebar_line = n.lineno
+        assert apply_line is not None, "main() must call apply_pending_industry_pack()"
+        assert sidebar_line is not None, "main() must call render_pack_sidebar()"
+        assert apply_line < sidebar_line, "apply pending pack before the industry_pack selectbox"
+
+        violations: list[str] = []
+        for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
-            if not (node.name.startswith("page_") or node.name == "_render_maintenance_attach"):
-                continue
-            counts = Counter(literal_keys(node))
-            for key, n in counts.items():
-                if n > 1:
-                    page_dupes.append(f"{node.name}:{key}×{n}")
-        assert not page_dupes, "duplicate Streamlit keys: " + ", ".join(page_dupes)
+            first_widget_line: dict[str, int] = {}
+            for lineno, key in _literal_widget_keys(node):
+                first_widget_line[key] = min(lineno, first_widget_line.get(key, lineno))
+            for lineno, key in _session_state_writes(node):
+                if key not in all_widget_keys:
+                    continue
+                if node.name in safe:
+                    continue
+                if key in first_widget_line and lineno < first_widget_line[key]:
+                    continue
+                violations.append(
+                    f"{node.name}:{lineno} writes session_state.{key} after widget key={key!r}"
+                )
+        assert not violations, "widget-bound session_state writes: " + "; ".join(violations)
+
+    def test_load_pack_sample_queues_pending() -> None:
+        """load_pack_sample must not write industry_pack; it queues _pending_industry_pack."""
+        import ast
+
+        _, tree = _app_ast()
+        fn = _fn_named(tree, "load_pack_sample")
+        assert fn is not None
+        writes = {k for _, k in _session_state_writes(fn)}
+        assert "industry_pack" not in writes, "load_pack_sample must not assign industry_pack"
+        called = False
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "request_industry_pack":
+                called = True
+        assert called, "load_pack_sample must call request_industry_pack()"
+
+        req = _fn_named(tree, "request_industry_pack")
+        assert req is not None
+        assert "industry_pack" not in {k for _, k in _session_state_writes(req)}
+        uses_pending = any(
+            isinstance(n, ast.Name) and n.id == "PENDING_INDUSTRY_PACK" for n in ast.walk(req)
+        )
+        assert uses_pending, "request_industry_pack must set PENDING_INDUSTRY_PACK"
+
+        sidebar = _fn_named(tree, "render_pack_sidebar")
+        assert sidebar is not None
+        assert "industry_pack" not in {k for _, k in _session_state_writes(sidebar)}
+
+    def test_upload_load_buttons_apptest() -> None:
+        """Clicking Load Plant / Load pack demo / CSV upload must not raise StreamlitAPIException."""
+        from streamlit.testing.v1 import AppTest
+
+        from src.industry_packs import DEFAULT_PACK_ID, PACK_ORDER
+
+        def _errs(at) -> list[str]:
+            return [getattr(e, "message", str(e)) for e in at.exception]
+
+        app_path = str(ROOT / "app.py")
+        at = AppTest.from_file(app_path, default_timeout=45)
+        at.run()
+        assert not _errs(at), "initial render: " + "; ".join(_errs(at))
+        assert at.session_state["industry_pack"] == DEFAULT_PACK_ID
+
+        next(b for b in at.button if b.label == "Load Plant sample (default)").click().run()
+        assert not _errs(at), "Load Plant sample: " + "; ".join(_errs(at))
+        assert at.session_state["data_loaded"] is True
+        assert at.session_state["raw_df"] is not None
+        assert len(at.session_state["raw_df"]) > 10
+        assert at.session_state["industry_pack"] == DEFAULT_PACK_ID
+
+        demo_id = next(pid for pid in PACK_ORDER if pid != DEFAULT_PACK_ID)
+        at2 = AppTest.from_file(app_path, default_timeout=45)
+        at2.run()
+        next(b for b in at2.button if b.label == "Load pack demo").click().run()
+        assert not _errs(at2), "Load pack demo: " + "; ".join(_errs(at2))
+        assert at2.session_state["data_loaded"] is True
+        assert at2.session_state["industry_pack"] == demo_id
+
+        at3 = AppTest.from_file(app_path, default_timeout=45)
+        at3.run()
+        next(b for b in at3.button if b.label == "Suggest pack from columns").click().run()
+        assert not _errs(at3), "Suggest pack: " + "; ".join(_errs(at3))
+
+        csv_bytes = (ROOT / "sample_data" / "sensor_readings.csv").read_bytes()
+        at4 = AppTest.from_file(app_path, default_timeout=45)
+        at4.run()
+        uploader = next(u for u in at4.file_uploader if "sensor" in (u.label or "").lower())
+        uploader.set_value([("sensor_readings.csv", csv_bytes, "text/csv")]).run()
+        assert not _errs(at4), "CSV upload: " + "; ".join(_errs(at4))
+        assert at4.session_state["data_loaded"] is True
+        assert at4.session_state["raw_df"] is not None
 
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
@@ -706,6 +922,9 @@ def main() -> int:
     check("dashboard_composer", test_dashboard_composer)
     check("joins_step", test_joins_step)
     check("streamlit_widget_keys_unique", test_streamlit_widget_keys_unique)
+    check("no_widget_key_writes_after_instantiate", test_no_widget_key_writes_after_instantiate)
+    check("load_pack_sample_queues_pending", test_load_pack_sample_queues_pending)
+    check("upload_load_buttons_apptest", test_upload_load_buttons_apptest)
 
     if errors:
         print(f"\n{len(errors)} FAIL")

@@ -256,12 +256,43 @@ def register_table(name: str, df: pd.DataFrame):
     st.session_state.uploaded_tables = tables
 
 
+# Widget-bound. Never assign st.session_state.industry_pack after the sidebar
+# selectbox exists — Streamlit raises StreamlitAPIException even for the same value.
+PENDING_INDUSTRY_PACK = "_pending_industry_pack"
+
+# Functions that run at the top of main() BEFORE any widgets. The static smoke
+# check allows these to write widget-bound keys (industry_pack, etc.).
+PRE_WIDGET_SESSION_FUNCS = frozenset({"init_session_state", "apply_pending_industry_pack"})
+
+
 def active_pack_id() -> str:
     return str(st.session_state.get("industry_pack") or DEFAULT_PACK_ID)
 
 
 def active_pack() -> dict:
     return get_pack(active_pack_id())
+
+
+def request_industry_pack(pack_id: str) -> None:
+    """Queue a pack change. Applied at the start of the next run, before the sidebar widget."""
+    st.session_state[PENDING_INDUSTRY_PACK] = pack_id
+
+
+def apply_pending_industry_pack() -> None:
+    """Copy a queued pack into ``industry_pack`` BEFORE the sidebar selectbox is created.
+
+    Load-sample / suggest-pack must not write ``st.session_state.industry_pack`` after
+    ``st.sidebar.selectbox(..., key="industry_pack")`` exists in the same script run.
+    They set ``_pending_industry_pack`` and ``st.rerun()``; this runs at the top of
+    ``main()`` so the widget is born with the new value.
+    """
+    pending = st.session_state.pop(PENDING_INDUSTRY_PACK, None)
+    if pending:
+        st.session_state.industry_pack = pending
+    packs = {p["id"] for p in list_packs()}
+    current = st.session_state.get("industry_pack") or DEFAULT_PACK_ID
+    if current not in packs:
+        st.session_state.industry_pack = DEFAULT_PACK_ID
 
 
 def render_pack_sidebar() -> None:
@@ -271,7 +302,6 @@ def render_pack_sidebar() -> None:
     current = active_pack_id()
     if current not in ids:
         current = DEFAULT_PACK_ID
-        st.session_state.industry_pack = current
     labels = {p["id"]: (p["short"] + ("  ★ SIH" if p.get("hero") else "") + ("  (default)" if p["default"] else "")) for p in packs}
     picked = st.sidebar.selectbox(
         "Field",
@@ -291,7 +321,7 @@ def render_pack_sidebar() -> None:
         mids = df["machine_id"].astype(str).unique().tolist() if df is not None and "machine_id" in df.columns else []
         suggestion = suggest_pack(cols, machine_ids=mids)
         st.session_state.pack_suggest = suggestion
-        st.session_state.industry_pack = suggestion["pack_id"]
+        request_industry_pack(suggestion["pack_id"])
         st.rerun()
     sug = st.session_state.get("pack_suggest")
     if sug:
@@ -315,7 +345,7 @@ def load_pack_sample(pack_id: str):
     df = pd.read_csv(path, parse_dates=["timestamp"])
     st.session_state.raw_df = df
     st.session_state.data_loaded = True
-    st.session_state.industry_pack = pack_id
+    request_industry_pack(pack_id)
     st.session_state.cleaned_df = None
     st.session_state.predictions = []
     st.session_state.pack_kpis = {}
@@ -585,9 +615,10 @@ def page_upload_clean():
                 "Upload sensor / ops CSVs (multi-select OK)",
                 type=["csv", "tsv", "xlsx", "json"],
                 accept_multiple_files=True,
+                key="upload_sensor_files",
             )
         with col2:
-            if st.button("Load Plant sample (default)", use_container_width=True):
+            if st.button("Load Plant sample (default)", use_container_width=True, key="upload_load_plant_sample"):
                 load_pack_sample(DEFAULT_PACK_ID)
                 st.success("Plant sample sensors (+ maintenance/costs if present) loaded.")
                 st.rerun()
@@ -597,7 +628,7 @@ def page_upload_clean():
                 format_func=lambda pid: pack_label(pid),
                 key="upload_demo_pack",
             )
-            if st.button("Load pack demo", use_container_width=True):
+            if st.button("Load pack demo", use_container_width=True, key="upload_load_pack_demo"):
                 load_pack_sample(demo_pack)
                 st.success(f"Loaded {pack_label(demo_pack)} demo and switched the industry pack.")
                 st.rerun()
@@ -1926,6 +1957,7 @@ def page_email_report():
 
 def main():
     init_session_state()
+    apply_pending_industry_pack()
     st.sidebar.markdown(f"## {config.APP_TITLE}")
     st.sidebar.caption(config.TAGLINE)
     st.sidebar.markdown("---")
