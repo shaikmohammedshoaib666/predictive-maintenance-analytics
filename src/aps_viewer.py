@@ -16,12 +16,14 @@ Model Derivative SVF2 job so the user gets a URN without leaving the SaaS.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import math
 import os
 import re
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -102,6 +104,24 @@ WARN_CAD_BYTES = 80 * 1024 * 1024
 CAD_SIZE_ZIP_FALLBACK = (
     "zip the STEP (often drops under 200 MB) and upload the zip; "
     "or export a lighter STEP from Fusion."
+)
+
+# Autodesk requires input.rootFilename when input.compressedUrn is true.
+ZIP_CAD_ROOT_EXTENSIONS: tuple[str, ...] = (
+    ".step",
+    ".stp",
+    ".stpz",
+    ".rvt",
+    ".ifc",
+    ".ipt",
+    ".f3d",
+    ".nwd",
+    ".dwg",
+    ".iam",
+)
+ZIP_CAD_ROOT_HINTS: tuple[str, ...] = ("step", "stp", "rotax", "engine")
+ZIP_ROOT_MISSING_MSG = (
+    "Open the zip and type the .STEP filename into ZIP root filename."
 )
 
 # OSS signed-upload: at most 25 URLs per GET.
@@ -656,6 +676,86 @@ def resolve_cad_urn(
     }
 
 
+def is_cad_zip_name(filename: str) -> bool:
+    """True for Autodesk zip / ifczip uploads that need compressedUrn + rootFilename."""
+    name = (filename or "").lower()
+    return name.endswith(".zip") or name.endswith(".ifczip")
+
+
+def _zip_member_norm(name: str) -> str:
+    return (name or "").replace("\\", "/").lstrip("./")
+
+
+def _zip_member_basename(name: str) -> str:
+    return _zip_member_norm(name).rstrip("/").rsplit("/", 1)[-1]
+
+
+def _is_ignored_zip_member(name: str) -> bool:
+    norm = _zip_member_norm(name)
+    base = _zip_member_basename(norm)
+    lower = norm.lower()
+    if not base or norm.endswith("/"):
+        return True
+    if lower.startswith("__macosx/") or base.startswith("._"):
+        return True
+    if base.lower() in {".ds_store", "thumbs.db"}:
+        return True
+    return False
+
+
+def _zip_member_is_cad(name: str) -> bool:
+    if _is_ignored_zip_member(name):
+        return False
+    lower = _zip_member_norm(name).lower()
+    return any(lower.endswith(ext) for ext in ZIP_CAD_ROOT_EXTENSIONS)
+
+
+def _zip_name_has_hint(name: str) -> bool:
+    lower = _zip_member_norm(name).lower()
+    base = _zip_member_basename(lower)
+    return any(hint in base for hint in ZIP_CAD_ROOT_HINTS)
+
+
+def pick_zip_cad_root(data: bytes) -> str:
+    """Pick Autodesk ``rootFilename`` from zip/ifczip bytes. Empty if none.
+
+    Prefers ``ZIP_CAD_ROOT_EXTENSIONS``. One match → that member. Many matches →
+    names containing step/stp/rotax/engine, else the largest member.
+    """
+    if not data:
+        return ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            candidates: list[tuple[str, int]] = []
+            for info in zf.infolist():
+                raw = _zip_member_norm(info.filename)
+                if info.is_dir() or not _zip_member_is_cad(raw):
+                    continue
+                candidates.append((raw, int(info.file_size or 0)))
+    except zipfile.BadZipFile:
+        return ""
+    except Exception:
+        return ""
+    if not candidates:
+        return ""
+    if len(candidates) == 1:
+        return candidates[0][0]
+    hinted = [c for c in candidates if _zip_name_has_hint(c[0])]
+    pool = hinted or candidates
+    pool.sort(key=lambda c: (c[1], len(c[0])), reverse=True)
+    return pool[0][0]
+
+
+def resolve_zip_root_filename(filename: str, data: bytes, root_filename: str = "") -> str:
+    """Use an explicit root, else inspect the zip. Empty means Autodesk would 400."""
+    given = (root_filename or "").strip()
+    if given:
+        return given
+    if not is_cad_zip_name(filename):
+        return ""
+    return pick_zip_cad_root(data)
+
+
 def cad_size_issue(n_bytes: int) -> tuple[Optional[str], str]:
     """Return (\"error\"|\"warn\"|None, message) for Streamlit/Render size limits."""
     n = int(n_bytes or 0)
@@ -957,10 +1057,12 @@ def start_svf_job(
     """Kick Model Derivative SVF2 (falls back to SVF if SVF2 is rejected)."""
     requests = http or _http()
     input_spec: dict[str, Any] = {"urn": model_urn}
-    if compressed or root_filename:
+    root = (root_filename or "").strip()
+    if compressed or root:
+        if not root:
+            raise ValueError(ZIP_ROOT_MISSING_MSG)
         input_spec["compressedUrn"] = True
-        if root_filename:
-            input_spec["rootFilename"] = root_filename
+        input_spec["rootFilename"] = root
     headers = {
         **_auth_headers(token),
         "Content-Type": "application/json; charset=utf-8",
@@ -1058,6 +1160,17 @@ def translate_cad_bytes(
             "object_key": "",
         }
 
+    root = resolve_zip_root_filename(filename, data, root_filename)
+    if is_cad_zip_name(filename) and not root:
+        return {
+            "ok": False,
+            "phase": "error",
+            "urn": "",
+            "message": ZIP_ROOT_MISSING_MSG,
+            "bucket": "",
+            "object_key": "",
+        }
+
     def _note(phase: str, detail: str) -> None:
         if on_status:
             on_status(phase, detail)
@@ -1065,7 +1178,7 @@ def translate_cad_bytes(
     cid = _aps_setting("APS_CLIENT_ID")
     bucket = oss_bucket_key(cid)
     object_key = sanitize_object_name(filename)
-    compressed = bool(root_filename) or (filename or "").lower().endswith(".zip")
+    compressed = bool(root) or is_cad_zip_name(filename)
     try:
         _note("auth", "Requesting APS token (translate scopes)…")
         token_payload = get_access_token(TRANSLATE_SCOPES, http=http)
@@ -1083,7 +1196,7 @@ def translate_cad_bytes(
             token,
             urn,
             compressed=compressed,
-            root_filename=(root_filename or "").strip(),
+            root_filename=root,
             http=http,
         )
         manifest = poll_manifest(

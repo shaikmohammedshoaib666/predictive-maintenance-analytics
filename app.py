@@ -93,15 +93,19 @@ from src.aps_viewer import (
     MAX_CAD_UPLOAD_MB,
     PUBLIC_VIEWER_NO_URN_WARNING,
     PUBLIC_VIEWER_WARNING,
+    ZIP_ROOT_MISSING_MSG,
     aps_available,
     aps_model_urn,
     build_viewer_html,
     cad_size_issue,
     extract_model_urn,
     get_access_token,
+    is_cad_zip_name,
     looks_like_public_viewer,
     normalize_model_urn,
+    pick_zip_cad_root,
     resolve_cad_urn,
+    resolve_zip_root_filename,
     delete_urn_for_pack,
     save_urn_for_pack,
     saved_urn_caption,
@@ -1626,14 +1630,31 @@ def page_cad_twin():
         st.caption(
             f"Upload limit is **{MAX_CAD_UPLOAD_MB} MB**. A 207 MB STEP should fit. "
             f"If the browser or Render still rejects it, {CAD_SIZE_ZIP_FALLBACK} "
-            "For a zipped STEP, enter the `.step` / `.stp` filename as ZIP root."
+            "Zipped STEP: ZIP root auto-fills from the `.step` / `.stp` inside the archive."
         )
         root_filename = ""
-        if cad_file is not None and str(cad_file.name or "").lower().endswith(".zip"):
+        cad_name = str(cad_file.name or "") if cad_file is not None else ""
+        if cad_file is not None and is_cad_zip_name(cad_name):
+            zip_bytes = cad_file.getvalue()
+            auto_root = pick_zip_cad_root(zip_bytes)
+            zip_sig = f"{cad_name}:{len(zip_bytes)}"
+            # Prefill BEFORE the widget exists — Streamlit forbids writing the key after.
+            if st.session_state.get("aps_zip_root_sig") != zip_sig:
+                st.session_state.aps_zip_root_sig = zip_sig
+                st.session_state.aps_zip_root_filename = auto_root
+            elif auto_root and not str(st.session_state.get("aps_zip_root_filename") or "").strip():
+                st.session_state.aps_zip_root_filename = auto_root
+            if auto_root:
+                st.caption(f"Detected ZIP root: `{auto_root}`")
+            else:
+                st.warning(ZIP_ROOT_MISSING_MSG)
             root_filename = st.text_input(
                 "ZIP root filename (required for assemblies / zipped STEP)",
                 key="aps_zip_root_filename",
-                help="Example: Rotax.step or assembly.iam — the file inside the zip Model Derivative should open.",
+                help=(
+                    "Example: Rotax.step or assembly.iam — the file inside the zip "
+                    "Model Derivative should open. Auto-filled when a CAD member is found."
+                ),
             )
         if cad_file is not None:
             kind, size_msg = cad_size_issue(getattr(cad_file, "size", 0) or 0)
@@ -1647,6 +1668,8 @@ def page_cad_twin():
             else:
                 payload = cad_file.getvalue()
                 kind, size_msg = cad_size_issue(len(payload))
+                cad_name = cad_file.name or "model"
+                root = resolve_zip_root_filename(cad_name, payload, root_filename)
                 if kind == "error":
                     st.error(size_msg)
                     st.session_state.aps_translate_log = {
@@ -1655,15 +1678,23 @@ def page_cad_twin():
                         "urn": "",
                         "message": size_msg,
                     }
+                elif is_cad_zip_name(cad_name) and not root:
+                    st.error(ZIP_ROOT_MISSING_MSG)
+                    st.session_state.aps_translate_log = {
+                        "ok": False,
+                        "phase": "error",
+                        "urn": "",
+                        "message": ZIP_ROOT_MISSING_MSG,
+                    }
                 else:
                     with st.status("Translating CAD with Autodesk…", expanded=True) as box:
                         def _on_status(phase: str, detail: str) -> None:
                             st.write(f"**{phase}:** {detail}")
 
                         result = translate_cad_bytes(
-                            cad_file.name or "model",
+                            cad_name,
                             payload,
-                            root_filename=root_filename,
+                            root_filename=root,
                             on_status=_on_status,
                         )
                         st.session_state.aps_translate_log = result

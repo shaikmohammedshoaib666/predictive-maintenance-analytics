@@ -686,6 +686,176 @@ def main() -> int:
             else:
                 os.environ["APS_CLIENT_SECRET"] = prev_sec
 
+    def test_aps_zip_root_filename() -> None:
+        """Zip CAD root: one .step extracts; empty zip fails clearly; never send empty root."""
+        import io
+        import json as _json
+        import zipfile
+
+        from src.aps_viewer import (
+            ZIP_ROOT_MISSING_MSG,
+            is_cad_zip_name,
+            pick_zip_cad_root,
+            resolve_zip_root_filename,
+            start_svf_job,
+            translate_cad_bytes,
+        )
+
+        def _zip_bytes(members: dict) -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                for name, body in members.items():
+                    zf.writestr(name, body)
+            return buf.getvalue()
+
+        assert is_cad_zip_name("model.ZIP")
+        assert is_cad_zip_name("pack.ifczip")
+        assert not is_cad_zip_name("Rotax.step")
+
+        one = _zip_bytes({"Rotax.step": b"ISO-10303-21;"})
+        assert pick_zip_cad_root(one) == "Rotax.step"
+        assert resolve_zip_root_filename("rotax.zip", one, "") == "Rotax.step"
+        assert resolve_zip_root_filename("rotax.zip", one, "  override.stp  ") == "override.stp"
+
+        empty = _zip_bytes({})
+        assert pick_zip_cad_root(empty) == ""
+        assert resolve_zip_root_filename("empty.zip", empty, "") == ""
+
+        no_cad = _zip_bytes({"readme.txt": b"hello", "photos/a.png": b"x"})
+        assert pick_zip_cad_root(no_cad) == ""
+
+        mixed = _zip_bytes(
+            {
+                "notes.txt": b"x" * 4000,
+                "folder/engine.step": b"ISO",
+                "other.ipt": b"y" * 8000,
+            }
+        )
+        assert pick_zip_cad_root(mixed) == "folder/engine.step"
+
+        largest = _zip_bytes({"small.iam": b"a", "big.iam": b"b" * 200})
+        assert pick_zip_cad_root(largest) == "big.iam"
+
+        upper = _zip_bytes({"ROTAX.STEP": b"ISO-10303-21;"})
+        assert pick_zip_cad_root(upper) == "ROTAX.STEP"
+
+        app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+        assert "pick_zip_cad_root" in app_src
+        assert "ZIP_ROOT_MISSING_MSG" in app_src
+        assert "resolve_zip_root_filename" in app_src
+        assert "Detected ZIP root" in app_src
+
+        try:
+            start_svf_job("tok", "dXJuOmFi", compressed=True, root_filename="")
+            raise AssertionError("start_svf_job must reject compressedUrn without rootFilename")
+        except ValueError as exc:
+            assert str(exc) == ZIP_ROOT_MISSING_MSG
+
+        class NoHttp:
+            def post(self, url, **kw):
+                raise AssertionError("empty zip must not call Autodesk: " + url)
+
+            def get(self, url, **kw):
+                raise AssertionError("empty zip must not call Autodesk: " + url)
+
+            def put(self, url, **kw):
+                raise AssertionError("empty zip must not call Autodesk: " + url)
+
+        blocked = translate_cad_bytes("model.zip", empty, http=NoHttp(), sleep=lambda _s: None)
+        assert blocked["ok"] is False
+        assert blocked["phase"] == "error"
+        assert blocked["message"] == ZIP_ROOT_MISSING_MSG
+        assert blocked["urn"] == ""
+
+        nocad = translate_cad_bytes("pack.ifczip", no_cad, http=NoHttp(), sleep=lambda _s: None)
+        assert nocad["ok"] is False and nocad["message"] == ZIP_ROOT_MISSING_MSG
+
+        class _Resp:
+            def __init__(self, status_code, json_data=None, text=""):
+                self.status_code = status_code
+                self._json = json_data
+                self.text = text if text else (_json.dumps(json_data) if json_data is not None else "")
+                self.content = self.text.encode() if self.text else b""
+
+            def json(self):
+                if self._json is None:
+                    raise ValueError("no json")
+                return self._json
+
+        class FakeZipAPS:
+            def __init__(self):
+                self.calls: list = []
+                self.job_input: dict = {}
+
+            def post(self, url, **kw):
+                self.calls.append(("POST", url, kw))
+                if "authentication" in url:
+                    return _Resp(200, {"access_token": "tok", "expires_in": 3600})
+                if url.rstrip("/").endswith("/oss/v2/buckets"):
+                    return _Resp(200, {"bucketKey": (kw.get("json") or {}).get("bucketKey")})
+                if url.endswith("/signeds3upload"):
+                    return _Resp(
+                        200,
+                        {
+                            "objectId": "urn:adsk.objects:os.object:pdm-testclientid9-cad/obj.zip",
+                            "objectKey": "obj.zip",
+                        },
+                    )
+                if url.endswith("/job"):
+                    body = kw.get("json") or {}
+                    self.job_input = dict(body.get("input") or {})
+                    assert self.job_input.get("compressedUrn") is True
+                    assert self.job_input.get("rootFilename") == "Rotax.step"
+                    return _Resp(201, {"result": "success", "urn": self.job_input.get("urn")})
+                return _Resp(500, {"developerMessage": "unexpected POST " + url})
+
+            def get(self, url, **kw):
+                self.calls.append(("GET", url, kw))
+                if url.endswith("/details"):
+                    return _Resp(404, {"developerMessage": "not found"})
+                if "signeds3upload" in url:
+                    return _Resp(200, {"uploadKey": "uk", "urls": ["https://s3.example.test/p1"]})
+                if "/manifest" in url:
+                    return _Resp(200, {"status": "success", "progress": "complete"})
+                return _Resp(500, {"developerMessage": "unexpected GET " + url})
+
+            def put(self, url, **kw):
+                self.calls.append(("PUT", url, kw))
+                assert url.startswith("https://s3.example.test/")
+                assert kw.get("data") == one
+                return _Resp(200, text="")
+
+        prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
+        os.environ["APS_CLIENT_ID"] = "TestClientID99"
+        os.environ["APS_CLIENT_SECRET"] = "not-a-real-secret"
+        try:
+            http = FakeZipAPS()
+            result = translate_cad_bytes(
+                "rotax.zip",
+                one,
+                root_filename="",
+                http=http,
+                sleep=lambda _s: None,
+                poll_timeout_s=20,
+                poll_interval_s=0.01,
+            )
+            assert result["ok"] is True, result
+            assert http.job_input.get("rootFilename") == "Rotax.step"
+            assert http.job_input.get("compressedUrn") is True
+            assert not any(
+                c[0] == "POST" and c[1].endswith("/job") and not (c[2].get("json") or {}).get("input", {}).get("rootFilename")
+                for c in http.calls
+            )
+        finally:
+            if prev_id is None:
+                os.environ.pop("APS_CLIENT_ID", None)
+            else:
+                os.environ["APS_CLIENT_ID"] = prev_id
+            if prev_sec is None:
+                os.environ.pop("APS_CLIENT_SECRET", None)
+            else:
+                os.environ["APS_CLIENT_SECRET"] = prev_sec
+
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
         det = AnomalyDetector()
@@ -1362,6 +1532,7 @@ def main() -> int:
     check("polars_engine", test_polars_engine)
     check("aps_viewer", test_aps_viewer)
     check("aps_translate_mocked", test_aps_translate_mocked)
+    check("aps_zip_root_filename", test_aps_zip_root_filename)
     check("charts_layout", test_charts)
     check("industry_packs", test_industry_packs)
     check("pack_kpis_every_function", test_pack_kpis_every_function)
