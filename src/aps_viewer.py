@@ -412,7 +412,20 @@ def save_urn_for_pack(
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source": source,
     }
-    payload = {"version": 1, "packs": packs}
+    _atomic_write_urns(p, {"version": 1, "packs": packs})
+    return {
+        "ok": True,
+        "saved": True,
+        "reason": "ok",
+        "urn": normalized,
+        "pack_id": pid,
+        "path": str(p),
+        "message": saved_urn_caption(pid),
+    }
+
+
+def _atomic_write_urns(p: Path, payload: dict[str, Any]) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix="cad_urns.", suffix=".json", dir=str(p.parent))
     try:
@@ -425,19 +438,9 @@ def save_urn_for_pack(
         except OSError:
             pass
         raise
-    return {
-        "ok": True,
-        "saved": True,
-        "reason": "ok",
-        "urn": normalized,
-        "pack_id": pid,
-        "path": str(p),
-        "message": saved_urn_caption(pid),
-    }
 
 
-def saved_urn_caption(pack_id: str) -> str:
-    """Honest: we wrote a file on this server. We did not write Render env."""
+def _pack_short(pack_id: str) -> str:
     short = pack_id or "this pack"
     try:
         from src.industry_packs import get_pack
@@ -445,8 +448,49 @@ def saved_urn_caption(pack_id: str) -> str:
         short = str(get_pack(pack_id).get("short") or short)
     except Exception:
         pass
+    return short
+
+
+def delete_urn_for_pack(pack_id: str, *, path: Optional[Path] = None) -> dict[str, Any]:
+    """Remove this pack's URN from the server JSON. Other packs are left alone."""
+    pid = (pack_id or "").strip()
+    short = _pack_short(pid)
+    if not pid:
+        return {
+            "ok": False,
+            "deleted": False,
+            "had_urn": False,
+            "reason": "no_pack",
+            "pack_id": pid,
+            "message": "No industry pack selected.",
+        }
+    p = Path(path) if path is not None else cad_urns_path()
+    had = bool(saved_urn_for_pack(pid, path=p))
+    doc = load_saved_urns(path=p)
+    packs = dict(doc.get("packs") or {})
+    if pid in packs:
+        packs.pop(pid, None)
+        if p.exists() or had:
+            _atomic_write_urns(p, {"version": 1, "packs": packs})
+    return {
+        "ok": True,
+        "deleted": True,
+        "had_urn": had,
+        "reason": "ok" if had else "already_empty",
+        "pack_id": pid,
+        "path": str(p),
+        "message": (
+            f"Deleted saved URN for {short} on this server."
+            if had
+            else f"No saved URN for {short} on this server."
+        ),
+    }
+
+
+def saved_urn_caption(pack_id: str) -> str:
+    """Honest: we wrote a file on this server. We did not write Render env."""
     return (
-        f"Saved for {short} on this server. "
+        f"Saved for {_pack_short(pack_id)} on this server. "
         "To keep it across Render redeploys, also set APS_MODEL_URN."
     )
 

@@ -355,6 +355,7 @@ def main() -> int:
             save_urn_for_pack,
             saved_urn_caption,
             saved_urn_for_pack,
+            delete_urn_for_pack,
             sanitize_object_name,
         )
 
@@ -455,6 +456,20 @@ def main() -> int:
                     os.environ.pop("APS_MODEL_URN", None)
                 else:
                     os.environ["APS_MODEL_URN"] = prev_env
+            plant = save_urn_for_pack(
+                "plant_rotating", "dXJuOmFkc2sucGxhbnR0ZXN0", source="save", path=store
+            )
+            assert plant["saved"] is True
+            gone = delete_urn_for_pack(av, path=store)
+            assert gone["ok"] is True and gone["deleted"] is True and gone["had_urn"] is True
+            assert saved_urn_for_pack(av, path=store) == ""
+            assert saved_urn_for_pack("plant_rotating", path=store) == "dXJuOmFkc2sucGxhbnR0ZXN0"
+            assert "Aviation" in gone["message"] and "Deleted" in gone["message"]
+            again = delete_urn_for_pack(av, path=store)
+            assert again["ok"] is True and again["had_urn"] is False
+            assert saved_urn_for_pack("plant_rotating", path=store) == "dXJuOmFkc2sucGxhbnR0ZXN0"
+            empty = resolve_cad_urn(av, "", path=store)
+            assert empty["urn"] == "" and empty["source"] == "none"
 
         example = ROOT / "data" / "cad_urns.example.json"
         assert example.is_file()
@@ -1201,9 +1216,23 @@ def main() -> int:
                 u.label for u in at_cad.file_uploader
             ]
             assert any(b.label == "Translate to SVF / get URN" for b in at_cad.button)
+            assert any(b.label == "Save URN for this pack" for b in at_cad.button)
+            assert any(b.label == "Delete saved URN" for b in at_cad.button)
             assert any("URN" in (t.label or "") for t in at_cad.text_input)
             next(b for b in at_cad.button if b.label == "Translate to SVF / get URN").click().run()
             assert not _errs(at_cad), "Translate with no file: " + "; ".join(_errs(at_cad))
+            next(b for b in at_cad.button if b.label == "Save URN for this pack").click().run()
+            assert not _errs(at_cad), "Save with empty URN: " + "; ".join(_errs(at_cad))
+            next(b for b in at_cad.button if b.label == "Delete saved URN").click().run()
+            assert not _errs(at_cad), "Delete saved URN: " + "; ".join(_errs(at_cad))
+            from src.aps_viewer import saved_urn_for_pack as _saved_pack
+
+            pid = "plant_rotating"
+            try:
+                pid = str(at_cad.session_state["industry_pack"])
+            except Exception:
+                pass
+            assert _saved_pack(pid) == ""
         finally:
             _urns_dir.cleanup()
             if prev_urns is None:

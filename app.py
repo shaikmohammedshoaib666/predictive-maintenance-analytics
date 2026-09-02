@@ -99,8 +99,10 @@ from src.aps_viewer import (
     looks_like_public_viewer,
     normalize_model_urn,
     resolve_cad_urn,
+    delete_urn_for_pack,
     save_urn_for_pack,
     saved_urn_caption,
+    saved_urn_for_pack,
     translate_cad_bytes,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
@@ -1507,10 +1509,12 @@ def _seed_cad_urn_widgets(pack_id: str) -> dict:
         st.session_state.aps_urn_extract_meta = meta
         if extracted and extracted != raw.strip():
             st.session_state.aps_urn_input = extracted
-        if meta.get("public_viewer"):
+        if meta.get("public_viewer") and extracted:
             st.session_state.aps_urn_from_public_viewer = True
-        elif extracted:
+            st.session_state.aps_public_viewer_urn = extracted
+        elif extracted and extracted != st.session_state.get("aps_public_viewer_urn"):
             st.session_state.aps_urn_from_public_viewer = False
+            st.session_state.aps_public_viewer_urn = ""
     return resolved
 
 
@@ -1520,6 +1524,16 @@ def _persist_pack_urn(pack_id: str, urn: str, *, source: str, public_viewer: boo
     if result.get("saved"):
         st.session_state.aps_urn_origin = source
         st.session_state.aps_urn_from_public_viewer = False
+        st.session_state.aps_public_viewer_urn = ""
+    return result
+
+
+def _delete_pack_urn(pack_id: str) -> dict:
+    result = delete_urn_for_pack(pack_id)
+    st.session_state.aps_delete_log = result
+    if result.get("ok"):
+        st.session_state.aps_save_log = {}
+        st.session_state.aps_urn_origin = "session"
     return result
 
 
@@ -1551,7 +1565,7 @@ def page_cad_twin():
     )
 
     ok, msg = aps_available()
-    resolved = _seed_cad_urn_widgets(pack_id)
+    _seed_cad_urn_widgets(pack_id)
     status = cad_slot_status(st.session_state.get("aps_urn") or "", pack_id=pack_id)
     env_urn = normalize_model_urn(aps_model_urn())
 
@@ -1580,8 +1594,9 @@ def page_cad_twin():
             "Do not rely on saving a public-viewer URN.\n"
             "5. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
             "`bucket:read` in addition to `viewables:read`.\n"
-            "6. Close the tab and come back — CAD Twin auto-loads the saved pack URN while this "
-            "service is up. After a Render **redeploy** the disk is wiped; set `APS_MODEL_URN` too."
+            "6. **Save URN for this pack** / **Delete saved URN** write or clear `data/cad_urns.json` "
+            "for this industry pack. Close the tab and come back — CAD Twin auto-loads the saved URN "
+            "while this service is up. After a Render **redeploy** the disk is wiped; set `APS_MODEL_URN` too."
         )
         st.caption(INSUFFICIENT_SCOPE_HINT)
         st.markdown(
@@ -1692,7 +1707,15 @@ def page_cad_twin():
         extracted, meta = extract_model_urn(urn_raw)
         urn = extracted or normalize_model_urn(urn_raw)
         st.session_state.aps_urn = urn
-        public_paste = bool(meta.get("public_viewer") or looks_like_public_viewer(urn_raw))
+        public_paste = bool(
+            meta.get("public_viewer")
+            or looks_like_public_viewer(urn_raw)
+            or (
+                st.session_state.get("aps_urn_from_public_viewer")
+                and urn
+                and urn == st.session_state.get("aps_public_viewer_urn")
+            )
+        )
     with c2:
         selected = st.selectbox("Asset", ids, key="aps_asset_pick")
     sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
@@ -1702,14 +1725,44 @@ def page_cad_twin():
         if not urn:
             st.caption(PUBLIC_VIEWER_NO_URN_WARNING)
 
-    seed_urn = env_urn or (resolved.get("saved_urn") or "")
+    save_col, delete_col = st.columns(2)
+    with save_col:
+        save_clicked = st.button("Save URN for this pack", key="aps_save_urn_btn")
+    with delete_col:
+        delete_clicked = st.button("Delete saved URN", key="aps_delete_urn_btn")
+
+    if save_clicked:
+        if public_paste:
+            persist = _persist_pack_urn(pack_id, urn, source="save", public_viewer=True)
+            st.warning(persist.get("message") or PUBLIC_VIEWER_WARNING)
+        elif not urn:
+            st.warning("Nothing to save — paste a dXJu URN from your bucket or translate a CAD file first.")
+        else:
+            persist = _persist_pack_urn(pack_id, urn, source="save", public_viewer=False)
+            if persist.get("saved"):
+                st.info(persist.get("message") or saved_urn_caption(pack_id))
+            else:
+                st.warning(persist.get("message") or "Could not save URN.")
+    if delete_clicked:
+        gone = _delete_pack_urn(pack_id)
+        if gone.get("had_urn"):
+            st.success(gone.get("message") or "Deleted saved URN on this server.")
+        else:
+            st.info(gone.get("message") or "No saved URN for this pack on this server.")
+
+    seed_urn = env_urn or saved_urn_for_pack(pack_id)
     if env_urn:
         st.caption(
             "Render `APS_MODEL_URN` is set and overrides the pack JSON as the default URN. "
             "We do not write Render env from this app."
         )
-    elif resolved.get("saved_urn"):
+    elif seed_urn:
         st.caption(saved_urn_caption(pack_id))
+    else:
+        st.caption(
+            f"No saved URN for {pack['short']} on this server yet. "
+            "Translate a CAD file or click **Save URN for this pack**."
+        )
 
     st.caption(
         "Viewer is **GuiViewer3D** (not headless Viewer3D): Home, Fit, Pan, Zoom, Orbit, "
@@ -1736,7 +1789,7 @@ def page_cad_twin():
     translated = str((st.session_state.get("aps_translate_log") or {}).get("urn") or "")
     translate_ok = bool((st.session_state.get("aps_translate_log") or {}).get("ok"))
     force = bool(st.session_state.get("aps_force_load"))
-    should_auto = (not public_paste) and bool(urn) and (
+    should_auto = (not public_paste) and bool(urn) and not save_clicked and not delete_clicked and (
         urn == seed_urn
         or force
         or (translate_ok and urn == normalize_model_urn(translated))
