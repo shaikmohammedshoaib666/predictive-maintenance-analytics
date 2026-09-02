@@ -279,9 +279,12 @@ def register_table(name: str, df: pd.DataFrame):
 # selectbox exists — Streamlit raises StreamlitAPIException even for the same value.
 PENDING_INDUSTRY_PACK = "_pending_industry_pack"
 
-# Functions that run at the top of main() BEFORE any widgets. The static smoke
-# check allows these to write widget-bound keys (industry_pack, etc.).
-PRE_WIDGET_SESSION_FUNCS = frozenset({"init_session_state", "apply_pending_industry_pack"})
+# Functions allowed to write widget-bound keys because they run before those widgets.
+# init_session_state / apply_pending_industry_pack: top of main() before the sidebar.
+# _seed_cad_urn_widgets: top of page_cad_twin before key="aps_urn_input".
+PRE_WIDGET_SESSION_FUNCS = frozenset(
+    {"init_session_state", "apply_pending_industry_pack", "_seed_cad_urn_widgets"}
+)
 
 
 def active_pack_id() -> str:

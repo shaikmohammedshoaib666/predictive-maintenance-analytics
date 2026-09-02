@@ -1072,8 +1072,8 @@ def main() -> int:
         - Flag ``st.session_state.<same> =`` / ``st.session_state["same"] =``.
         Allowed:
         1. Functions in ``PRE_WIDGET_SESSION_FUNCS`` (run at top of ``main()``
-           before sidebar widgets) — currently ``init_session_state`` and
-           ``apply_pending_industry_pack``.
+           before sidebar widgets) — ``init_session_state``, ``apply_pending_industry_pack``,
+           and ``_seed_cad_urn_widgets`` (CAD Twin URN field, before that page's text_input).
         2. Functions passed as ``on_click=`` (Streamlit runs those before widgets).
         3. Same function as the widget, assignment line **before** the widget.
         """
@@ -1084,6 +1084,7 @@ def main() -> int:
         safe = _pre_widget_funcs(tree) | _on_click_callbacks(tree)
         assert "apply_pending_industry_pack" in safe
         assert "init_session_state" in safe
+        assert "_seed_cad_urn_widgets" in safe
 
         main_fn = _fn_named(tree, "main")
         assert main_fn is not None
