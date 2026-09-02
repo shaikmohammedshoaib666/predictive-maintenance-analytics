@@ -180,22 +180,57 @@ def encode_oss_urn(bucket_key: str, object_key: str) -> str:
     return encode_model_urn(oss_object_id(bucket_key, object_key))
 
 
+def strip_urn_query_fragment(raw: str) -> str:
+    """Drop ``?query`` and ``#fragment`` so ``sheetId`` never stays on a URN."""
+    text = (raw or "").strip()
+    for sep in ("?", "#"):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+    return text.strip()
+
+
 def normalize_model_urn(raw: str) -> str:
     """Accept paste of base64, ``urn:``+base64, or a raw ``urn:adsk.objects:...`` id."""
-    u = (raw or "").strip()
+    u = strip_urn_query_fragment(raw or "")
     if not u:
         return ""
     if u.lower().startswith("urn:adsk."):
         return encode_model_urn(u)
     if u.lower().startswith("urn:"):
         u = u[4:]
-    return u.strip()
+    return strip_urn_query_fragment(u)
 
 
-# Autodesk encoded URNs are URL-safe base64 of ``urn:...`` and therefore start with dXJu.
-_DXJU_RE = re.compile(r"(dXJu[A-Za-z0-9_-]+)")
-_ADSK_OBJECT_RE = re.compile(r"(urn:adsk\.[^\s\"'<>]+)", re.I)
+def decode_model_urn(raw: str) -> str:
+    """Decode a ``dXJu…`` (or ``urn:adsk.…``) value to the OSS object id. Empty on failure."""
+    text = strip_urn_query_fragment(raw or "")
+    if not text:
+        return ""
+    if text.lower().startswith("urn:adsk."):
+        return text
+    encoded = text[4:] if text.lower().startswith("urn:") else text
+    encoded = strip_urn_query_fragment(encoded).strip()
+    if not encoded.startswith("dXJu"):
+        encoded = normalize_model_urn(text)
+    if not encoded.startswith("dXJu"):
+        return ""
+    pad = "=" * ((4 - len(encoded) % 4) % 4)
+    blob = (encoded + pad).encode("ascii", errors="ignore")
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            out = decoder(blob).decode("utf-8")
+            if out.lower().startswith("urn:"):
+                return out
+        except Exception:
+            continue
+    return ""
+
+
+# Autodesk encoded URNs start with dXJu. Standard base64 may include ``/`` and ``+``.
+_DXJU_RE = re.compile(r"(dXJu[A-Za-z0-9+/_-]+=*)")
+_ADSK_OBJECT_RE = re.compile(r"(urn:adsk\.[^\s\"'<>?#]+)", re.I)
 _PUBLIC_VIEWER_HOSTS = ("viewer.autodesk.com", "autode.sk")
+_PUBLIC_URN_MARKERS = ("a360viewer", "viewer.autodesk.com")
 
 PUBLIC_VIEWER_WARNING = (
     "That paste is from viewer.autodesk.com (Autodesk’s public viewer). The URN lives in "
@@ -209,6 +244,28 @@ PUBLIC_VIEWER_NO_URN_WARNING = (
     "(no dXJu… in the URL). This app cannot log into Autodesk’s public viewer. "
     "Choose the STEP/CAD file here and Translate to SVF so the model lives in YOUR bucket."
 )
+
+A360_PUBLIC_URN_ERROR = (
+    "This URN is from Autodesk’s public Viewer website. Your APS app cannot open it. "
+    "Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN."
+)
+
+# Autodesk.Viewing.ErrorCodes (viewer3D). 4 = NETWORK_ACCESS_DENIED.
+VIEWER_ERROR_CODES: dict[int, str] = {
+    1: "Unknown failure",
+    2: "Bad data",
+    3: "Network failure",
+    4: "Access denied (NETWORK_ACCESS_DENIED) — your APS app token cannot read this URN",
+    5: "File not found",
+    6: "Network server error",
+    7: "Unhandled network response",
+    8: "Browser WebGL not supported",
+    9: "Model is empty",
+    10: "Too many requests",
+    11: "Unhandled exception",
+    12: "WebGL context lost",
+    13: "Load canceled",
+}
 
 # GuiViewer3D already ships these 3D tools; we refuse to disable them and also load extras.
 VIEWER_DEFAULT_3D_EXTENSIONS: tuple[str, ...] = (
@@ -232,9 +289,51 @@ VIEWER_EXTRA_EXTENSIONS: tuple[str, ...] = (
 _DEFAULT_URNS_NAME = "cad_urns.json"
 
 
+def _blob_is_autodesk_public(blob: str) -> bool:
+    text = (blob or "").lower()
+    if any(host in text for host in _PUBLIC_VIEWER_HOSTS):
+        return True
+    return any(marker in text for marker in _PUBLIC_URN_MARKERS)
+
+
 def looks_like_public_viewer(raw: str) -> bool:
-    blob = (raw or "").lower()
-    return any(host in blob for host in _PUBLIC_VIEWER_HOSTS)
+    """True for viewer.autodesk.com pastes and for URNs in Autodesk’s a360viewer bucket."""
+    if _blob_is_autodesk_public(raw or ""):
+        return True
+    return _blob_is_autodesk_public(decode_model_urn(raw))
+
+
+def describe_viewer_error(err: Any) -> str:
+    """Map APS Viewer ErrorCodes (especially 4 = NETWORK_ACCESS_DENIED) to human text."""
+    code: Optional[int] = None
+    if isinstance(err, bool):
+        code = None
+    elif isinstance(err, int):
+        code = err
+    elif isinstance(err, float) and err == int(err):
+        code = int(err)
+    elif isinstance(err, str) and err.strip().lstrip("-").isdigit():
+        code = int(err.strip())
+    elif isinstance(err, dict):
+        for key in ("code", "errorCode", "error_code"):
+            val = err.get(key)
+            if val is None or val == "":
+                continue
+            try:
+                code = int(val)
+                break
+            except (TypeError, ValueError):
+                continue
+    if code == 4:
+        return (
+            "Access denied (error 4 / NETWORK_ACCESS_DENIED). Your 2-legged APS token cannot "
+            "read this object. Autodesk public Viewer URNs (a360viewer-protected) are not in your bucket."
+        )
+    if code in VIEWER_ERROR_CODES:
+        return f"{VIEWER_ERROR_CODES[code]} (error {code})"
+    if err is None or err == "":
+        return "Unknown viewer error"
+    return str(err)
 
 
 def _query_first(qs: dict[str, list[str]], *keys: str) -> str:
@@ -252,7 +351,11 @@ def extract_model_urn(raw: str) -> tuple[str, dict[str, Any]]:
     meta: dict[str, Any] = {
         "source": "empty",
         "public_viewer": False,
+        "a360_protected": False,
+        "block_load": False,
         "warning": "",
+        "error": "",
+        "decoded": "",
         "raw": text,
     }
     if not text:
@@ -262,6 +365,21 @@ def extract_model_urn(raw: str) -> tuple[str, dict[str, Any]]:
     meta["public_viewer"] = public
     if public:
         meta["warning"] = PUBLIC_VIEWER_WARNING
+        meta["error"] = A360_PUBLIC_URN_ERROR
+
+    def _finish(urn: str, source: str) -> tuple[str, dict[str, Any]]:
+        urn = normalize_model_urn(strip_urn_query_fragment(urn))
+        decoded = decode_model_urn(urn)
+        meta["decoded"] = decoded
+        a360 = _blob_is_autodesk_public(decoded)
+        if a360 or public or looks_like_public_viewer(urn):
+            meta["public_viewer"] = True
+            meta["a360_protected"] = a360 or "a360viewer" in (decoded or "").lower()
+            meta["block_load"] = True
+            meta["warning"] = PUBLIC_VIEWER_WARNING
+            meta["error"] = A360_PUBLIC_URN_ERROR
+        meta["source"] = source
+        return urn, meta
 
     candidates: list[tuple[str, str]] = []
 
@@ -272,63 +390,68 @@ def extract_model_urn(raw: str) -> tuple[str, dict[str, Any]]:
             parsed = urlparse(url)
             qs = parse_qs(parsed.query, keep_blank_values=False)
             for key in ("urn", "id", "objectid", "objectId", "url", "model", "file"):
+                if key.lower() == "sheetid":
+                    continue
                 val = _query_first(qs, key)
                 if val:
-                    candidates.append((val, "query"))
-            for part in (parsed.path or "").split("/"):
-                part = unquote(part).strip()
-                if part:
-                    candidates.append((part, "path"))
+                    candidates.append((strip_urn_query_fragment(val), "query"))
+            path = unquote(parsed.path or "").strip()
+            if path:
+                # Do not split on ``/`` — standard base64 URNs contain slashes.
+                candidates.append((strip_urn_query_fragment(path), "path"))
+                id_m = re.search(r"/id/(.+)$", path, re.I)
+                if id_m:
+                    candidates.append((strip_urn_query_fragment(id_m.group(1)), "path"))
             frag = unquote(parsed.fragment or "").strip()
             if frag:
-                if frag.startswith("?"):
-                    fqs = parse_qs(frag[1:], keep_blank_values=False)
+                frag_body = frag[1:] if frag.startswith("?") else frag
+                if "=" in frag_body:
+                    fqs = parse_qs(frag_body, keep_blank_values=False)
                     for key in ("urn", "id", "url"):
                         val = _query_first(fqs, key)
                         if val:
-                            candidates.append((val, "fragment"))
-                else:
-                    candidates.append((frag, "fragment"))
+                            candidates.append((strip_urn_query_fragment(val), "fragment"))
+                candidates.append((strip_urn_query_fragment(frag_body), "fragment"))
         except Exception:
             pass
 
-    candidates.append((text, "paste"))
+    candidates.append((strip_urn_query_fragment(text), "paste"))
 
     for cand, origin in candidates:
+        cand = strip_urn_query_fragment(cand)
         if not cand:
             continue
         if cand.lower().startswith("urn:adsk."):
             urn = normalize_model_urn(cand)
             if urn:
-                meta["source"] = "object_id" if origin == "paste" else origin
-                return urn, meta
+                return _finish(urn, "object_id" if origin == "paste" else origin)
         dx = _DXJU_RE.search(cand)
         if dx:
             urn = normalize_model_urn(dx.group(1))
             if urn:
-                meta["source"] = "viewer_url" if public else ("urn" if origin == "paste" else origin)
-                return urn, meta
+                src = "viewer_url" if public else ("urn" if origin == "paste" else origin)
+                return _finish(urn, src)
         adsk = _ADSK_OBJECT_RE.search(cand)
         if adsk:
             urn = normalize_model_urn(adsk.group(1))
             if urn:
-                meta["source"] = "object_id"
-                return urn, meta
+                return _finish(urn, "object_id")
 
     if public:
         meta["source"] = "viewer_url_no_urn"
         meta["warning"] = PUBLIC_VIEWER_NO_URN_WARNING
+        meta["error"] = A360_PUBLIC_URN_ERROR
+        meta["block_load"] = True
         return "", meta
 
-    dx = _DXJU_RE.search(text)
+    cleaned = strip_urn_query_fragment(text)
+    dx = _DXJU_RE.search(cleaned)
     if dx:
         urn = normalize_model_urn(dx.group(1))
         if urn:
-            meta["source"] = "urn"
-            return urn, meta
-    if text.lower().startswith("urn:adsk.") or text.startswith("dXJu"):
-        meta["source"] = "urn"
-        return normalize_model_urn(text), meta
+            return _finish(urn, "urn")
+    if cleaned.lower().startswith("urn:adsk.") or cleaned.startswith("dXJu"):
+        return _finish(normalize_model_urn(cleaned), "urn")
     meta["source"] = "unknown"
     return "", meta
 
@@ -1046,13 +1169,41 @@ _VIEWER_TEMPLATE = """
 (function(){
   var TOKEN="__TOKEN__", URN="__URN__", RISK="__RISK__", PUBLIC=__PUBLIC__;
   var EXTRAS=__EXTRAS__;
+  var VIEWER_ERR=__VIEWER_ERR__;
   function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
     e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
+  function errCode(err){
+    if (err == null) return null;
+    if (typeof err === 'number' && isFinite(err)) return err;
+    if (typeof err === 'string' && /^-?\\d+$/.test(err.trim())) return Number(err.trim());
+    if (typeof err === 'object'){
+      var v = err.code != null ? err.code : err.errorCode;
+      if (v != null && v !== ''){
+        var n = Number(v);
+        if (isFinite(n)) return n;
+      }
+    }
+    return null;
+  }
+  function describeErr(err){
+    var n = errCode(err);
+    if (n === 4){
+      return 'Access denied (error 4 / NETWORK_ACCESS_DENIED). Your 2-legged APS token cannot '
+        + 'read this object. Autodesk public Viewer URNs (a360viewer-protected) are not in your bucket.';
+    }
+    if (n != null && VIEWER_ERR[String(n)]) return VIEWER_ERR[String(n)] + ' (error ' + n + ')';
+    try { return typeof err === 'string' ? err : JSON.stringify(err); } catch (e) { return String(err); }
+  }
   function publicHint(){
     return PUBLIC
-      ? '<br><br>This URN came from viewer.autodesk.com. Your app token cannot read Autodesk&apos;s bucket. '
-        + 'On CAD Twin: <b>Choose CAD file → Translate to SVF</b> so the URN is in YOUR OSS bucket, then we save that URN.'
+      ? '<br><br><b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+        + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.'
       : '';
+  }
+  if (PUBLIC){
+    fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+      + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
+    return;
   }
   if (typeof Autodesk==='undefined'){
     fail('APS Viewer script failed to load (needs internet to Autodesk).');
@@ -1121,8 +1272,8 @@ _VIEWER_TEMPLATE = """
             }catch(e){/* theming best-effort */}
           });
         }
-      }).catch(function(err){ fail('loadDocumentNode failed: '+JSON.stringify(err)+publicHint()); });
-    }, function(err){ fail('Model load failed: '+JSON.stringify(err)+publicHint()); });
+      }).catch(function(err){ fail('loadDocumentNode failed: '+describeErr(err)+publicHint()); });
+    }, function(err){ fail('Model load failed: '+describeErr(err)+publicHint()); });
   });
 })();
 </script>
@@ -1146,6 +1297,7 @@ def build_viewer_html(
     risk = risk if risk in _RISK_HEX else "Unknown"
     urn = normalize_model_urn(urn)
     extras_js = json.dumps(list(VIEWER_EXTRA_EXTENSIONS))
+    err_js = json.dumps({str(k): v for k, v in VIEWER_ERROR_CODES.items()})
     return (
         _VIEWER_TEMPLATE.replace("__TOKEN__", token)
         .replace("__URN__", urn)
@@ -1155,4 +1307,5 @@ def build_viewer_html(
         .replace("__HEIGHT__", str(int(height)))
         .replace("__PUBLIC__", "true" if public_viewer else "false")
         .replace("__EXTRAS__", extras_js)
+        .replace("__VIEWER_ERR__", err_js)
     )

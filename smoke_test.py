@@ -332,6 +332,7 @@ def main() -> int:
         from datetime import datetime, timezone
 
         from src.aps_viewer import (
+            A360_PUBLIC_URN_ERROR,
             DEFAULT_VIEWER_HEIGHT,
             INSUFFICIENT_SCOPE_HINT,
             MAX_CAD_UPLOAD_MB,
@@ -339,11 +340,14 @@ def main() -> int:
             PUBLIC_VIEWER_NO_URN_WARNING,
             PUBLIC_VIEWER_WARNING,
             TRANSLATE_SCOPES,
+            VIEWER_ERROR_CODES,
             VIEWER_EXTRA_EXTENSIONS,
             aps_available,
             aps_model_urn,
             build_viewer_html,
             cad_size_issue,
+            decode_model_urn,
+            describe_viewer_error,
             encode_model_urn,
             encode_oss_urn,
             extract_model_urn,
@@ -359,6 +363,7 @@ def main() -> int:
             saved_urn_for_pack,
             delete_urn_for_pack,
             sanitize_object_name,
+            strip_urn_query_fragment,
         )
 
         ok, msg = aps_available()
@@ -378,7 +383,16 @@ def main() -> int:
         assert str(DEFAULT_VIEWER_HEIGHT) in build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low")
         assert "Autodesk.Viewing.MarkupsGui" in VIEWER_EXTRA_EXTENSIONS
         pub = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low", public_viewer=True)
-        assert "YOUR OSS bucket" in pub or "viewer.autodesk.com" in pub
+        assert "YOUR OSS bucket" in pub or "viewer.autodesk.com" in pub or "Rotax 912" in pub
+        assert "cannot open it" in pub
+        html_err = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low")
+        assert "NETWORK_ACCESS_DENIED" in html_err
+        assert "describeErr" in html_err
+        assert VIEWER_ERROR_CODES[4].split("—")[0].strip() in html_err or "Access denied" in html_err
+        assert "NETWORK_ACCESS_DENIED" in describe_viewer_error(4)
+        assert "error 4" in describe_viewer_error(4)
+        assert "error 4" in describe_viewer_error({"code": 4})
+        assert "Bad data" in describe_viewer_error(2)
 
         assert oss_bucket_key("AbC-123_XYZ") == "pdm-abc123xyz-cad"
         assert oss_bucket_key("") == "pdm-app-cad"
@@ -424,6 +438,41 @@ def main() -> int:
         assert looks_like_public_viewer("https://viewer.autodesk.com/?urn=dXJuOmFi")
         assert not looks_like_public_viewer("dXJuOmFi")
 
+        a360_oid = (
+            "urn:adsk.objects:os.object:a360viewer-protected/"
+            "t1788359463_db62c835-54e9-4d0d-8ef8-863aacb123ce.step"
+        )
+        a360_b64 = (
+            "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6YTM2MHZpZXdlci1wcm90ZWN0ZWQv"
+            "dDE3ODgzNTk0NjNfZGI2MmM4MzUtNTRlOS00ZDBkLThlZjgtODYzYWFjYjEyM2NlLnN0ZXA"
+        )
+        sheet_url = (
+            "https://viewer.autodesk.com/id/" + a360_b64
+            + "?sheetId=Y2M1MmM3NmEtZDBkYS00ZjExLTk2NzEtM2JmNzBmMWQ3NzBi"
+        )
+        sheet_ex, sheet_meta = extract_model_urn(sheet_url)
+        assert "?" not in sheet_ex and "sheetId" not in sheet_ex and "#" not in sheet_ex
+        assert sheet_ex.startswith("dXJu")
+        assert "a360viewer" in decode_model_urn(sheet_ex).lower()
+        assert sheet_meta["public_viewer"] is True
+        assert sheet_meta["a360_protected"] is True
+        assert sheet_meta["block_load"] is True
+        assert "cannot open it" in (sheet_meta.get("error") or A360_PUBLIC_URN_ERROR)
+        pasted = a360_b64 + "?sheetId=Y2M1MmM3NmEtZDBkYS00ZjExLTk2NzEtM2JmNzBmMWQ3NzBi"
+        pasted_ex, pasted_meta = extract_model_urn(pasted)
+        assert pasted_ex == strip_urn_query_fragment(a360_b64) or pasted_ex.startswith("dXJu")
+        assert "?" not in pasted_ex and "sheetId" not in pasted_ex
+        assert "a360viewer" in decode_model_urn(pasted_ex).lower()
+        assert pasted_meta["a360_protected"] is True
+        assert looks_like_public_viewer(a360_b64)
+        assert looks_like_public_viewer(a360_oid)
+        assert "a360viewer" in decode_model_urn(a360_b64).lower()
+        assert strip_urn_query_fragment(pasted) == a360_b64
+        assert "Rotax 912" in A360_PUBLIC_URN_ERROR
+        app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+        assert "A360_PUBLIC_URN_ERROR" in app_src
+        assert "if public_paste:" in app_src
+
         import tempfile
         from pathlib import Path
 
@@ -435,6 +484,11 @@ def main() -> int:
                 av, working, source="paste", public_viewer=True, path=store
             )
             assert denied["saved"] is False and denied["reason"] == "public_viewer"
+            assert not store.is_file()
+            a360_denied = save_urn_for_pack(
+                av, a360_b64, source="paste", public_viewer=False, path=store
+            )
+            assert a360_denied["saved"] is False and a360_denied["reason"] == "public_viewer"
             assert not store.is_file()
             saved = save_urn_for_pack(av, working, source="translate", path=store)
             assert saved["saved"] is True

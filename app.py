@@ -85,6 +85,7 @@ from src.insights_engine import (
 )
 from src.aps_viewer import (
     APS_SAMPLE_CAD_URL,
+    A360_PUBLIC_URN_ERROR,
     CAD_SIZE_ZIP_FALLBACK,
     CAD_UPLOAD_EXTENSIONS,
     DEFAULT_VIEWER_HEIGHT,
@@ -1721,7 +1722,10 @@ def page_cad_twin():
         st.session_state.aps_urn = urn
         public_paste = bool(
             meta.get("public_viewer")
+            or meta.get("a360_protected")
+            or meta.get("block_load")
             or looks_like_public_viewer(urn_raw)
+            or looks_like_public_viewer(urn)
             or (
                 st.session_state.get("aps_urn_from_public_viewer")
                 and urn
@@ -1733,9 +1737,11 @@ def page_cad_twin():
     sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
 
     if public_paste:
-        st.warning(meta.get("warning") or PUBLIC_VIEWER_WARNING)
+        st.error(f"**{A360_PUBLIC_URN_ERROR}**")
         if not urn:
             st.caption(PUBLIC_VIEWER_NO_URN_WARNING)
+        else:
+            st.caption(meta.get("warning") or PUBLIC_VIEWER_WARNING)
 
     save_col, delete_col = st.columns(2)
     with save_col:
@@ -1809,7 +1815,15 @@ def page_cad_twin():
     if load_clicked or force:
         st.session_state.aps_force_load = False
 
-    if load_clicked or (should_auto and not cache_fresh):
+    if public_paste:
+        st.session_state.aps_viewer_html = ""
+        st.session_state.aps_viewer_urn = ""
+        if load_clicked or force:
+            st.error(f"**{A360_PUBLIC_URN_ERROR}**")
+            persist = _persist_pack_urn(pack_id, urn, source="load", public_viewer=True)
+            if persist.get("reason") == "public_viewer":
+                st.caption(persist.get("message") or PUBLIC_VIEWER_WARNING)
+    elif load_clicked or (should_auto and not cache_fresh):
         try:
             with st.spinner("Fetching APS token and loading GuiViewer3D…"):
                 token = get_access_token()
@@ -1818,22 +1832,20 @@ def page_cad_twin():
                     urn=urn,
                     asset=selected,
                     risk=sel.get("risk_level", "Unknown"),
-                    public_viewer=public_paste,
+                    public_viewer=False,
                 )
             if load_clicked or should_auto:
                 persist = _persist_pack_urn(
-                    pack_id, urn, source="load" if load_clicked else "auto", public_viewer=public_paste
+                    pack_id, urn, source="load" if load_clicked else "auto", public_viewer=False
                 )
                 if persist.get("saved"):
                     st.info(persist.get("message") or saved_urn_caption(pack_id))
                 elif persist.get("reason") == "public_viewer":
-                    st.warning(PUBLIC_VIEWER_WARNING)
+                    st.error(f"**{A360_PUBLIC_URN_ERROR}**")
         except Exception as exc:
             st.error(f"APS error: {exc}")
             if INSUFFICIENT_SCOPE_HINT in str(exc):
                 st.info(INSUFFICIENT_SCOPE_HINT)
-            if public_paste:
-                st.warning(PUBLIC_VIEWER_WARNING)
     elif cache_fresh:
         components.html(cache_html, height=_cad_iframe_height())
         save_info = st.session_state.get("aps_save_log") or {}
