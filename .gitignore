@@ -10,7 +10,8 @@ venv/
 output/
 graphs/*.html
 graphs/*.json
-data/
+data/*
+!data/cad_urns.example.json
 *.db
 .DS_Store
 .cursor/

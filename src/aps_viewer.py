@@ -16,13 +16,16 @@ Model Derivative SVF2 job so the user gets a URN without leaving the SaaS.
 from __future__ import annotations
 
 import base64
+import json
 import math
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, unquote, urlparse, quote
 
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/token"
 APS_BASE = "https://developer.api.autodesk.com"
@@ -180,6 +183,303 @@ def normalize_model_urn(raw: str) -> str:
     if u.lower().startswith("urn:"):
         u = u[4:]
     return u.strip()
+
+
+# Autodesk encoded URNs are URL-safe base64 of ``urn:...`` and therefore start with dXJu.
+_DXJU_RE = re.compile(r"(dXJu[A-Za-z0-9_-]+)")
+_ADSK_OBJECT_RE = re.compile(r"(urn:adsk\.[^\s\"'<>]+)", re.I)
+_PUBLIC_VIEWER_HOSTS = ("viewer.autodesk.com", "autode.sk")
+
+PUBLIC_VIEWER_WARNING = (
+    "That paste is from viewer.autodesk.com (Autodesk’s public viewer). The URN lives in "
+    "Autodesk’s — or someone else’s — bucket, not yours. Your 2-legged app token cannot "
+    "load it. Saving it is useless. Choose the STEP/CAD file on this page → Translate to "
+    "SVF so the URN is in YOUR APS bucket; then we save that URN for this pack."
+)
+
+PUBLIC_VIEWER_NO_URN_WARNING = (
+    "That looks like a viewer.autodesk.com share link, not a Model Derivative URN "
+    "(no dXJu… in the URL). This app cannot log into Autodesk’s public viewer. "
+    "Choose the STEP/CAD file here and Translate to SVF so the model lives in YOUR bucket."
+)
+
+# GuiViewer3D already ships these 3D tools; we refuse to disable them and also load extras.
+VIEWER_DEFAULT_3D_EXTENSIONS: tuple[str, ...] = (
+    "Autodesk.ViewCubeUi",
+    "Autodesk.Measure",
+    "Autodesk.Section",
+    "Autodesk.Explode",
+    "Autodesk.BimWalk",
+    "Autodesk.Viewing.FusionOrbit",
+    "Autodesk.LayerManager",
+    "Autodesk.ModelStructure",
+    "Autodesk.PropertiesManager",
+)
+VIEWER_EXTRA_EXTENSIONS: tuple[str, ...] = (
+    "Autodesk.DocumentBrowser",
+    "Autodesk.Viewing.MarkupsCore",
+    "Autodesk.Viewing.MarkupsGui",
+    "Autodesk.FirstPerson",
+)
+
+_DEFAULT_URNS_NAME = "cad_urns.json"
+
+
+def looks_like_public_viewer(raw: str) -> bool:
+    blob = (raw or "").lower()
+    return any(host in blob for host in _PUBLIC_VIEWER_HOSTS)
+
+
+def _query_first(qs: dict[str, list[str]], *keys: str) -> str:
+    lower = {k.lower(): v for k, v in qs.items()}
+    for key in keys:
+        vals = lower.get(key.lower()) or []
+        if vals and str(vals[0]).strip():
+            return unquote(str(vals[0]).strip())
+    return ""
+
+
+def extract_model_urn(raw: str) -> tuple[str, dict[str, Any]]:
+    """Pull a normalized ``dXJu…`` URN from a paste (raw URN, object id, or viewer URL)."""
+    text = (raw or "").strip()
+    meta: dict[str, Any] = {
+        "source": "empty",
+        "public_viewer": False,
+        "warning": "",
+        "raw": text,
+    }
+    if not text:
+        return "", meta
+
+    public = looks_like_public_viewer(text)
+    meta["public_viewer"] = public
+    if public:
+        meta["warning"] = PUBLIC_VIEWER_WARNING
+
+    candidates: list[tuple[str, str]] = []
+
+    looks_url = "://" in text or text.lower().startswith("viewer.autodesk") or text.lower().startswith("autode.sk")
+    if looks_url:
+        url = text if "://" in text else "https://" + text
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=False)
+            for key in ("urn", "id", "objectid", "objectId", "url", "model", "file"):
+                val = _query_first(qs, key)
+                if val:
+                    candidates.append((val, "query"))
+            for part in (parsed.path or "").split("/"):
+                part = unquote(part).strip()
+                if part:
+                    candidates.append((part, "path"))
+            frag = unquote(parsed.fragment or "").strip()
+            if frag:
+                if frag.startswith("?"):
+                    fqs = parse_qs(frag[1:], keep_blank_values=False)
+                    for key in ("urn", "id", "url"):
+                        val = _query_first(fqs, key)
+                        if val:
+                            candidates.append((val, "fragment"))
+                else:
+                    candidates.append((frag, "fragment"))
+        except Exception:
+            pass
+
+    candidates.append((text, "paste"))
+
+    for cand, origin in candidates:
+        if not cand:
+            continue
+        if cand.lower().startswith("urn:adsk."):
+            urn = normalize_model_urn(cand)
+            if urn:
+                meta["source"] = "object_id" if origin == "paste" else origin
+                return urn, meta
+        dx = _DXJU_RE.search(cand)
+        if dx:
+            urn = normalize_model_urn(dx.group(1))
+            if urn:
+                meta["source"] = "viewer_url" if public else ("urn" if origin == "paste" else origin)
+                return urn, meta
+        adsk = _ADSK_OBJECT_RE.search(cand)
+        if adsk:
+            urn = normalize_model_urn(adsk.group(1))
+            if urn:
+                meta["source"] = "object_id"
+                return urn, meta
+
+    if public:
+        meta["source"] = "viewer_url_no_urn"
+        meta["warning"] = PUBLIC_VIEWER_NO_URN_WARNING
+        return "", meta
+
+    dx = _DXJU_RE.search(text)
+    if dx:
+        urn = normalize_model_urn(dx.group(1))
+        if urn:
+            meta["source"] = "urn"
+            return urn, meta
+    if text.lower().startswith("urn:adsk.") or text.startswith("dXJu"):
+        meta["source"] = "urn"
+        return normalize_model_urn(text), meta
+    meta["source"] = "unknown"
+    return "", meta
+
+
+def cad_urns_path() -> Path:
+    """JSON file of last-successful URNs keyed by industry pack. Override with PDM_CAD_URNS_PATH."""
+    override = (os.getenv("PDM_CAD_URNS_PATH") or "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent / "data" / _DEFAULT_URNS_NAME
+
+
+def _empty_urns_doc() -> dict[str, Any]:
+    return {"version": 1, "packs": {}}
+
+
+def load_saved_urns(*, path: Optional[Path] = None) -> dict[str, Any]:
+    p = Path(path) if path is not None else cad_urns_path()
+    try:
+        if not p.is_file():
+            return _empty_urns_doc()
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return _empty_urns_doc()
+        packs = data.get("packs")
+        if not isinstance(packs, dict):
+            packs = {}
+            # Allow a flat {pack_id: {urn: ...}} or {pack_id: "dXJu..."} file.
+            for k, v in data.items():
+                if k in ("version", "packs"):
+                    continue
+                if isinstance(v, str) and v.strip():
+                    packs[str(k)] = {"urn": normalize_model_urn(v)}
+                elif isinstance(v, dict) and v.get("urn"):
+                    packs[str(k)] = v
+            data = {"version": int(data.get("version") or 1), "packs": packs}
+        else:
+            data = {"version": int(data.get("version") or 1), "packs": packs}
+        return data
+    except Exception:
+        return _empty_urns_doc()
+
+
+def saved_urn_for_pack(pack_id: str, *, path: Optional[Path] = None) -> str:
+    pid = (pack_id or "").strip()
+    if not pid:
+        return ""
+    packs = load_saved_urns(path=path).get("packs") or {}
+    row = packs.get(pid) or {}
+    if isinstance(row, str):
+        return normalize_model_urn(row)
+    if isinstance(row, dict):
+        return normalize_model_urn(str(row.get("urn") or ""))
+    return ""
+
+
+def save_urn_for_pack(
+    pack_id: str,
+    urn: str,
+    *,
+    source: str = "load",
+    public_viewer: bool = False,
+    path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Persist a working URN for an industry pack. Refuses public-viewer URNs."""
+    pid = (pack_id or "").strip()
+    normalized = normalize_model_urn(urn)
+    if public_viewer or looks_like_public_viewer(urn):
+        return {
+            "ok": False,
+            "saved": False,
+            "reason": "public_viewer",
+            "urn": normalized,
+            "pack_id": pid,
+            "message": PUBLIC_VIEWER_WARNING,
+        }
+    if not pid:
+        return {"ok": False, "saved": False, "reason": "no_pack", "urn": normalized, "pack_id": pid, "message": ""}
+    if not normalized:
+        return {"ok": False, "saved": False, "reason": "no_urn", "urn": "", "pack_id": pid, "message": ""}
+
+    p = Path(path) if path is not None else cad_urns_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    doc = load_saved_urns(path=p)
+    packs = dict(doc.get("packs") or {})
+    packs[pid] = {
+        "urn": normalized,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source,
+    }
+    payload = {"version": 1, "packs": packs}
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix="cad_urns.", suffix=".json", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+        os.replace(tmp_name, p)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return {
+        "ok": True,
+        "saved": True,
+        "reason": "ok",
+        "urn": normalized,
+        "pack_id": pid,
+        "path": str(p),
+        "message": saved_urn_caption(pid),
+    }
+
+
+def saved_urn_caption(pack_id: str) -> str:
+    """Honest: we wrote a file on this server. We did not write Render env."""
+    short = pack_id or "this pack"
+    try:
+        from src.industry_packs import get_pack
+
+        short = str(get_pack(pack_id).get("short") or short)
+    except Exception:
+        pass
+    return (
+        f"Saved for {short} on this server. "
+        "To keep it across Render redeploys, also set APS_MODEL_URN."
+    )
+
+
+def resolve_cad_urn(
+    pack_id: str = "",
+    session_urn: str = "",
+    *,
+    path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Session paste wins, then Render ``APS_MODEL_URN`` override, then pack JSON."""
+    env = normalize_model_urn(aps_model_urn())
+    saved = saved_urn_for_pack(pack_id, path=path) if pack_id else ""
+    extracted, meta = extract_model_urn(session_urn)
+    sess = extracted or normalize_model_urn(session_urn)
+    if sess:
+        urn, source = sess, "session"
+    elif env:
+        urn, source = env, "env"
+    elif saved:
+        urn, source = saved, "saved"
+    else:
+        urn, source = "", "none"
+    return {
+        "urn": urn,
+        "source": source,
+        "env_urn": env,
+        "saved_urn": saved,
+        "env_override": bool(env),
+        "pack_id": pack_id or "",
+        "extract": meta,
+        "public_viewer": bool(meta.get("public_viewer")),
+    }
 
 
 def cad_size_issue(n_bytes: int) -> tuple[Optional[str], str]:
@@ -669,31 +969,91 @@ def translate_cad_bytes(
 
 
 _VIEWER_TEMPLATE = """
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b1016; }
+  #aps-wrap { position:relative; width:100%; height:__HEIGHT__px; min-height:__HEIGHT__px;
+    border-radius:12px; background:#0b1016; }
+  #apsViewer, #apsViewer .adsk-viewing-viewer { width:100%; height:100% !important; }
+  #aps-badge { position:absolute; top:10px; left:12px; z-index:3; font-family:system-ui,sans-serif;
+    color:#fff; background:rgba(10,16,22,.55); padding:6px 10px; border-radius:8px; pointer-events:none; }
+  #aps-err { display:none; position:absolute; inset:0; z-index:8; color:#fff;
+    font-family:system-ui,sans-serif; padding:20px; font-size:13px; background:#101822; line-height:1.45; }
+</style>
 <link rel="stylesheet"
   href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css" type="text/css">
-<div id="aps-wrap" style="position:relative;width:100%;height:__HEIGHT__px;border-radius:12px;overflow:hidden;">
-  <div id="aps-badge" style="position:absolute;top:10px;left:12px;z-index:5;font-family:system-ui;
-       color:#fff;background:rgba(10,16,22,.6);padding:6px 10px;border-radius:8px;">
+<div id="aps-wrap">
+  <div id="aps-badge">
     <b id="aps-name">__ASSET__</b> · risk
     <b id="aps-risk" style="color:__RISK_HEX__">__RISK__</b>
   </div>
-  <div id="apsViewer" style="width:100%;height:100%"></div>
-  <div id="aps-err" style="display:none;position:absolute;inset:0;z-index:6;color:#fff;
-       font-family:system-ui;padding:20px;font-size:13px;background:#101822"></div>
+  <div id="apsViewer"></div>
+  <div id="aps-err"></div>
 </div>
 <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
 <script>
 (function(){
-  var TOKEN="__TOKEN__", URN="__URN__", RISK="__RISK__";
+  var TOKEN="__TOKEN__", URN="__URN__", RISK="__RISK__", PUBLIC=__PUBLIC__;
+  var EXTRAS=__EXTRAS__;
   function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
     e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
-  if (typeof Autodesk==='undefined'){ fail('APS Viewer script failed to load (needs internet to Autodesk).'); return; }
-  Autodesk.Viewing.Initializer({env:'AutodeskProduction', accessToken:TOKEN}, function(){
-    var viewer = new Autodesk.Viewing.GuiViewer3D(document.getElementById('apsViewer'));
-    viewer.start();
+  function publicHint(){
+    return PUBLIC
+      ? '<br><br>This URN came from viewer.autodesk.com. Your app token cannot read Autodesk&apos;s bucket. '
+        + 'On CAD Twin: <b>Choose CAD file → Translate to SVF</b> so the URN is in YOUR OSS bucket, then we save that URN.'
+      : '';
+  }
+  if (typeof Autodesk==='undefined'){
+    fail('APS Viewer script failed to load (needs internet to Autodesk).');
+    return;
+  }
+  Autodesk.Viewing.Initializer({
+    env: 'AutodeskProduction',
+    api: 'derivativeV2',
+    accessToken: TOKEN,
+    useADP: false
+  }, function(){
+    var el = document.getElementById('apsViewer');
+    var viewer = new Autodesk.Viewing.GuiViewer3D(el, {
+      theme: 'dark-theme',
+      disabledExtensions: {
+        measure: false,
+        section: false,
+        explode: false,
+        viewcube: false,
+        bimwalk: false,
+        fusionOrbit: false,
+        hyperlink: false,
+        layerManager: false,
+        modelBrowser: false,
+        propertiesPanel: false
+      },
+      extensions: EXTRAS
+    });
+    var started = viewer.start();
+    if (started === false) {
+      fail('GuiViewer3D failed to start (container has no size).');
+      return;
+    }
+    function fitUi(){
+      try { viewer.resize(); } catch (e) {}
+      try { if (viewer.showViewCube) viewer.showViewCube(true); } catch (e) {}
+    }
+    window.addEventListener('resize', fitUi);
+    setTimeout(fitUi, 250);
+    function loadExtras(){
+      EXTRAS.forEach(function(name){
+        try {
+          viewer.loadExtension(name).catch(function(){ /* optional: FirstPerson / MarkupsGui */ });
+        } catch (e) {}
+      });
+    }
     Autodesk.Viewing.Document.load('urn:'+URN, function(doc){
       var node = doc.getRoot().getDefaultGeometry();
+      if (!node) { fail('No viewable geometry in this URN.'+publicHint()); return; }
       viewer.loadDocumentNode(doc, node).then(function(){
+        fitUi();
+        loadExtras();
+        try { viewer.getToolbar(true); } catch (e) {}
         if (RISK==='High' || RISK==='Medium'){
           viewer.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, function(){
             try{
@@ -709,8 +1069,8 @@ _VIEWER_TEMPLATE = """
             }catch(e){/* theming best-effort */}
           });
         }
-      });
-    }, function(err){ fail('Model load failed: '+JSON.stringify(err)); });
+      }).catch(function(err){ fail('loadDocumentNode failed: '+JSON.stringify(err)+publicHint()); });
+    }, function(err){ fail('Model load failed: '+JSON.stringify(err)+publicHint()); });
   });
 })();
 </script>
@@ -718,11 +1078,22 @@ _VIEWER_TEMPLATE = """
 
 _RISK_HEX = {"High": "#e74c3c", "Medium": "#f39c12", "Low": "#27ae60", "Unknown": "#7f8c8d"}
 
+DEFAULT_VIEWER_HEIGHT = 840
 
-def build_viewer_html(token: str, urn: str, *, asset: str, risk: str, height: int = 560) -> str:
-    """Embed the APS Viewer for a translated model URN, tinting red/amber on risk."""
+
+def build_viewer_html(
+    token: str,
+    urn: str,
+    *,
+    asset: str,
+    risk: str,
+    height: int = DEFAULT_VIEWER_HEIGHT,
+    public_viewer: bool = False,
+) -> str:
+    """Embed GuiViewer3D (full toolbar), not a headless Viewer3D."""
     risk = risk if risk in _RISK_HEX else "Unknown"
     urn = normalize_model_urn(urn)
+    extras_js = json.dumps(list(VIEWER_EXTRA_EXTENSIONS))
     return (
         _VIEWER_TEMPLATE.replace("__TOKEN__", token)
         .replace("__URN__", urn)
@@ -730,4 +1101,6 @@ def build_viewer_html(token: str, urn: str, *, asset: str, risk: str, height: in
         .replace("__RISK__", risk)
         .replace("__RISK_HEX__", _RISK_HEX[risk])
         .replace("__HEIGHT__", str(int(height)))
+        .replace("__PUBLIC__", "true" if public_viewer else "false")
+        .replace("__EXTRAS__", extras_js)
     )

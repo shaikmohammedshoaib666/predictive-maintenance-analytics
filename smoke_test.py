@@ -332,19 +332,29 @@ def main() -> int:
         from datetime import datetime, timezone
 
         from src.aps_viewer import (
+            DEFAULT_VIEWER_HEIGHT,
             INSUFFICIENT_SCOPE_HINT,
+            PUBLIC_VIEWER_NO_URN_WARNING,
+            PUBLIC_VIEWER_WARNING,
             TRANSLATE_SCOPES,
+            VIEWER_EXTRA_EXTENSIONS,
             aps_available,
             aps_model_urn,
             build_viewer_html,
             cad_size_issue,
             encode_model_urn,
             encode_oss_urn,
+            extract_model_urn,
             format_aps_error,
             looks_like_insufficient_scope,
+            looks_like_public_viewer,
             normalize_model_urn,
             oss_bucket_key,
             oss_object_id,
+            resolve_cad_urn,
+            save_urn_for_pack,
+            saved_urn_caption,
+            saved_urn_for_pack,
             sanitize_object_name,
         )
 
@@ -355,6 +365,17 @@ def main() -> int:
         assert "TOKEN123" in html and "dXJuOmFkc2sx" in html and "GuiViewer3D" in html
         assert "__TOKEN__" not in html and "__URN__" not in html
         assert "Unknown" in build_viewer_html("t", "u", asset="a", risk="bogus")
+        assert "new Autodesk.Viewing.Viewer3D(" not in html
+        assert "disabledExtensions" in html
+        assert "Autodesk.DocumentBrowser" in html
+        assert "Autodesk.Viewing.MarkupsGui" in html
+        assert "Autodesk.Measure" in html or "measure: false" in html
+        assert "Autodesk.BimWalk" in html or "bimwalk: false" in html
+        assert "showViewCube" in html
+        assert str(DEFAULT_VIEWER_HEIGHT) in build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low")
+        assert "Autodesk.Viewing.MarkupsGui" in VIEWER_EXTRA_EXTENSIONS
+        pub = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low", public_viewer=True)
+        assert "YOUR OSS bucket" in pub or "viewer.autodesk.com" in pub
 
         assert oss_bucket_key("AbC-123_XYZ") == "pdm-abc123xyz-cad"
         assert oss_bucket_key("") == "pdm-app-cad"
@@ -379,6 +400,70 @@ def main() -> int:
         assert normalize_model_urn(oid) == urn
         html2 = build_viewer_html("t", "urn:" + urn, asset="a", risk="Low")
         assert f'URN="{urn}"' in html2
+
+        extracted, meta = extract_model_urn(
+            "https://viewer.autodesk.com/?urn=dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6YnVja2V0L1JvdGF4LnN0ZXA"
+        )
+        assert extracted.startswith("dXJu")
+        assert meta["public_viewer"] is True
+        assert "YOUR" in (meta["warning"] or PUBLIC_VIEWER_WARNING)
+        path_ex, path_meta = extract_model_urn(
+            "https://viewer.autodesk.com/id/dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6YnVja2V0L2VuZ2luZS5zdHA"
+        )
+        assert path_ex.startswith("dXJu") and path_meta["public_viewer"] is True
+        obj_ex, _ = extract_model_urn("urn:adsk.objects:os.object:bucket/Rotax.step")
+        assert obj_ex == encode_model_urn("urn:adsk.objects:os.object:bucket/Rotax.step")
+        share, share_meta = extract_model_urn("https://viewer.autodesk.com/share/abc123")
+        assert share == "" and share_meta["public_viewer"] is True
+        assert PUBLIC_VIEWER_NO_URN_WARNING.split("share")[0][:20] in share_meta["warning"] or "share" in share_meta["warning"].lower()
+        plain, plain_meta = extract_model_urn("  dXJuOmFkc2suZXhhbXBsZQ  ")
+        assert plain.startswith("dXJu") and plain_meta["public_viewer"] is False
+        assert looks_like_public_viewer("https://viewer.autodesk.com/?urn=dXJuOmFi")
+        assert not looks_like_public_viewer("dXJuOmFi")
+
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "cad_urns.json"
+            av = "aviation_uav_piston"
+            working = "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6cGRtLWFwcC1jYWQvcm90YXguc3RlcA"
+            denied = save_urn_for_pack(
+                av, working, source="paste", public_viewer=True, path=store
+            )
+            assert denied["saved"] is False and denied["reason"] == "public_viewer"
+            assert not store.is_file()
+            saved = save_urn_for_pack(av, working, source="translate", path=store)
+            assert saved["saved"] is True
+            assert saved_urn_for_pack(av, path=store) == working
+            assert "Aviation" in saved_urn_caption(av)
+            assert "APS_MODEL_URN" in saved["message"]
+            assert "Render env" not in saved["message"].lower()
+            assert "we wrote render" not in saved["message"].lower()
+            info = resolve_cad_urn(av, "", path=store)
+            assert info["urn"] == working and info["source"] == "saved"
+            sess = resolve_cad_urn(av, "dXJuOmZyb21zZXNzaW9u", path=store)
+            assert sess["source"] == "session" and sess["urn"] == "dXJuOmZyb21zZXNzaW9u"
+            prev_env = os.environ.get("APS_MODEL_URN")
+            os.environ["APS_MODEL_URN"] = "dXJuOmVudm92ZXJyaWRl"
+            try:
+                over = resolve_cad_urn(av, "", path=store)
+                assert over["source"] == "env" and over["urn"] == "dXJuOmVudm92ZXJyaWRl"
+                assert over["env_override"] is True
+            finally:
+                if prev_env is None:
+                    os.environ.pop("APS_MODEL_URN", None)
+                else:
+                    os.environ["APS_MODEL_URN"] = prev_env
+
+        example = ROOT / "data" / "cad_urns.example.json"
+        assert example.is_file()
+        import json as _json
+
+        example_doc = _json.loads(example.read_text(encoding="utf-8"))
+        assert example_doc.get("packs") == {}
+        gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert "cad_urns.json" in gitignore or "data/*" in gitignore
 
         assert cad_size_issue(0)[0] == "error"
         assert cad_size_issue(1024)[0] is None
@@ -784,6 +869,31 @@ def main() -> int:
         ph = cad_placeholder_html(status=status)
         assert "APS_CLIENT_ID" in ph and "post-deploy" in ph.lower() or "Render" in ph or "credentials" in ph.lower()
 
+        import tempfile
+        from pathlib import Path
+
+        from src.aps_viewer import save_urn_for_pack
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "cad_urns.json"
+            prev = os.environ.get("PDM_CAD_URNS_PATH")
+            os.environ["PDM_CAD_URNS_PATH"] = str(store)
+            try:
+                save_urn_for_pack(
+                    "aviation_uav_piston",
+                    "dXJuOmFkc2suYXZpYXRpb250ZXN0",
+                    source="translate",
+                )
+                packed = cad_slot_status("", pack_id="aviation_uav_piston")
+                assert packed["urn"] == "dXJuOmFkc2suYXZpYXRpb250ZXN0"
+                assert packed["source"] == "saved"
+                assert packed["ready"] is False  # still no APS credentials in this test
+            finally:
+                if prev is None:
+                    os.environ.pop("PDM_CAD_URNS_PATH", None)
+                else:
+                    os.environ["PDM_CAD_URNS_PATH"] = prev
+
         preds = [{"machine_id": "UAV-03", "risk_level": "High", "predicted_rul_days": 4}]
         bundle = compute_pack_kpis("aviation_uav_piston", pd.DataFrame({"machine_id": ["UAV-03"], "egt": [800]}), preds)
         twin = board_twin_html(preds, "aviation_uav_piston", selected_id="UAV-03")
@@ -1071,6 +1181,12 @@ def main() -> int:
         assert not _errs(at3), "Suggest pack: " + "; ".join(_errs(at3))
 
         prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
+        prev_urns = os.environ.get("PDM_CAD_URNS_PATH")
+        import tempfile as _tf
+        from pathlib import Path as _Path
+
+        _urns_dir = _tf.TemporaryDirectory()
+        os.environ["PDM_CAD_URNS_PATH"] = str(_Path(_urns_dir.name) / "cad_urns.json")
         os.environ["APS_CLIENT_ID"] = "UiTestClientId"
         os.environ["APS_CLIENT_SECRET"] = "ui-test-secret-not-real"
         try:
@@ -1088,6 +1204,11 @@ def main() -> int:
             next(b for b in at_cad.button if b.label == "Translate to SVF / get URN").click().run()
             assert not _errs(at_cad), "Translate with no file: " + "; ".join(_errs(at_cad))
         finally:
+            _urns_dir.cleanup()
+            if prev_urns is None:
+                os.environ.pop("PDM_CAD_URNS_PATH", None)
+            else:
+                os.environ["PDM_CAD_URNS_PATH"] = prev_urns
             if prev_id is None:
                 os.environ.pop("APS_CLIENT_ID", None)
             else:

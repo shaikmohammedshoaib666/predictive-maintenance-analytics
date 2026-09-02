@@ -86,13 +86,21 @@ from src.insights_engine import (
 from src.aps_viewer import (
     APS_SAMPLE_CAD_URL,
     CAD_UPLOAD_EXTENSIONS,
+    DEFAULT_VIEWER_HEIGHT,
     INSUFFICIENT_SCOPE_HINT,
+    PUBLIC_VIEWER_NO_URN_WARNING,
+    PUBLIC_VIEWER_WARNING,
     aps_available,
     aps_model_urn,
     build_viewer_html,
     cad_size_issue,
+    extract_model_urn,
     get_access_token,
+    looks_like_public_viewer,
     normalize_model_urn,
+    resolve_cad_urn,
+    save_urn_for_pack,
+    saved_urn_caption,
     translate_cad_bytes,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
@@ -193,7 +201,7 @@ def init_session_state():
         # Cleaning engine (pandas | Polars)
         "clean_engine": "pandas",
         "dashboard_tiles": None,
-        # Autodesk APS CAD twin — URN also accepted from APS_MODEL_URN after deploy
+        # Autodesk APS CAD twin — URN from APS_MODEL_URN, pack JSON save, or paste
         "aps_urn": "",
         # Industry pack (Plant is the default; 3D + KPIs switch with this)
         "industry_pack": DEFAULT_PACK_ID,
@@ -1474,26 +1482,76 @@ def page_twin_3d():
     )
 
 
+def _cad_iframe_height(viewer_h: int = DEFAULT_VIEWER_HEIGHT) -> int:
+    return int(viewer_h) + 36
+
+
+def _seed_cad_urn_widgets(pack_id: str) -> dict:
+    """Prefill URN widgets BEFORE they are created. Streamlit forbids writing the key after."""
+    env_urn = normalize_model_urn(aps_model_urn())
+    resolved = resolve_cad_urn(pack_id, st.session_state.get("aps_urn") or "")
+    seed = resolved.get("urn") or ""
+    if not st.session_state.get("aps_urn") and seed:
+        st.session_state.aps_urn = seed
+        st.session_state.aps_urn_origin = resolved.get("source") or "saved"
+    if "aps_urn_input" not in st.session_state and seed:
+        st.session_state.aps_urn_input = seed
+        st.session_state.aps_urn_origin = resolved.get("source") or "saved"
+    # Normalize a paste (viewer.autodesk.com URL → dXJu…) before the text_input is built.
+    if "aps_urn_input" in st.session_state:
+        raw = str(st.session_state.aps_urn_input or "")
+        extracted, meta = extract_model_urn(raw)
+        st.session_state.aps_urn_extract_meta = meta
+        if extracted and extracted != raw.strip():
+            st.session_state.aps_urn_input = extracted
+        if meta.get("public_viewer"):
+            st.session_state.aps_urn_from_public_viewer = True
+        elif extracted:
+            st.session_state.aps_urn_from_public_viewer = False
+    return resolved
+
+
+def _persist_pack_urn(pack_id: str, urn: str, *, source: str, public_viewer: bool) -> dict:
+    result = save_urn_for_pack(pack_id, urn, source=source, public_viewer=public_viewer)
+    st.session_state.aps_save_log = result
+    if result.get("saved"):
+        st.session_state.aps_urn_origin = source
+        st.session_state.aps_urn_from_public_viewer = False
+    return result
+
+
+def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_viewer: bool) -> None:
+    html = build_viewer_html(
+        token,
+        urn,
+        asset=asset,
+        risk=risk,
+        height=DEFAULT_VIEWER_HEIGHT,
+        public_viewer=public_viewer,
+    )
+    st.session_state.aps_viewer_html = html
+    st.session_state.aps_viewer_urn = urn
+    st.session_state.aps_viewer_at = datetime.now().timestamp()
+    components.html(html, height=_cad_iframe_height())
+
+
 # ── CAD Twin — Autodesk APS (Upgrade 3) ───────────────────────────────────────
 def page_cad_twin():
     st.markdown('<p class="main-header">CAD Twin (Autodesk APS)</p>', unsafe_allow_html=True)
+    pack = active_pack()
+    pack_id = active_pack_id()
     st.markdown(
-        '<p class="sub-header">Real translated CAD (Revit / Fusion / IFC → SVF). Credentials are '
-        "runtime secrets — add them on Render after deploy; this page and the dashboard CAD tile "
-        "turn on without a code change.</p>",
+        f'<p class="sub-header">Real translated CAD for <b>{pack["label"]}</b> (Revit / Fusion / IFC / STEP → SVF). '
+        "GuiViewer3D full toolbar. Last working URN is saved on this server per industry pack — "
+        "not session-only. Credentials are runtime secrets.</p>",
         unsafe_allow_html=True,
     )
 
     ok, msg = aps_available()
-    env_urn = aps_model_urn()
-    if not st.session_state.get("aps_urn") and env_urn:
-        st.session_state.aps_urn = env_urn
-    if "aps_urn_input" not in st.session_state:
-        seed = st.session_state.get("aps_urn") or env_urn
-        if seed:
-            st.session_state.aps_urn_input = seed
+    resolved = _seed_cad_urn_widgets(pack_id)
+    status = cad_slot_status(st.session_state.get("aps_urn") or "", pack_id=pack_id)
+    env_urn = normalize_model_urn(aps_model_urn())
 
-    status = cad_slot_status(st.session_state.get("aps_urn") or "")
     if ok:
         st.success(f"APS: {msg}")
     else:
@@ -1509,12 +1567,18 @@ def page_cad_twin():
             "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) with "
             "**Model Derivative** and **Data Management** APIs enabled. Copy **Client ID** + **Client Secret**.\n"
             "2. On Render → Environment, set `APS_CLIENT_ID` and `APS_CLIENT_SECRET` "
-            "(optional `APS_MODEL_URN` if you already have a translated model).\n"
-            "3. **Generate a URN here:** choose a CAD file → **Translate to SVF / get URN** → "
-            "then **Load CAD model**. You can still paste a URN if you translated elsewhere.\n"
-            "4. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
-            "`bucket:read` in addition to `viewables:read`. Viewer-only tokens cannot upload.\n"
-            "5. Reload the dashboard — the CAD tile uses the same URN (session or `APS_MODEL_URN`)."
+            "(optional `APS_MODEL_URN` if you already have a translated model — that env var is the "
+            "override that survives Render redeploys).\n"
+            "3. **Generate a URN here:** choose a CAD file → **Translate to SVF / get URN**. "
+            "That puts the model in **your** OSS bucket. We then save that URN for this pack "
+            f"({pack['short']}) in a JSON file on this server.\n"
+            "4. Pasting a [viewer.autodesk.com](https://viewer.autodesk.com) link only extracts the "
+            "`dXJu…` URN. It will **not** load with your app token unless that object is in your bucket. "
+            "Do not rely on saving a public-viewer URN.\n"
+            "5. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
+            "`bucket:read` in addition to `viewables:read`.\n"
+            "6. Close the tab and come back — CAD Twin auto-loads the saved pack URN while this "
+            "service is up. After a Render **redeploy** the disk is wiped; set `APS_MODEL_URN` too."
         )
         st.caption(INSUFFICIENT_SCOPE_HINT)
         st.markdown(
@@ -1576,7 +1640,17 @@ def page_cad_twin():
                             # Widget with key aps_urn_input is created below this button.
                             st.session_state.aps_urn = result["urn"]
                             st.session_state.aps_urn_input = result["urn"]
-                        if result.get("ok"):
+                            st.session_state.aps_urn_from_public_viewer = False
+                            st.session_state.aps_viewer_html = ""
+                            st.session_state.aps_viewer_urn = ""
+                        if result.get("ok") and result.get("urn"):
+                            persist = _persist_pack_urn(
+                                pack_id, result["urn"], source="translate", public_viewer=False
+                            )
+                            result = dict(result)
+                            result["save"] = persist
+                            st.session_state.aps_translate_log = result
+                            st.session_state.aps_force_load = True
                             box.update(label="Translation succeeded", state="complete")
                         elif result.get("phase") == "timeout":
                             box.update(label="Still translating on Autodesk", state="running")
@@ -1588,6 +1662,9 @@ def page_cad_twin():
             phase = str(log.get("phase") or "")
             if log.get("ok"):
                 st.success(log["message"])
+                save_info = log.get("save") or st.session_state.get("aps_save_log") or {}
+                if save_info.get("saved"):
+                    st.info(save_info.get("message") or saved_urn_caption(pack_id))
             elif phase == "timeout":
                 st.warning(log["message"])
             else:
@@ -1601,15 +1678,42 @@ def page_cad_twin():
     ids = [s["machine_id"] for s in states] or ["asset"]
     c1, c2 = st.columns([2, 1])
     with c1:
-        urn = st.text_input(
-            "Translated model URN (base64)",
+        urn_raw = st.text_input(
+            "Translated model URN (base64) or viewer.autodesk.com URL",
             key="aps_urn_input",
-            help="Paste a URN, set APS_MODEL_URN on Render, or use Translate to SVF / get URN above.",
+            help=(
+                "Paste a dXJu URN, an Autodesk viewer URL (we extract the URN), "
+                "or use Translate above. APS_MODEL_URN on Render overrides the saved pack file."
+            ),
         )
+        extracted, meta = extract_model_urn(urn_raw)
+        urn = extracted or normalize_model_urn(urn_raw)
         st.session_state.aps_urn = urn
+        public_paste = bool(meta.get("public_viewer") or looks_like_public_viewer(urn_raw))
     with c2:
         selected = st.selectbox("Asset", ids, key="aps_asset_pick")
     sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
+
+    if public_paste:
+        st.warning(meta.get("warning") or PUBLIC_VIEWER_WARNING)
+        if not urn:
+            st.caption(PUBLIC_VIEWER_NO_URN_WARNING)
+
+    seed_urn = env_urn or (resolved.get("saved_urn") or "")
+    if env_urn:
+        st.caption(
+            "Render `APS_MODEL_URN` is set and overrides the pack JSON as the default URN. "
+            "We do not write Render env from this app."
+        )
+    elif resolved.get("saved_urn"):
+        st.caption(saved_urn_caption(pack_id))
+
+    st.caption(
+        "Viewer is **GuiViewer3D** (not headless Viewer3D): Home, Fit, Pan, Zoom, Orbit, "
+        "First Person / BimWalk, Measure, Section, Explode (slider), View cube, left Views "
+        "(DocumentBrowser), Model browser, Properties, Settings. Markup loads when "
+        "`Autodesk.Viewing.MarkupsGui` is in the viewer library — no extra paid API."
+    )
 
     if not ok:
         components.html(cad_placeholder_html(status=status, height=280), height=300)
@@ -1617,24 +1721,57 @@ def page_cad_twin():
     if not (urn or "").strip():
         st.warning(
             "Choose a CAD file and click **Translate to SVF / get URN**, paste a translated "
-            "SVF URN, or set APS_MODEL_URN on Render."
+            "SVF URN from **your** bucket, or set APS_MODEL_URN on Render."
         )
         return
-    if st.button("Load CAD model", type="primary", key="aps_load_cad_btn"):
+
+    load_clicked = st.button("Load CAD model", type="primary", key="aps_load_cad_btn")
+    cache_urn = str(st.session_state.get("aps_viewer_urn") or "")
+    cache_html = str(st.session_state.get("aps_viewer_html") or "")
+    cache_at = float(st.session_state.get("aps_viewer_at") or 0)
+    cache_fresh = bool(cache_html and cache_urn == urn and (datetime.now().timestamp() - cache_at) < 50 * 60)
+    translated = str((st.session_state.get("aps_translate_log") or {}).get("urn") or "")
+    translate_ok = bool((st.session_state.get("aps_translate_log") or {}).get("ok"))
+    force = bool(st.session_state.get("aps_force_load"))
+    should_auto = (not public_paste) and bool(urn) and (
+        urn == seed_urn
+        or force
+        or (translate_ok and urn == normalize_model_urn(translated))
+    )
+    if load_clicked or force:
+        st.session_state.aps_force_load = False
+
+    if load_clicked or (should_auto and not cache_fresh):
         try:
-            with st.spinner("Fetching APS token and loading model…"):
+            with st.spinner("Fetching APS token and loading GuiViewer3D…"):
                 token = get_access_token()
-                html = build_viewer_html(
-                    token["access_token"],
-                    normalize_model_urn(urn),
+                _render_cad_viewer(
+                    token=token["access_token"],
+                    urn=urn,
                     asset=selected,
                     risk=sel.get("risk_level", "Unknown"),
+                    public_viewer=public_paste,
                 )
-            components.html(html, height=620)
+            if load_clicked or should_auto:
+                persist = _persist_pack_urn(
+                    pack_id, urn, source="load" if load_clicked else "auto", public_viewer=public_paste
+                )
+                if persist.get("saved"):
+                    st.info(persist.get("message") or saved_urn_caption(pack_id))
+                elif persist.get("reason") == "public_viewer":
+                    st.warning(PUBLIC_VIEWER_WARNING)
         except Exception as exc:
             st.error(f"APS error: {exc}")
             if INSUFFICIENT_SCOPE_HINT in str(exc):
                 st.info(INSUFFICIENT_SCOPE_HINT)
+            if public_paste:
+                st.warning(PUBLIC_VIEWER_WARNING)
+    elif cache_fresh:
+        components.html(cache_html, height=_cad_iframe_height())
+        save_info = st.session_state.get("aps_save_log") or {}
+        if save_info.get("saved") and save_info.get("urn") == urn:
+            st.caption(save_info.get("message") or saved_urn_caption(pack_id))
+
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
@@ -1909,7 +2046,7 @@ def page_dashboard_builder():
         selected_id = str(twin_source[0].get("machine_id"))
     twin_html = board_twin_html(twin_source, active_pack_id(), selected_id=selected_id, height=480)
 
-    cad_status = cad_slot_status(st.session_state.get("aps_urn") or "")
+    cad_status = cad_slot_status(st.session_state.get("aps_urn") or "", pack_id=active_pack_id())
     cad_html = ""
     cad_asset = selected_id or "asset"
     cad_risk = "Unknown"
@@ -1923,7 +2060,7 @@ def page_dashboard_builder():
                 urn=cad_status["urn"],
                 asset=cad_asset,
                 risk=cad_risk,
-                height=480,
+                height=DEFAULT_VIEWER_HEIGHT,
             )
         except Exception as exc:
             cad_status = dict(cad_status)
@@ -1970,7 +2107,13 @@ def page_dashboard_builder():
     if "cad" in enabled:
         st.subheader("CAD twin (APS)")
         if cad_status.get("ready") and cad_html:
-            components.html(cad_html, height=500)
+            components.html(cad_html, height=_cad_iframe_height())
+            if cad_status.get("source") == "saved":
+                st.caption(saved_urn_caption(active_pack_id()))
+            elif cad_status.get("env_override"):
+                st.caption(
+                    "Using Render APS_MODEL_URN override. Saved pack URN is unused while that env is set."
+                )
         else:
             components.html(cad_placeholder_html(status=cad_status, height=280), height=300)
 

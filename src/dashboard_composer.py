@@ -13,7 +13,12 @@ from typing import Any, Optional
 
 import plotly.graph_objects as go
 
-from src.aps_viewer import aps_available, aps_model_urn, build_viewer_html
+from src.aps_viewer import (
+    DEFAULT_VIEWER_HEIGHT,
+    aps_available,
+    build_viewer_html,
+    resolve_cad_urn,
+)
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import get_pack
 from src.twin3d import RISK_COLORS, build_twin_html, normalize_risk
@@ -33,21 +38,28 @@ def default_tile_state() -> dict[str, bool]:
     return {t["id"]: True for t in TILE_SPECS}
 
 
-def cad_slot_status(urn: str = "") -> dict[str, Any]:
-    """Runtime APS gate. Secrets can be added after deploy; this re-reads env each call."""
+def cad_slot_status(urn: str = "", pack_id: str = "") -> dict[str, Any]:
+    """Runtime APS gate. Secrets can be added after deploy; this re-reads env each call.
+
+    URN order: session paste, then Render ``APS_MODEL_URN`` override, then pack JSON save.
+    """
     ok, msg = aps_available()
-    resolved = (urn or aps_model_urn() or "").strip()
+    info = resolve_cad_urn(pack_id, urn)
+    resolved = (info.get("urn") or "").strip()
     return {
         "credentials": ok,
         "urn": resolved,
         "ready": bool(ok and resolved),
         "message": msg,
+        "source": info.get("source") or "none",
+        "env_override": bool(info.get("env_override")),
+        "pack_id": pack_id or "",
         "needs": (
             (["APS_CLIENT_ID", "APS_CLIENT_SECRET"] if not ok else [])
             + (
                 []
                 if resolved
-                else ["APS_MODEL_URN, upload CAD on CAD Twin, or paste a URN"]
+                else ["APS_MODEL_URN, upload CAD on CAD Twin, or a saved pack URN"]
             )
         ),
     }
@@ -135,7 +147,7 @@ def compose_dashboard_html(
     enabled = [t for t in (tiles or list(DEFAULT_TILES)) if t in DEFAULT_TILES]
     pack = get_pack(pack_id)
     bundle = kpi_bundle or {}
-    status = cad_status or cad_slot_status()
+    status = cad_status or cad_slot_status(pack_id=pack_id)
     parts = [
         "<!DOCTYPE html><html><head><meta charset='utf-8'>",
         f"<title>{html.escape(title)}</title>",
@@ -166,7 +178,7 @@ def compose_dashboard_html(
     if "cad" in enabled:
         parts.append("<div class='tile'><h2>CAD twin (APS)</h2>")
         if status.get("ready") and cad_html:
-            parts.append(_iframe(cad_html, 560))
+            parts.append(_iframe(cad_html, DEFAULT_VIEWER_HEIGHT))
         else:
             parts.append(cad_placeholder_html(status=status, height=280))
         parts.append("</div>")
@@ -216,7 +228,7 @@ def board_cad_html(
     urn: str,
     asset: str,
     risk: str,
-    height: int = 480,
+    height: int = DEFAULT_VIEWER_HEIGHT,
 ) -> str:
     return build_viewer_html(token, urn, asset=asset, risk=risk, height=height)
 

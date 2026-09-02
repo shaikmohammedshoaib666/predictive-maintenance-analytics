@@ -113,7 +113,7 @@ APS_CLIENT_SECRET=...
 APS_MODEL_URN=...
 ```
 
-`APS_MODEL_URN` is optional. On **CAD Twin**, with client id/secret set, choose a CAD file → **Translate to SVF / get URN** to generate it in the app (OSS signed upload + Model Derivative). The APS app needs **Model Derivative** + **Data Management**; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Copy the resulting base64 URN into `APS_MODEL_URN` if you want it on every dyno restart.
+`APS_MODEL_URN` is optional. On **CAD Twin**, with client id/secret set, choose a CAD file → **Translate to SVF / get URN** to generate it in **your** OSS bucket. The last working URN is saved per industry pack in `data/cad_urns.json` on the running server (close-tab safe; **not** written to Render env — we have no Render API). Render free-tier disk is ephemeral across **redeploys**; copy that URN into `APS_MODEL_URN` if you want it after a deploy. The APS app needs **Model Derivative** + **Data Management**; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Do not paste a `viewer.autodesk.com` share and expect it to load with your app token.
 
 **Local secrets (never commit):** copy to `.streamlit/secrets.toml` (this path is in `.gitignore`).
 
