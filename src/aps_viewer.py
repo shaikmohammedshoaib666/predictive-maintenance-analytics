@@ -93,9 +93,16 @@ CAD_UPLOAD_EXTENSIONS: tuple[str, ...] = (
     "zip",
 )
 
-# Render / Streamlit practical cap. Warn before we hit it.
-MAX_CAD_BYTES = 200 * 1024 * 1024
+# Keep in sync with .streamlit/config.toml [server] maxUploadSize (MB).
+MAX_CAD_UPLOAD_MB = 300
+MAX_CAD_BYTES = MAX_CAD_UPLOAD_MB * 1024 * 1024
 WARN_CAD_BYTES = 80 * 1024 * 1024
+
+# If Streamlit accepts the file but Render / a reverse proxy still rejects the POST.
+CAD_SIZE_ZIP_FALLBACK = (
+    "zip the STEP (often drops under 200 MB) and upload the zip; "
+    "or export a lighter STEP from Fusion."
+)
 
 # OSS signed-upload: at most 25 URLs per GET.
 _SIGNED_URL_BATCH = 25
@@ -535,14 +542,15 @@ def cad_size_issue(n_bytes: int) -> tuple[Optional[str], str]:
         mb = n / (1024 * 1024)
         return (
             "error",
-            f"File is {mb:.0f} MB. Streamlit/Render uploads cap around 200 MB — "
-            "use a smaller CAD or zip, or translate in APS and paste the URN.",
+            f"File is {mb:.0f} MB. Streamlit maxUploadSize is {MAX_CAD_UPLOAD_MB} MB. "
+            f"{CAD_SIZE_ZIP_FALLBACK[0].upper()}{CAD_SIZE_ZIP_FALLBACK[1:]}",
         )
     if n > WARN_CAD_BYTES:
         mb = n / (1024 * 1024)
         return (
             "warn",
-            f"File is {mb:.0f} MB. Large uploads can time out on Render; translation may take a while.",
+            f"File is {mb:.0f} MB. Large uploads can time out on Render; translation may take a while. "
+            f"If the upload still fails (Render or a proxy may block large POSTs), {CAD_SIZE_ZIP_FALLBACK}",
         )
     return None, ""
 

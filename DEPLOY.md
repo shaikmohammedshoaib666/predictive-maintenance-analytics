@@ -113,7 +113,7 @@ APS_CLIENT_SECRET=...
 APS_MODEL_URN=...
 ```
 
-`APS_MODEL_URN` is optional. On **CAD Twin**, with client id/secret set, choose a CAD file → **Translate to SVF / get URN** to generate it in **your** OSS bucket. The last working URN is saved per industry pack in `data/cad_urns.json` on the running server (close-tab safe; **not** written to Render env — we have no Render API). Render free-tier disk is ephemeral across **redeploys**; copy that URN into `APS_MODEL_URN` if you want it after a deploy. The APS app needs **Model Derivative** + **Data Management**; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Do not paste a `viewer.autodesk.com` share and expect it to load with your app token.
+`APS_MODEL_URN` is optional. On **CAD Twin**, with client id/secret set, choose a CAD file → **Translate to SVF / get URN** to generate it in **your** OSS bucket. viewer.autodesk.com does **not** copy the file into that bucket. Streamlit `server.maxUploadSize` is **300 MB** so a ~207 MB STEP can upload; if Render or a proxy still rejects the POST, zip the STEP (often drops under 200 MB) and upload the zip (set ZIP root to the `.step` filename), or export a lighter STEP from Fusion. The last working URN is saved per industry pack in `data/cad_urns.json` on the running server (close-tab safe; **not** written to Render env — we have no Render API). Render free-tier disk is ephemeral across **redeploys**; copy that URN into `APS_MODEL_URN` if you want it after a deploy. The APS app needs **Model Derivative** + **Data Management**; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Do not paste a `viewer.autodesk.com` share and expect it to load with your app token.
 
 **Local secrets (never commit):** copy to `.streamlit/secrets.toml` (this path is in `.gitignore`).
 
@@ -129,3 +129,4 @@ APS_MODEL_URN=...
 | Port scan timeout | Start command must be `bash start.sh` (not `streamlit run app.py`) |
 | Build OOM / Python 3.14 | Confirm `PYTHON_VERSION=3.11.9`; do not use Streamlit Cloud for this repo |
 | Email still in demo mode | Set env above and `EMAIL_DEMO_MODE=false` |
+| CAD upload fails around 200 MB | Streamlit default was 200 MB; this repo sets `server.maxUploadSize = 300` in `.streamlit/config.toml`. If Render/proxy still blocks, zip the STEP and upload the zip, or export a lighter STEP from Fusion. |

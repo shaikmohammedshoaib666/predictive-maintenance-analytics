@@ -334,6 +334,8 @@ def main() -> int:
         from src.aps_viewer import (
             DEFAULT_VIEWER_HEIGHT,
             INSUFFICIENT_SCOPE_HINT,
+            MAX_CAD_UPLOAD_MB,
+            CAD_SIZE_ZIP_FALLBACK,
             PUBLIC_VIEWER_NO_URN_WARNING,
             PUBLIC_VIEWER_WARNING,
             TRANSLATE_SCOPES,
@@ -483,7 +485,23 @@ def main() -> int:
         assert cad_size_issue(0)[0] == "error"
         assert cad_size_issue(1024)[0] is None
         assert cad_size_issue(90 * 1024 * 1024)[0] == "warn"
-        assert cad_size_issue(201 * 1024 * 1024)[0] == "error"
+        rotax_207 = cad_size_issue(207 * 1024 * 1024)
+        assert rotax_207[0] == "warn", rotax_207
+        assert "zip" in rotax_207[1].lower() and "fusion" in rotax_207[1].lower()
+        assert cad_size_issue(201 * 1024 * 1024)[0] == "warn"
+        over, over_msg = cad_size_issue((MAX_CAD_UPLOAD_MB + 1) * 1024 * 1024)
+        assert over == "error"
+        assert "zip" in over_msg.lower() and "fusion" in over_msg.lower()
+        assert "maxUploadSize" in over_msg
+        assert "zip the STEP" in CAD_SIZE_ZIP_FALLBACK
+
+        cfg_text = (ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+        size_m = re.search(r"(?m)^\s*maxUploadSize\s*=\s*(\d+)\s*$", cfg_text)
+        assert size_m, "server.maxUploadSize missing from .streamlit/config.toml"
+        max_upload_mb = int(size_m.group(1))
+        assert max_upload_mb >= 250, max_upload_mb
+        assert MAX_CAD_UPLOAD_MB <= max_upload_mb
+        assert MAX_CAD_UPLOAD_MB >= 250
 
         assert looks_like_insufficient_scope(
             403,
@@ -1215,6 +1233,27 @@ def main() -> int:
             assert any("CAD" in (u.label or "") for u in at_cad.file_uploader), [
                 u.label for u in at_cad.file_uploader
             ]
+            from src.aps_viewer import MAX_CAD_UPLOAD_MB
+
+            cad_help = " ".join(str(getattr(u, "help", "") or "") for u in at_cad.file_uploader)
+            cad_caps = ""
+            try:
+                cad_caps = " ".join(
+                    str(getattr(c, "value", "") or "") for c in at_cad.caption
+                )
+            except Exception:
+                pass
+            cad_md = ""
+            try:
+                cad_md = " ".join(
+                    str(getattr(m, "body", None) or getattr(m, "value", "") or "")
+                    for m in at_cad.markdown
+                )
+            except Exception:
+                pass
+            cad_copy = f"{cad_help} {cad_caps} {cad_md}"
+            assert str(MAX_CAD_UPLOAD_MB) in cad_copy, cad_copy[:500]
+            assert "zip" in cad_copy.lower(), cad_copy[:500]
             assert any(b.label == "Translate to SVF / get URN" for b in at_cad.button)
             assert any(b.label == "Save URN for this pack" for b in at_cad.button)
             assert any(b.label == "Delete saved URN" for b in at_cad.button)

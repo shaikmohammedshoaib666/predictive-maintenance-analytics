@@ -85,9 +85,11 @@ from src.insights_engine import (
 )
 from src.aps_viewer import (
     APS_SAMPLE_CAD_URL,
+    CAD_SIZE_ZIP_FALLBACK,
     CAD_UPLOAD_EXTENSIONS,
     DEFAULT_VIEWER_HEIGHT,
     INSUFFICIENT_SCOPE_HINT,
+    MAX_CAD_UPLOAD_MB,
     PUBLIC_VIEWER_NO_URN_WARNING,
     PUBLIC_VIEWER_WARNING,
     aps_available,
@@ -1587,7 +1589,10 @@ def page_cad_twin():
             "(optional `APS_MODEL_URN` if you already have a translated model — that env var is the "
             "override that survives Render redeploys).\n"
             "3. **Generate a URN here:** choose a CAD file → **Translate to SVF / get URN**. "
-            "That puts the model in **your** OSS bucket. We then save that URN for this pack "
+            "That puts the model in **your** OSS bucket (using `APS_CLIENT_ID` / `APS_CLIENT_SECRET` on Render). "
+            "viewer.autodesk.com is Autodesk’s public website — it does **not** put the file in your bucket; "
+            "there is no “move from viewer to my bucket” button. "
+            "We then save that URN for this pack "
             f"({pack['short']}) in a JSON file on this server.\n"
             "4. Pasting a [viewer.autodesk.com](https://viewer.autodesk.com) link only extracts the "
             "`dXJu…` URN. It will **not** load with your app token unless that object is in your bucket. "
@@ -1611,16 +1616,23 @@ def page_cad_twin():
             type=list(CAD_UPLOAD_EXTENSIONS),
             key="aps_cad_file_uploader",
             help=(
+                f"Up to {MAX_CAD_UPLOAD_MB} MB (Streamlit maxUploadSize). "
                 "Common Model Derivative inputs (Revit, Fusion, IFC, Inventor, SolidWorks, STEP, "
-                "Navisworks, DWG, OBJ/STL, ZIP assemblies, …). Exotic kernels can still fail on Autodesk."
+                "Navisworks, DWG, OBJ/STL, ZIP assemblies, …). Exotic kernels can still fail on Autodesk. "
+                f"If a ~200 MB STEP still fails, {CAD_SIZE_ZIP_FALLBACK}"
             ),
+        )
+        st.caption(
+            f"Upload limit is **{MAX_CAD_UPLOAD_MB} MB**. A 207 MB STEP should fit. "
+            f"If the browser or Render still rejects it, {CAD_SIZE_ZIP_FALLBACK} "
+            "For a zipped STEP, enter the `.step` / `.stp` filename as ZIP root."
         )
         root_filename = ""
         if cad_file is not None and str(cad_file.name or "").lower().endswith(".zip"):
             root_filename = st.text_input(
-                "ZIP root filename (required for assemblies)",
+                "ZIP root filename (required for assemblies / zipped STEP)",
                 key="aps_zip_root_filename",
-                help="Example: assembly.iam — the file inside the zip Model Derivative should open.",
+                help="Example: Rotax.step or assembly.iam — the file inside the zip Model Derivative should open.",
             )
         if cad_file is not None:
             kind, size_msg = cad_size_issue(getattr(cad_file, "size", 0) or 0)

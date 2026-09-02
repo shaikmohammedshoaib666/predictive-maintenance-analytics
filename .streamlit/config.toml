@@ -11,6 +11,8 @@ font = "sans serif"
 [server]
 headless = true
 enableXsrfProtection = true
+# Default is 200 MB. A 207 MB Rotax STEP must be able to upload.
+maxUploadSize = 300
 
 [browser]
 gatherUsageStats = false
