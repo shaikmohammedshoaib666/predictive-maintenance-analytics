@@ -107,10 +107,9 @@ CAD_SIZE_ZIP_FALLBACK = (
 )
 
 # Autodesk requires input.rootFilename when input.compressedUrn is true.
-ZIP_CAD_ROOT_EXTENSIONS: tuple[str, ...] = (
-    ".step",
-    ".stp",
-    ".stpz",
+# Prefer STEP/stp when scanning zip members (this product's Rotax CAD path).
+ZIP_STEP_ROOT_EXTENSIONS: tuple[str, ...] = (".step", ".stp", ".stpz")
+ZIP_CAD_ROOT_EXTENSIONS: tuple[str, ...] = ZIP_STEP_ROOT_EXTENSIONS + (
     ".rvt",
     ".ifc",
     ".ipt",
@@ -121,7 +120,8 @@ ZIP_CAD_ROOT_EXTENSIONS: tuple[str, ...] = (
 )
 ZIP_CAD_ROOT_HINTS: tuple[str, ...] = ("step", "stp", "rotax", "engine")
 ZIP_ROOT_MISSING_MSG = (
-    "Open the zip and type the .STEP filename into ZIP root filename."
+    "Could not detect a .STEP/.stp inside this zip (ignored __MACOSX), and the "
+    "upload name is not like Engine.STEP.zip so rootFilename cannot be inferred."
 )
 
 # OSS signed-upload: at most 25 URLs per GET.
@@ -710,50 +710,99 @@ def _zip_member_is_cad(name: str) -> bool:
     return any(lower.endswith(ext) for ext in ZIP_CAD_ROOT_EXTENSIONS)
 
 
+def _zip_member_is_step(name: str) -> bool:
+    if _is_ignored_zip_member(name):
+        return False
+    lower = _zip_member_norm(name).lower()
+    return any(lower.endswith(ext) for ext in ZIP_STEP_ROOT_EXTENSIONS)
+
+
 def _zip_name_has_hint(name: str) -> bool:
     lower = _zip_member_norm(name).lower()
     base = _zip_member_basename(lower)
     return any(hint in base for hint in ZIP_CAD_ROOT_HINTS)
 
 
+def _zip_member_size(zf: zipfile.ZipFile, member: str) -> int:
+    try:
+        return int(zf.getinfo(member).file_size or 0)
+    except KeyError:
+        want = _zip_member_norm(member)
+        for info in zf.infolist():
+            if _zip_member_norm(info.filename) == want:
+                return int(info.file_size or 0)
+    except Exception:
+        return 0
+    return 0
+
+
 def pick_zip_cad_root(data: bytes) -> str:
     """Pick Autodesk ``rootFilename`` from zip/ifczip bytes. Empty if none.
 
-    Prefers ``ZIP_CAD_ROOT_EXTENSIONS``. One match → that member. Many matches →
-    names containing step/stp/rotax/engine, else the largest member.
+    Uses ``ZipFile.namelist()``. Ignores ``__MACOSX`` / AppleDouble / folder
+    entries. Prefers ``.STEP`` / ``.stp`` / ``.stpz``. One match → that member.
+    Many matches → names containing step/stp/rotax/engine, else the largest.
     """
     if not data:
         return ""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             candidates: list[tuple[str, int]] = []
-            for info in zf.infolist():
-                raw = _zip_member_norm(info.filename)
-                if info.is_dir() or not _zip_member_is_cad(raw):
+            for raw_name in zf.namelist():
+                raw = _zip_member_norm(raw_name)
+                if not _zip_member_is_cad(raw):
                     continue
-                candidates.append((raw, int(info.file_size or 0)))
+                candidates.append((raw, _zip_member_size(zf, raw_name)))
     except zipfile.BadZipFile:
         return ""
     except Exception:
         return ""
     if not candidates:
         return ""
-    if len(candidates) == 1:
-        return candidates[0][0]
-    hinted = [c for c in candidates if _zip_name_has_hint(c[0])]
-    pool = hinted or candidates
-    pool.sort(key=lambda c: (c[1], len(c[0])), reverse=True)
-    return pool[0][0]
+    step_like = [c for c in candidates if _zip_member_is_step(c[0])]
+    pool = step_like or candidates
+    if len(pool) == 1:
+        return pool[0][0]
+    hinted = [c for c in pool if _zip_name_has_hint(c[0])]
+    ranked = hinted or pool
+    ranked.sort(key=lambda c: (c[1], len(c[0])), reverse=True)
+    return ranked[0][0]
+
+
+def guess_zip_root_from_upload_name(filename: str) -> str:
+    """If the upload is ``Something.STEP.zip`` / ``Something.stp.zip``, return that STEP name.
+
+    Does not open the archive. ``*.ifczip`` is a different Autodesk container and
+    is not treated as ``*.ifc.zip``. Empty if the stem is not a CAD root.
+    """
+    base = os.path.basename((filename or "").replace("\\", "/"))
+    if not base:
+        return ""
+    lower = base.lower()
+    if lower.endswith(".ifczip"):
+        return ""
+    if not lower.endswith(".zip"):
+        return ""
+    stem = base[:-4]
+    stem_lower = stem.lower()
+    for ext in ZIP_CAD_ROOT_EXTENSIONS:
+        if stem_lower.endswith(ext):
+            return stem
+    return ""
 
 
 def resolve_zip_root_filename(filename: str, data: bytes, root_filename: str = "") -> str:
-    """Use an explicit root, else inspect the zip. Empty means Autodesk would 400."""
+    """Root Autodesk must receive for a zip. Empty means we must not send compressedUrn.
+
+    Order: explicit widget value → zip namelist (.STEP/.stp, ignore __MACOSX) →
+    upload name ``Something.STEP.zip`` / ``Something.stp.zip``.
+    """
     given = (root_filename or "").strip()
     if given:
         return given
     if not is_cad_zip_name(filename):
         return ""
-    return pick_zip_cad_root(data)
+    return pick_zip_cad_root(data) or guess_zip_root_from_upload_name(filename)
 
 
 def cad_size_issue(n_bytes: int) -> tuple[Optional[str], str]:
@@ -1058,11 +1107,14 @@ def start_svf_job(
     requests = http or _http()
     input_spec: dict[str, Any] = {"urn": model_urn}
     root = (root_filename or "").strip()
+    # Never send compressedUrn without a non-empty rootFilename (Autodesk 400).
     if compressed or root:
         if not root:
             raise ValueError(ZIP_ROOT_MISSING_MSG)
         input_spec["compressedUrn"] = True
         input_spec["rootFilename"] = root
+    if input_spec.get("compressedUrn") and not str(input_spec.get("rootFilename") or "").strip():
+        raise ValueError(ZIP_ROOT_MISSING_MSG)
     headers = {
         **_auth_headers(token),
         "Content-Type": "application/json; charset=utf-8",
@@ -1178,7 +1230,7 @@ def translate_cad_bytes(
     cid = _aps_setting("APS_CLIENT_ID")
     bucket = oss_bucket_key(cid)
     object_key = sanitize_object_name(filename)
-    compressed = bool(root) or is_cad_zip_name(filename)
+    compressed = bool(root)
     try:
         _note("auth", "Requesting APS token (translate scopes)…")
         token_payload = get_access_token(TRANSLATE_SCOPES, http=http)

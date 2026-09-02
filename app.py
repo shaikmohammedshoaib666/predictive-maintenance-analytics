@@ -103,6 +103,7 @@ from src.aps_viewer import (
     is_cad_zip_name,
     looks_like_public_viewer,
     normalize_model_urn,
+    guess_zip_root_from_upload_name,
     pick_zip_cad_root,
     resolve_cad_urn,
     resolve_zip_root_filename,
@@ -287,12 +288,19 @@ def register_table(name: str, df: pd.DataFrame):
 # Widget-bound. Never assign st.session_state.industry_pack after the sidebar
 # selectbox exists — Streamlit raises StreamlitAPIException even for the same value.
 PENDING_INDUSTRY_PACK = "_pending_industry_pack"
+PENDING_ZIP_ROOT = "_pending_aps_zip_root_filename"
 
 # Functions allowed to write widget-bound keys because they run before those widgets.
 # init_session_state / apply_pending_industry_pack: top of main() before the sidebar.
 # _seed_cad_urn_widgets: top of page_cad_twin before key="aps_urn_input".
+# _seed_zip_root_widget: top of page_cad_twin before key="aps_zip_root_filename".
 PRE_WIDGET_SESSION_FUNCS = frozenset(
-    {"init_session_state", "apply_pending_industry_pack", "_seed_cad_urn_widgets"}
+    {
+        "init_session_state",
+        "apply_pending_industry_pack",
+        "_seed_cad_urn_widgets",
+        "_seed_zip_root_widget",
+    }
 )
 
 
@@ -1525,6 +1533,43 @@ def _seed_cad_urn_widgets(pack_id: str) -> dict:
     return resolved
 
 
+def _seed_zip_root_widget() -> None:
+    """Prefill ZIP rootFilename BEFORE the text_input widget exists this run.
+
+    Streamlit forbids writing ``aps_zip_root_filename`` after ``st.text_input``
+    with that key. Apply a pending value first, then infer from the already
+    uploaded zip (namelist .STEP/.stp, else ``Something.STEP.zip``).
+    """
+    pending = str(st.session_state.pop(PENDING_ZIP_ROOT, None) or "").strip()
+    uploaded = st.session_state.get("aps_cad_file_uploader")
+    auto = ""
+    sig = ""
+    if uploaded is not None:
+        name = str(getattr(uploaded, "name", "") or "")
+        if is_cad_zip_name(name):
+            try:
+                data = uploaded.getvalue()
+            except Exception:
+                data = b""
+            auto = resolve_zip_root_filename(name, data, "")
+            sig = f"{name}:{len(data)}"
+    # A queued name is only for the current zip. A new file must not keep the old STEP name.
+    if sig and st.session_state.get("aps_zip_root_sig") != sig:
+        chosen = auto
+    else:
+        chosen = pending or auto
+    if not chosen:
+        return
+    current = str(st.session_state.get("aps_zip_root_filename") or "").strip()
+    if sig and st.session_state.get("aps_zip_root_sig") != sig:
+        st.session_state.aps_zip_root_sig = sig
+        st.session_state.aps_zip_root_filename = chosen
+    elif not current:
+        st.session_state.aps_zip_root_filename = chosen
+        if sig:
+            st.session_state.aps_zip_root_sig = sig
+
+
 def _persist_pack_urn(pack_id: str, urn: str, *, source: str, public_viewer: bool) -> dict:
     result = save_urn_for_pack(pack_id, urn, source=source, public_viewer=public_viewer)
     st.session_state.aps_save_log = result
@@ -1573,6 +1618,7 @@ def page_cad_twin():
 
     ok, msg = aps_available()
     _seed_cad_urn_widgets(pack_id)
+    _seed_zip_root_widget()
     status = cad_slot_status(st.session_state.get("aps_urn") or "", pack_id=pack_id)
     env_urn = normalize_model_urn(aps_model_urn())
 
@@ -1630,30 +1676,37 @@ def page_cad_twin():
         st.caption(
             f"Upload limit is **{MAX_CAD_UPLOAD_MB} MB**. A 207 MB STEP should fit. "
             f"If the browser or Render still rejects it, {CAD_SIZE_ZIP_FALLBACK} "
-            "Zipped STEP: ZIP root auto-fills from the `.step` / `.stp` inside the archive."
+            "Zipped STEP: ZIP root auto-fills from the `.step` / `.stp` inside the archive "
+            "(or from a name like `Engine Rotax 912 ULS.STEP.zip`). You do not type it."
         )
         root_filename = ""
         cad_name = str(cad_file.name or "") if cad_file is not None else ""
         if cad_file is not None and is_cad_zip_name(cad_name):
             zip_bytes = cad_file.getvalue()
-            auto_root = pick_zip_cad_root(zip_bytes)
+            auto_root = pick_zip_cad_root(zip_bytes) or guess_zip_root_from_upload_name(cad_name)
             zip_sig = f"{cad_name}:{len(zip_bytes)}"
             # Prefill BEFORE the widget exists — Streamlit forbids writing the key after.
+            # Pending key is applied at the top of this page via _seed_zip_root_widget.
             if st.session_state.get("aps_zip_root_sig") != zip_sig:
                 st.session_state.aps_zip_root_sig = zip_sig
-                st.session_state.aps_zip_root_filename = auto_root
+                if auto_root:
+                    st.session_state[PENDING_ZIP_ROOT] = auto_root
+                    st.session_state.aps_zip_root_filename = auto_root
             elif auto_root and not str(st.session_state.get("aps_zip_root_filename") or "").strip():
+                st.session_state[PENDING_ZIP_ROOT] = auto_root
                 st.session_state.aps_zip_root_filename = auto_root
             if auto_root:
                 st.caption(f"Detected ZIP root: `{auto_root}`")
             else:
                 st.warning(ZIP_ROOT_MISSING_MSG)
             root_filename = st.text_input(
-                "ZIP root filename (required for assemblies / zipped STEP)",
+                "ZIP root filename (auto-filled for zipped STEP — leave as-is)",
                 key="aps_zip_root_filename",
                 help=(
-                    "Example: Rotax.step or assembly.iam — the file inside the zip "
-                    "Model Derivative should open. Auto-filled when a CAD member is found."
+                    "The file inside the zip Model Derivative should open "
+                    "(e.g. Engine Rotax 912 ULS.STEP). Auto-filled from the archive "
+                    "or from a name like Something.STEP.zip. Translate still infers "
+                    "this if the box is empty."
                 ),
             )
         if cad_file is not None:

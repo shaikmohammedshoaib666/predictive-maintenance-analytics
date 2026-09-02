@@ -694,6 +694,7 @@ def main() -> int:
 
         from src.aps_viewer import (
             ZIP_ROOT_MISSING_MSG,
+            guess_zip_root_from_upload_name,
             is_cad_zip_name,
             pick_zip_cad_root,
             resolve_zip_root_filename,
@@ -739,11 +740,47 @@ def main() -> int:
         upper = _zip_bytes({"ROTAX.STEP": b"ISO-10303-21;"})
         assert pick_zip_cad_root(upper) == "ROTAX.STEP"
 
+        macos_only = _zip_bytes(
+            {
+                "__MACOSX/._Engine Rotax 912 ULS.STEP": b"junk",
+                "__MACOSX/Engine Rotax 912 ULS.STEP": b"junk",
+            }
+        )
+        assert pick_zip_cad_root(macos_only) == ""
+
+        rotax_inner = "Engine Rotax 912 ULS.STEP"
+        rotax_upload = "Engine Rotax 912 ULS.STEP.zip"
+        rotax_zip = _zip_bytes({rotax_inner: b"ISO-10303-21;"})
+        assert pick_zip_cad_root(rotax_zip) == rotax_inner
+        assert resolve_zip_root_filename(rotax_upload, rotax_zip, "") == rotax_inner
+        assert resolve_zip_root_filename(rotax_upload, rotax_zip, "   ") == rotax_inner
+        rotax_with_macos = _zip_bytes(
+            {rotax_inner: b"ISO-10303-21;", "__MACOSX/._" + rotax_inner: b"junk"}
+        )
+        assert pick_zip_cad_root(rotax_with_macos) == rotax_inner
+
+        # Filename-only fallback: do not open zip (empty / invalid bytes).
+        assert guess_zip_root_from_upload_name(rotax_upload) == rotax_inner
+        assert guess_zip_root_from_upload_name("Something.stp.zip") == "Something.stp"
+        assert guess_zip_root_from_upload_name("Something.STEP.zip") == "Something.STEP"
+        assert guess_zip_root_from_upload_name("Something.stp.ZIP") == "Something.stp"
+        assert guess_zip_root_from_upload_name("folder/Engine Rotax 912 ULS.STEP.zip") == rotax_inner
+        assert guess_zip_root_from_upload_name("nope.zip") == ""
+        assert guess_zip_root_from_upload_name("Rotax.step") == ""
+        assert guess_zip_root_from_upload_name("pack.ifczip") == ""
+        assert resolve_zip_root_filename(rotax_upload, b"", "") == rotax_inner
+        assert resolve_zip_root_filename(rotax_upload, b"not-a-zip", "") == rotax_inner
+        assert resolve_zip_root_filename(rotax_upload, macos_only, "") == rotax_inner
+
         app_src = (ROOT / "app.py").read_text(encoding="utf-8")
         assert "pick_zip_cad_root" in app_src
+        assert "guess_zip_root_from_upload_name" in app_src
         assert "ZIP_ROOT_MISSING_MSG" in app_src
         assert "resolve_zip_root_filename" in app_src
         assert "Detected ZIP root" in app_src
+        assert "_seed_zip_root_widget" in app_src
+        assert "PENDING_ZIP_ROOT" in app_src
+        assert "_pending_aps_zip_root_filename" in app_src
 
         try:
             start_svf_job("tok", "dXJuOmFi", compressed=True, root_filename="")
@@ -783,9 +820,11 @@ def main() -> int:
                 return self._json
 
         class FakeZipAPS:
-            def __init__(self):
+            def __init__(self, expected_root: str, expected_data: bytes):
                 self.calls: list = []
                 self.job_input: dict = {}
+                self.expected_root = expected_root
+                self.expected_data = expected_data
 
             def post(self, url, **kw):
                 self.calls.append(("POST", url, kw))
@@ -805,7 +844,8 @@ def main() -> int:
                     body = kw.get("json") or {}
                     self.job_input = dict(body.get("input") or {})
                     assert self.job_input.get("compressedUrn") is True
-                    assert self.job_input.get("rootFilename") == "Rotax.step"
+                    assert self.job_input.get("rootFilename") == self.expected_root
+                    assert str(self.job_input.get("rootFilename") or "").strip()
                     return _Resp(201, {"result": "success", "urn": self.job_input.get("urn")})
                 return _Resp(500, {"developerMessage": "unexpected POST " + url})
 
@@ -822,17 +862,14 @@ def main() -> int:
             def put(self, url, **kw):
                 self.calls.append(("PUT", url, kw))
                 assert url.startswith("https://s3.example.test/")
-                assert kw.get("data") == one
+                assert kw.get("data") == self.expected_data
                 return _Resp(200, text="")
 
-        prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
-        os.environ["APS_CLIENT_ID"] = "TestClientID99"
-        os.environ["APS_CLIENT_SECRET"] = "not-a-real-secret"
-        try:
-            http = FakeZipAPS()
+        def _run_zip_translate(upload_name: str, payload: bytes, expected_root: str) -> None:
+            http = FakeZipAPS(expected_root, payload)
             result = translate_cad_bytes(
-                "rotax.zip",
-                one,
+                upload_name,
+                payload,
                 root_filename="",
                 http=http,
                 sleep=lambda _s: None,
@@ -840,12 +877,23 @@ def main() -> int:
                 poll_interval_s=0.01,
             )
             assert result["ok"] is True, result
-            assert http.job_input.get("rootFilename") == "Rotax.step"
+            assert http.job_input.get("rootFilename") == expected_root
             assert http.job_input.get("compressedUrn") is True
             assert not any(
-                c[0] == "POST" and c[1].endswith("/job") and not (c[2].get("json") or {}).get("input", {}).get("rootFilename")
+                c[0] == "POST"
+                and c[1].endswith("/job")
+                and not str((c[2].get("json") or {}).get("input", {}).get("rootFilename") or "").strip()
                 for c in http.calls
             )
+
+        prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
+        os.environ["APS_CLIENT_ID"] = "TestClientID99"
+        os.environ["APS_CLIENT_SECRET"] = "not-a-real-secret"
+        try:
+            _run_zip_translate("rotax.zip", one, "Rotax.step")
+            _run_zip_translate(rotax_upload, rotax_zip, rotax_inner)
+            # Scan misses (__MACOSX only); filename `Something.STEP.zip` still supplies root.
+            _run_zip_translate(rotax_upload, macos_only, rotax_inner)
         finally:
             if prev_id is None:
                 os.environ.pop("APS_CLIENT_ID", None)
@@ -1342,6 +1390,7 @@ def main() -> int:
         assert "apply_pending_industry_pack" in safe
         assert "init_session_state" in safe
         assert "_seed_cad_urn_widgets" in safe
+        assert "_seed_zip_root_widget" in safe
 
         main_fn = _fn_named(tree, "main")
         assert main_fn is not None
