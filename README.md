@@ -73,7 +73,7 @@ Maintenance attach: on *Upload & Clean* you can attach a work-order / PM CSV as 
 
 - **Offline 3D twin** — three.js + OrbitControls are vendored in `src/vendor/three` and inlined, so the *3D Twin* renders with **no internet/CDN**. The mesh follows the **industry pack** (sidebar).
 - **Real live sources** — *Live Connect* adds **MQTT** and **OPC-UA** sources (alongside the simulator and CSV polling). MQTT expects JSON sensor payloads; OPC-UA reads a set of node IDs each poll. Requires `paho-mqtt` / `asyncua` (both in `requirements.txt`).
-- **CAD Twin (Autodesk APS)** — *CAD Twin* page + dashboard CAD tile. Availability-gated at **runtime**: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional `APS_MODEL_URN`) on Render after deploy and reload — no code change. Until then the 3D twin is the credential-free mesh.
+- **CAD Twin (Autodesk APS)** — *CAD Twin* page + dashboard CAD tile. Availability-gated at **runtime**: set `APS_CLIENT_ID` + `APS_CLIENT_SECRET` on Render after deploy and reload — no code change. With credentials, choose a CAD file on *CAD Twin*, **Translate to SVF / get URN**, then **Load CAD model** (or paste / set `APS_MODEL_URN`). The APS app must allow Model Derivative + Data Management; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Until then the 3D twin is the credential-free mesh.
 
 ---
 

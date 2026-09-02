@@ -327,7 +327,26 @@ def main() -> int:
 
     def test_aps_viewer() -> None:
         # Upgrade 3 — APS gate never raises; viewer HTML builder is pure (no network).
-        from src.aps_viewer import aps_available, aps_model_urn, build_viewer_html
+        import base64
+        import re
+        from datetime import datetime, timezone
+
+        from src.aps_viewer import (
+            INSUFFICIENT_SCOPE_HINT,
+            TRANSLATE_SCOPES,
+            aps_available,
+            aps_model_urn,
+            build_viewer_html,
+            cad_size_issue,
+            encode_model_urn,
+            encode_oss_urn,
+            format_aps_error,
+            looks_like_insufficient_scope,
+            normalize_model_urn,
+            oss_bucket_key,
+            oss_object_id,
+            sanitize_object_name,
+        )
 
         ok, msg = aps_available()
         assert isinstance(ok, bool) and isinstance(msg, str)
@@ -336,6 +355,164 @@ def main() -> int:
         assert "TOKEN123" in html and "dXJuOmFkc2sx" in html and "GuiViewer3D" in html
         assert "__TOKEN__" not in html and "__URN__" not in html
         assert "Unknown" in build_viewer_html("t", "u", asset="a", risk="bogus")
+
+        assert oss_bucket_key("AbC-123_XYZ") == "pdm-abc123xyz-cad"
+        assert oss_bucket_key("") == "pdm-app-cad"
+        long_key = oss_bucket_key("Z" * 200)
+        assert long_key.startswith("pdm-") and long_key.endswith("-cad")
+        assert long_key == long_key.lower() and 3 <= len(long_key) <= 128
+        assert re.fullmatch(r"[a-z0-9._-]+", long_key)
+
+        when = datetime(2026, 9, 2, 12, 0, 0, tzinfo=timezone.utc)
+        assert sanitize_object_name("../../My Model.RVT", when) == "20260902120000_My_Model.RVT"
+        assert sanitize_object_name("/etc/passwd", when) == "20260902120000_passwd"
+        assert sanitize_object_name("", when).endswith("_model")
+
+        oid = oss_object_id("pdm-abc-cad", "20260902_box.ipt")
+        urn = encode_model_urn(oid)
+        assert urn == encode_oss_urn("pdm-abc-cad", "20260902_box.ipt")
+        assert not urn.startswith("urn:")
+        assert ":" not in urn
+        pad = "=" * ((4 - len(urn) % 4) % 4)
+        assert base64.urlsafe_b64decode(urn + pad).decode() == oid
+        assert normalize_model_urn(" urn:dXJuOmFi ") == "dXJuOmFi"
+        assert normalize_model_urn(oid) == urn
+        html2 = build_viewer_html("t", "urn:" + urn, asset="a", risk="Low")
+        assert f'URN="{urn}"' in html2
+
+        assert cad_size_issue(0)[0] == "error"
+        assert cad_size_issue(1024)[0] is None
+        assert cad_size_issue(90 * 1024 * 1024)[0] == "warn"
+        assert cad_size_issue(201 * 1024 * 1024)[0] == "error"
+
+        assert looks_like_insufficient_scope(
+            403,
+            '{"errorCode":"AUTH-010","developerMessage":"The access token does not have the required privileges"}',
+        )
+        assert INSUFFICIENT_SCOPE_HINT in format_aps_error(401, "insufficient scope")
+        assert "data:write" in TRANSLATE_SCOPES and "bucket:create" in TRANSLATE_SCOPES
+        assert "viewables:read" in TRANSLATE_SCOPES
+
+    def test_aps_translate_mocked() -> None:
+        """OSS signed-upload + MD job + poll — mocked HTTP only. Never hits Autodesk."""
+        import json as _json
+
+        from src.aps_viewer import INSUFFICIENT_SCOPE_HINT, TRANSLATE_SCOPES, translate_cad_bytes
+
+        class _Resp:
+            def __init__(self, status_code, json_data=None, text=""):
+                self.status_code = status_code
+                self._json = json_data
+                self.text = text if text else (_json.dumps(json_data) if json_data is not None else "")
+                self.content = self.text.encode() if self.text else b""
+
+            def json(self):
+                if self._json is None:
+                    raise ValueError("no json")
+                return self._json
+
+        class FakeAPS:
+            def __init__(self):
+                self.calls: list[tuple[str, str, dict]] = []
+                self.manifest_n = 0
+
+            def post(self, url, **kw):
+                self.calls.append(("POST", url, kw))
+                if "authentication" in url:
+                    return _Resp(200, {"access_token": "tok", "expires_in": 3600})
+                if url.rstrip("/").endswith("/oss/v2/buckets"):
+                    return _Resp(200, {"bucketKey": (kw.get("json") or {}).get("bucketKey")})
+                if url.endswith("/signeds3upload"):
+                    return _Resp(
+                        200,
+                        {
+                            "objectId": "urn:adsk.objects:os.object:pdm-testclientid9-cad/obj.ipt",
+                            "objectKey": "obj.ipt",
+                        },
+                    )
+                if url.endswith("/job"):
+                    body = kw.get("json") or {}
+                    assert body.get("input", {}).get("urn")
+                    fmt = (body.get("output") or {}).get("formats") or [{}]
+                    assert fmt[0].get("type") in ("svf2", "svf")
+                    return _Resp(201, {"result": "success", "urn": body["input"]["urn"]})
+                return _Resp(500, {"developerMessage": "unexpected POST " + url})
+
+            def get(self, url, **kw):
+                self.calls.append(("GET", url, kw))
+                if url.endswith("/details"):
+                    return _Resp(404, {"developerMessage": "not found"})
+                if "signeds3upload" in url:
+                    return _Resp(200, {"uploadKey": "uk", "urls": ["https://s3.example.test/p1"]})
+                if "/manifest" in url:
+                    self.manifest_n += 1
+                    if self.manifest_n < 2:
+                        return _Resp(200, {"status": "inprogress", "progress": "45%"})
+                    return _Resp(200, {"status": "success", "progress": "complete"})
+                return _Resp(500, {"developerMessage": "unexpected GET " + url})
+
+            def put(self, url, **kw):
+                self.calls.append(("PUT", url, kw))
+                assert url.startswith("https://s3.example.test/")
+                assert kw.get("data") == b"tiny-cad-bytes"
+                return _Resp(200, text="")
+
+        class ScopeDenied:
+            def post(self, url, **kw):
+                return _Resp(
+                    401,
+                    {
+                        "errorCode": "AUTH-010",
+                        "developerMessage": "The access token does not have the required privileges",
+                    },
+                )
+
+            def get(self, url, **kw):
+                raise AssertionError("scope-denied token must not continue to OSS")
+
+            def put(self, url, **kw):
+                raise AssertionError("scope-denied token must not PUT S3")
+
+        prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
+        os.environ["APS_CLIENT_ID"] = "TestClientID99"
+        os.environ["APS_CLIENT_SECRET"] = "not-a-real-secret"
+        try:
+            http = FakeAPS()
+            sleeps: list[float] = []
+            result = translate_cad_bytes(
+                "box.ipt",
+                b"tiny-cad-bytes",
+                http=http,
+                sleep=sleeps.append,
+                poll_timeout_s=20,
+                poll_interval_s=0.01,
+            )
+            assert result["ok"] is True, result
+            assert result["phase"] == "success"
+            assert result["urn"] and not result["urn"].startswith("urn:")
+            assert result["bucket"] == "pdm-testclientid-cad"
+            token_post = next(c for c in http.calls if c[0] == "POST" and "authentication" in c[1])
+            assert TRANSLATE_SCOPES == token_post[2]["data"]["scope"]
+            assert any(c[0] == "PUT" for c in http.calls)
+            assert any(c[0] == "POST" and c[1].endswith("/job") for c in http.calls)
+            assert sleeps, "manifest poll should sleep between attempts"
+            assert not any("aps.autodesk.com" in (c[1] or "") and c[0] == "PUT" for c in http.calls)
+
+            denied = translate_cad_bytes("a.ipt", b"x", http=ScopeDenied(), sleep=lambda _s: None)
+            assert denied["ok"] is False
+            assert INSUFFICIENT_SCOPE_HINT in denied["message"]
+
+            empty = translate_cad_bytes("a.ipt", b"", http=FakeAPS(), sleep=lambda _s: None)
+            assert empty["ok"] is False and "empty" in empty["message"].lower()
+        finally:
+            if prev_id is None:
+                os.environ.pop("APS_CLIENT_ID", None)
+            else:
+                os.environ["APS_CLIENT_ID"] = prev_id
+            if prev_sec is None:
+                os.environ.pop("APS_CLIENT_SECRET", None)
+            else:
+                os.environ["APS_CLIENT_SECRET"] = prev_sec
 
     def test_charts() -> None:
         cleaned, _, _ = clean_and_quality(sample.head(400), run_quality=False)
@@ -893,6 +1070,33 @@ def main() -> int:
         next(b for b in at3.button if b.label == "Suggest pack from columns").click().run()
         assert not _errs(at3), "Suggest pack: " + "; ".join(_errs(at3))
 
+        prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
+        os.environ["APS_CLIENT_ID"] = "UiTestClientId"
+        os.environ["APS_CLIENT_SECRET"] = "ui-test-secret-not-real"
+        try:
+            at_cad = AppTest.from_file(app_path, default_timeout=45)
+            at_cad.run()
+            assert not _errs(at_cad), "CAD page initial: " + "; ".join(_errs(at_cad))
+            radio = next(r for r in at_cad.radio if "Pipeline" in (r.label or ""))
+            radio.set_value("CAD Twin (APS)").run()
+            assert not _errs(at_cad), "CAD Twin nav: " + "; ".join(_errs(at_cad))
+            assert any("CAD" in (u.label or "") for u in at_cad.file_uploader), [
+                u.label for u in at_cad.file_uploader
+            ]
+            assert any(b.label == "Translate to SVF / get URN" for b in at_cad.button)
+            assert any("URN" in (t.label or "") for t in at_cad.text_input)
+            next(b for b in at_cad.button if b.label == "Translate to SVF / get URN").click().run()
+            assert not _errs(at_cad), "Translate with no file: " + "; ".join(_errs(at_cad))
+        finally:
+            if prev_id is None:
+                os.environ.pop("APS_CLIENT_ID", None)
+            else:
+                os.environ["APS_CLIENT_ID"] = prev_id
+            if prev_sec is None:
+                os.environ.pop("APS_CLIENT_SECRET", None)
+            else:
+                os.environ["APS_CLIENT_SECRET"] = prev_sec
+
         csv_bytes = (ROOT / "sample_data" / "sensor_readings.csv").read_bytes()
         at4 = AppTest.from_file(app_path, default_timeout=45)
         at4.run()
@@ -913,6 +1117,7 @@ def main() -> int:
     check("live_sources", test_live_sources)
     check("polars_engine", test_polars_engine)
     check("aps_viewer", test_aps_viewer)
+    check("aps_translate_mocked", test_aps_translate_mocked)
     check("charts_layout", test_charts)
     check("industry_packs", test_industry_packs)
     check("pack_kpis_every_function", test_pack_kpis_every_function)

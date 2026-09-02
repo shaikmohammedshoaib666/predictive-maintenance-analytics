@@ -113,6 +113,8 @@ APS_CLIENT_SECRET=...
 APS_MODEL_URN=...
 ```
 
+`APS_MODEL_URN` is optional. On **CAD Twin**, with client id/secret set, choose a CAD file → **Translate to SVF / get URN** to generate it in the app (OSS signed upload + Model Derivative). The APS app needs **Model Derivative** + **Data Management**; the token needs `data:write`/`data:create` and `bucket:create`/`bucket:read` in addition to `viewables:read`. Copy the resulting base64 URN into `APS_MODEL_URN` if you want it on every dyno restart.
+
 **Local secrets (never commit):** copy to `.streamlit/secrets.toml` (this path is in `.gitignore`).
 
 ---

@@ -83,7 +83,18 @@ from src.insights_engine import (
     polish_brief_with_gemini,
     test_gemini_connection,
 )
-from src.aps_viewer import aps_available, aps_model_urn, build_viewer_html, get_access_token
+from src.aps_viewer import (
+    APS_SAMPLE_CAD_URL,
+    CAD_UPLOAD_EXTENSIONS,
+    INSUFFICIENT_SCOPE_HINT,
+    aps_available,
+    aps_model_urn,
+    build_viewer_html,
+    cad_size_issue,
+    get_access_token,
+    normalize_model_urn,
+    translate_cad_bytes,
+)
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
     AUTOMOTIVE_OEM_TRIM_EV_NOTE,
@@ -1477,6 +1488,10 @@ def page_cad_twin():
     env_urn = aps_model_urn()
     if not st.session_state.get("aps_urn") and env_urn:
         st.session_state.aps_urn = env_urn
+    if "aps_urn_input" not in st.session_state:
+        seed = st.session_state.get("aps_urn") or env_urn
+        if seed:
+            st.session_state.aps_urn_input = seed
 
     status = cad_slot_status(st.session_state.get("aps_urn") or "")
     if ok:
@@ -1487,14 +1502,98 @@ def page_cad_twin():
             "credential-free twin. Add `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional "
             "`APS_MODEL_URN`) on Render, reload, and this tile loads."
         )
-        with st.expander("How to enable after deploy", expanded=True):
-            st.markdown(
-                "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) → **Client ID** + **Client Secret**.\n"
-                "2. On Render → Environment, set `APS_CLIENT_ID`, `APS_CLIENT_SECRET`, optional `APS_MODEL_URN`.\n"
-                "3. Translate a CAD model to **SVF**, paste the base64 URN here if not in env.\n"
-                "4. Reload — dashboard CAD tile uses the same gate."
-            )
         st.caption(f"Status: {msg}")
+
+    with st.expander("How to generate a URN (APS app + this page)", expanded=not ok):
+        st.markdown(
+            "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) with "
+            "**Model Derivative** and **Data Management** APIs enabled. Copy **Client ID** + **Client Secret**.\n"
+            "2. On Render → Environment, set `APS_CLIENT_ID` and `APS_CLIENT_SECRET` "
+            "(optional `APS_MODEL_URN` if you already have a translated model).\n"
+            "3. **Generate a URN here:** choose a CAD file → **Translate to SVF / get URN** → "
+            "then **Load CAD model**. You can still paste a URN if you translated elsewhere.\n"
+            "4. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
+            "`bucket:read` in addition to `viewables:read`. Viewer-only tokens cannot upload.\n"
+            "5. Reload the dashboard — the CAD tile uses the same URN (session or `APS_MODEL_URN`)."
+        )
+        st.caption(INSUFFICIENT_SCOPE_HINT)
+        st.markdown(
+            f"Need a tiny test file? Autodesk’s Model Derivative tutorial includes a sample Inventor "
+            f"part (`box.ipt`): [prep a file for the viewer]({APS_SAMPLE_CAD_URL})."
+        )
+
+    if ok:
+        st.subheader("Choose CAD file → translate → URN")
+        cad_file = st.file_uploader(
+            "CAD file for Model Derivative",
+            type=list(CAD_UPLOAD_EXTENSIONS),
+            key="aps_cad_file_uploader",
+            help=(
+                "Common Model Derivative inputs (Revit, Fusion, IFC, Inventor, SolidWorks, STEP, "
+                "Navisworks, DWG, OBJ/STL, ZIP assemblies, …). Exotic kernels can still fail on Autodesk."
+            ),
+        )
+        root_filename = ""
+        if cad_file is not None and str(cad_file.name or "").lower().endswith(".zip"):
+            root_filename = st.text_input(
+                "ZIP root filename (required for assemblies)",
+                key="aps_zip_root_filename",
+                help="Example: assembly.iam — the file inside the zip Model Derivative should open.",
+            )
+        if cad_file is not None:
+            kind, size_msg = cad_size_issue(getattr(cad_file, "size", 0) or 0)
+            if kind == "error":
+                st.error(size_msg)
+            elif kind == "warn":
+                st.warning(size_msg)
+        if st.button("Translate to SVF / get URN", type="primary", key="aps_translate_btn"):
+            if cad_file is None:
+                st.warning("Choose a CAD file first.")
+            else:
+                payload = cad_file.getvalue()
+                kind, size_msg = cad_size_issue(len(payload))
+                if kind == "error":
+                    st.error(size_msg)
+                    st.session_state.aps_translate_log = {
+                        "ok": False,
+                        "phase": "error",
+                        "urn": "",
+                        "message": size_msg,
+                    }
+                else:
+                    with st.status("Translating CAD with Autodesk…", expanded=True) as box:
+                        def _on_status(phase: str, detail: str) -> None:
+                            st.write(f"**{phase}:** {detail}")
+
+                        result = translate_cad_bytes(
+                            cad_file.name or "model",
+                            payload,
+                            root_filename=root_filename,
+                            on_status=_on_status,
+                        )
+                        st.session_state.aps_translate_log = result
+                        if result.get("urn"):
+                            # Widget with key aps_urn_input is created below this button.
+                            st.session_state.aps_urn = result["urn"]
+                            st.session_state.aps_urn_input = result["urn"]
+                        if result.get("ok"):
+                            box.update(label="Translation succeeded", state="complete")
+                        elif result.get("phase") == "timeout":
+                            box.update(label="Still translating on Autodesk", state="running")
+                        else:
+                            box.update(label="Translation failed", state="error")
+
+        log = st.session_state.get("aps_translate_log") or {}
+        if log.get("message"):
+            phase = str(log.get("phase") or "")
+            if log.get("ok"):
+                st.success(log["message"])
+            elif phase == "timeout":
+                st.warning(log["message"])
+            else:
+                st.error(log["message"])
+                if INSUFFICIENT_SCOPE_HINT in str(log.get("message") or ""):
+                    st.info(INSUFFICIENT_SCOPE_HINT)
 
     states = asset_states_from_predictions(st.session_state.get("predictions") or []) or (
         st.session_state.get("live_asset_states") or []
@@ -1504,9 +1603,8 @@ def page_cad_twin():
     with c1:
         urn = st.text_input(
             "Translated model URN (base64)",
-            value=st.session_state.get("aps_urn", "") or env_urn,
             key="aps_urn_input",
-            help="Also accepted from env APS_MODEL_URN after Render deploy.",
+            help="Paste a URN, set APS_MODEL_URN on Render, or use Translate to SVF / get URN above.",
         )
         st.session_state.aps_urn = urn
     with c2:
@@ -1517,18 +1615,26 @@ def page_cad_twin():
         components.html(cad_placeholder_html(status=status, height=280), height=300)
         return
     if not (urn or "").strip():
-        st.warning("Paste a translated SVF model URN, or set APS_MODEL_URN on Render.")
+        st.warning(
+            "Choose a CAD file and click **Translate to SVF / get URN**, paste a translated "
+            "SVF URN, or set APS_MODEL_URN on Render."
+        )
         return
-    if st.button("Load CAD model", type="primary"):
+    if st.button("Load CAD model", type="primary", key="aps_load_cad_btn"):
         try:
             with st.spinner("Fetching APS token and loading model…"):
                 token = get_access_token()
                 html = build_viewer_html(
-                    token["access_token"], urn.strip(), asset=selected, risk=sel.get("risk_level", "Unknown")
+                    token["access_token"],
+                    normalize_model_urn(urn),
+                    asset=selected,
+                    risk=sel.get("risk_level", "Unknown"),
                 )
             components.html(html, height=620)
         except Exception as exc:
             st.error(f"APS error: {exc}")
+            if INSUFFICIENT_SCOPE_HINT in str(exc):
+                st.info(INSUFFICIENT_SCOPE_HINT)
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────

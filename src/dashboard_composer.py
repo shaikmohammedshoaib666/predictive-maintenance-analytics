@@ -42,23 +42,35 @@ def cad_slot_status(urn: str = "") -> dict[str, Any]:
         "urn": resolved,
         "ready": bool(ok and resolved),
         "message": msg,
-        "needs": [] if ok else ["APS_CLIENT_ID", "APS_CLIENT_SECRET"]
-        + ([] if resolved else ["APS_MODEL_URN or paste URN on CAD Twin"]),
+        "needs": (
+            (["APS_CLIENT_ID", "APS_CLIENT_SECRET"] if not ok else [])
+            + (
+                []
+                if resolved
+                else ["APS_MODEL_URN, upload CAD on CAD Twin, or paste a URN"]
+            )
+        ),
     }
 
 
 def cad_placeholder_html(*, status: dict[str, Any], height: int = 360) -> str:
     needs = ", ".join(status.get("needs") or ["APS_CLIENT_ID", "APS_CLIENT_SECRET"])
+    waiting = (
+        "Waiting for a translated URN"
+        if status.get("credentials")
+        else "Waiting for credentials (post-deploy)"
+    )
     return f"""
 <div style="height:{int(height)}px;border-radius:12px;background:#101822;color:#e8eef5;
      font-family:system-ui,Segoe UI,sans-serif;padding:24px;box-sizing:border-box">
   <div style="font-size:13px;opacity:.7;letter-spacing:.04em">CAD TWIN · AUTODESK APS</div>
-  <h3 style="margin:8px 0 12px">Waiting for credentials (post-deploy)</h3>
+  <h3 style="margin:8px 0 12px">{html.escape(waiting)}</h3>
   <p style="opacity:.85;line-height:1.45">This tile is wired. Add Render env / secrets
   <code>{html.escape(needs)}</code> and reload — no app rebuild required. Status:
   {html.escape(str(status.get('message') or ''))}.</p>
   <p style="opacity:.7;font-size:13px">Until then the <b>3D twin</b> tile is the
-  credential-free digital twin (pack mesh + risk color).</p>
+  credential-free digital twin (pack mesh + risk color). On <b>CAD Twin</b> you can
+  upload a CAD file and translate it to get a URN.</p>
 </div>
 """
 
