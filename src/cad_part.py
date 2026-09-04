@@ -44,6 +44,7 @@ _GENERIC_PART_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("vib", "vibration"),
     ("temperature", "temperature"),
     ("temp", "temperature"),
+    ("oiltemperature", "oil_temp"),
     ("oiltemp", "oil_temp"),
     ("oil_temp", "oil_temp"),
     ("oilpress", "oil_pressure"),
