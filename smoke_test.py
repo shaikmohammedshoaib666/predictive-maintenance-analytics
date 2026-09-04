@@ -394,6 +394,30 @@ def main() -> int:
         assert "error 4" in describe_viewer_error({"code": 4})
         assert "Bad data" in describe_viewer_error(2)
 
+        assert "SELECTION_CHANGED_EVENT" in html
+        assert "AGGREGATE_SELECTION_CHANGED_EVENT" in html
+        assert "getNodeName" in html
+        assert "setThemingColor" in html
+        assert "clearThemingColors" in html
+        assert "streamlit:setComponentValue" in html
+        assert "setInterval(" not in html
+        assert "explode: false" in html
+        low_html = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low")
+        assert "RISK_RGBA" in low_html
+        from src.cad_part import RISK_THEME_RGBA as _RGBA
+
+        assert str(_RGBA["High"][0]) in html
+        bridge = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low", bridge=True)
+        assert "streamlit:componentReady" in bridge
+        assert "var BRIDGE=true" in bridge
+        from src.aps_viewer import CAD_VIEWER_COMPONENT_DIR, viewer_bridge_html
+
+        index = CAD_VIEWER_COMPONENT_DIR / "index.html"
+        assert index.is_file()
+        index_html = index.read_text(encoding="utf-8")
+        assert index_html == viewer_bridge_html()
+        assert "GuiViewer3D" in index_html and "streamlit:componentReady" in index_html
+
         assert oss_bucket_key("AbC-123_XYZ") == "pdm-abc123xyz-cad"
         assert oss_bucket_key("") == "pdm-app-cad"
         long_key = oss_bucket_key("Z" * 200)
@@ -564,6 +588,83 @@ def main() -> int:
         assert INSUFFICIENT_SCOPE_HINT in format_aps_error(401, "insufficient scope")
         assert "data:write" in TRANSLATE_SCOPES and "bucket:create" in TRANSLATE_SCOPES
         assert "viewables:read" in TRANSLATE_SCOPES
+
+    def test_cad_part_click() -> None:
+        """Asset risk → whole-model tint; Autodesk part name → sensor hint. Not per-bolt IF."""
+        from src.cad_part import (
+            RISK_THEME_HEX,
+            build_part_card,
+            latest_asset_sensors,
+            parse_cad_part_event,
+            part_sensor_hint,
+            risk_theme_hex,
+            risk_theming_rgba,
+        )
+
+        assert risk_theme_hex("High") == "#e74c3c" == RISK_THEME_HEX["High"]
+        assert risk_theme_hex("medium") == "#f39c12"
+        assert risk_theme_hex("Low") == "#7a8c82"
+        assert risk_theme_hex("Low") != "#e74c3c"
+        assert risk_theme_hex("bogus") == RISK_THEME_HEX["Unknown"]
+        assert risk_theming_rgba("High") == (0.91, 0.30, 0.24, 0.72)
+        assert risk_theming_rgba("Medium") is not None
+        assert risk_theming_rgba("Low") is not None
+        assert risk_theming_rgba("Unknown") is None
+        assert risk_theming_rgba("") is None
+
+        assert part_sensor_hint("Cylinder Head") == "cht"
+        assert part_sensor_hint("cyl-4") == "cht"
+        assert part_sensor_hint("Oil Pump Housing") == "oil_pressure"
+        assert part_sensor_hint("Oil Temperature Sender") == "oil_temp"
+        assert part_sensor_hint("Crankshaft") == "rpm"
+        assert part_sensor_hint("Exhaust manifold") == "egt"
+        assert part_sensor_hint("EGT probe") == "egt"
+        assert part_sensor_hint("Temperature sensor") == "temperature"
+        assert part_sensor_hint("Vibration pickup") == "vibration"
+        assert part_sensor_hint("RPM gear") == "rpm"
+        assert part_sensor_hint("Bolt_14") is None
+        assert part_sensor_hint("Housing Cover") is None
+        assert part_sensor_hint("") is None
+        assert (
+            part_sensor_hint(
+                "Cylinder Head",
+                pack_id="aviation_uav_piston",
+                available=["egt", "cht", "oil_pressure"],
+            )
+            == "cht"
+        )
+        assert part_sensor_hint("Exhaust", available=["temperature"]) is None
+        assert part_sensor_hint("Exhaust", available=["egt", "temperature"]) == "egt"
+        assert part_sensor_hint("Crank", pack_id="aviation_uav_piston", available=["rpm"]) == "rpm"
+
+        df = pd.DataFrame(
+            {
+                "machine_id": ["UAV-01", "UAV-01", "UAV-02"],
+                "timestamp": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-02"]),
+                "temperature": [1.0, 9.5, 3.0],
+                "egt": [100.0, 200.0, 50.0],
+                "is_anomaly": [0, 1, 0],
+            }
+        )
+        sensors = latest_asset_sensors(df, "UAV-01")
+        assert sensors["temperature"] == 9.5
+        assert sensors["egt"] == 200.0
+        assert "is_anomaly" not in sensors
+        card = build_part_card(
+            part_name="Cylinder Head",
+            asset_id="UAV-01",
+            risk="High",
+            rul_days=4,
+            sensors=sensors,
+            hint="egt",
+        )
+        assert card["asset_id"] == "UAV-01"
+        assert card["risk"] == "High"
+        assert card["part_name"] == "Cylinder Head"
+        assert "asset" in card["honesty"].lower()
+        assert parse_cad_part_event({"name": "Cyl", "dbId": 12, "properties": {"Name": "Cyl"}})["name"] == "Cyl"
+        assert parse_cad_part_event({"cleared": True})["cleared"] is True
+        assert parse_cad_part_event("nope") is None
 
     def test_aps_translate_mocked() -> None:
         """OSS signed-upload + MD job + poll — mocked HTTP only. Never hits Autodesk."""
@@ -963,6 +1064,12 @@ def main() -> int:
             assert token in PACKS["automotive_powertrain"]["not_in_scope"]
         assert extra_field_defs("plant_rotating") == []
         assert "egt" in extra_aliases_for("aviation_uav_piston")
+        from src.industry_packs import AVIATION_PART_HINTS, part_hints_for
+
+        assert part_hints_for("aviation_uav_piston")["exhaust"] == "egt"
+        assert part_hints_for("aviation_uav_piston")["cyl"] == "cht"
+        assert part_hints_for("plant_rotating") == {}
+        assert "crank" in AVIATION_PART_HINTS
         assert "pump_fillage" in extra_aliases_for("oil_srp")
         assert sample_path_for("aviation_uav_piston").name == "aviation_uav_piston.csv"
 
@@ -1387,6 +1494,7 @@ def main() -> int:
         _, tree = _app_ast()
         all_widget_keys = {k for _, k in _literal_widget_keys(tree)}
         safe = _pre_widget_funcs(tree) | _on_click_callbacks(tree)
+        assert "apply_pending_pipeline_page" in safe
         assert "apply_pending_industry_pack" in safe
         assert "init_session_state" in safe
         assert "_seed_cad_urn_widgets" in safe
@@ -1405,6 +1513,18 @@ def main() -> int:
         assert apply_line is not None, "main() must call apply_pending_industry_pack()"
         assert sidebar_line is not None, "main() must call render_pack_sidebar()"
         assert apply_line < sidebar_line, "apply pending pack before the industry_pack selectbox"
+
+        apply_page_line = None
+        radio_line = None
+        for n in ast.walk(main_fn):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "apply_pending_pipeline_page":
+                apply_page_line = n.lineno
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "radio":
+                radio_line = n.lineno
+        assert apply_page_line is not None, "main() must call apply_pending_pipeline_page()"
+        assert radio_line is not None, "main() must create the Pipeline radio"
+        assert apply_page_line < radio_line, "apply pending pipeline page before the radio widget"
+        assert "apply_pending_pipeline_page" in safe
 
         violations: list[str] = []
         for node in ast.walk(tree):
@@ -1447,6 +1567,21 @@ def main() -> int:
             isinstance(n, ast.Name) and n.id == "PENDING_INDUSTRY_PACK" for n in ast.walk(req)
         )
         assert uses_pending, "request_industry_pack must set PENDING_INDUSTRY_PACK"
+
+        req_page = _fn_named(tree, "request_pipeline_page")
+        assert req_page is not None
+        assert "pipeline_page" not in {k for _, k in _session_state_writes(req_page)}
+        uses_page_pending = any(
+            isinstance(n, ast.Name) and n.id == "PENDING_PIPELINE_PAGE" for n in ast.walk(req_page)
+        )
+        assert uses_page_pending, "request_pipeline_page must set PENDING_PIPELINE_PAGE"
+        card_fn = _fn_named(tree, "render_cad_part_card")
+        assert card_fn is not None
+        assert any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "request_pipeline_page"
+            for n in ast.walk(card_fn)
+        )
+        assert "cad_open_anomaly_rul" in {k for _, k in _literal_widget_keys(card_fn)}
 
         sidebar = _fn_named(tree, "render_pack_sidebar")
         assert sidebar is not None
@@ -1530,6 +1665,8 @@ def main() -> int:
             assert any(b.label == "Translate to SVF / get URN" for b in at_cad.button)
             assert any(b.label == "Save URN for this pack" for b in at_cad.button)
             assert any(b.label == "Delete saved URN" for b in at_cad.button)
+            open_btns = [b for b in at_cad.button if b.label == "Open Anomaly & RUL"]
+            assert len(open_btns) == 1, [b.label for b in at_cad.button]
             assert any("URN" in (t.label or "") for t in at_cad.text_input)
             next(b for b in at_cad.button if b.label == "Translate to SVF / get URN").click().run()
             assert not _errs(at_cad), "Translate with no file: " + "; ".join(_errs(at_cad))
@@ -1537,6 +1674,9 @@ def main() -> int:
             assert not _errs(at_cad), "Save with empty URN: " + "; ".join(_errs(at_cad))
             next(b for b in at_cad.button if b.label == "Delete saved URN").click().run()
             assert not _errs(at_cad), "Delete saved URN: " + "; ".join(_errs(at_cad))
+            next(b for b in at_cad.button if b.label == "Open Anomaly & RUL").click().run()
+            assert not _errs(at_cad), "Open Anomaly & RUL: " + "; ".join(_errs(at_cad))
+            assert at_cad.session_state["pipeline_page"] == "4. Anomaly & RUL"
             from src.aps_viewer import saved_urn_for_pack as _saved_pack
 
             pid = "plant_rotating"
@@ -1580,6 +1720,7 @@ def main() -> int:
     check("live_sources", test_live_sources)
     check("polars_engine", test_polars_engine)
     check("aps_viewer", test_aps_viewer)
+    check("cad_part_click", test_cad_part_click)
     check("aps_translate_mocked", test_aps_translate_mocked)
     check("aps_zip_root_filename", test_aps_zip_root_filename)
     check("charts_layout", test_charts)

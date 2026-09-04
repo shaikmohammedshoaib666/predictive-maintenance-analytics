@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, unquote, urlparse, quote
 
+from src.cad_part import RISK_THEME_RGBA
+
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/token"
 APS_BASE = "https://developer.api.autodesk.com"
 OSS_BUCKETS_URL = f"{APS_BASE}/oss/v2/buckets"
@@ -1325,6 +1327,7 @@ _VIEWER_TEMPLATE = """
   <div id="aps-badge">
     <b id="aps-name">__ASSET__</b> · risk
     <b id="aps-risk" style="color:__RISK_HEX__">__RISK__</b>
+    <span id="aps-part" style="display:none; opacity:.9"> · <span id="aps-part-name"></span></span>
   </div>
   <div id="apsViewer"></div>
   <div id="aps-err"></div>
@@ -1333,8 +1336,13 @@ _VIEWER_TEMPLATE = """
 <script>
 (function(){
   var TOKEN="__TOKEN__", URN="__URN__", RISK="__RISK__", PUBLIC=__PUBLIC__;
+  var ASSET="__ASSET__";
   var EXTRAS=__EXTRAS__;
   var VIEWER_ERR=__VIEWER_ERR__;
+  var BRIDGE=__BRIDGE__;
+  var HEIGHT=__HEIGHT__;
+  var RISK_RGBA=__RISK_RGBA__;
+  var viewer=null, lastUrn=null, lastToken=null, lastRisk=null, selectionWired=false;
   function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
     e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
   function errCode(err){
@@ -1365,81 +1373,233 @@ _VIEWER_TEMPLATE = """
         + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.'
       : '';
   }
-  if (PUBLIC){
-    fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
-      + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
-    return;
+  function sendToStreamlit(type, data){
+    try {
+      var msg = { isStreamlitMessage: true, type: type };
+      if (data) { for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) msg[k] = data[k]; } }
+      window.parent.postMessage(msg, '*');
+    } catch (e) {}
   }
-  if (typeof Autodesk==='undefined'){
-    fail('APS Viewer script failed to load (needs internet to Autodesk).');
-    return;
+  function emitSelection(payload){
+    try { window.parent.postMessage({ type: 'pdm-cad-part', payload: payload }, '*'); } catch (e) {}
+    if (BRIDGE) sendToStreamlit('streamlit:setComponentValue', { value: payload });
   }
-  Autodesk.Viewing.Initializer({
-    env: 'AutodeskProduction',
-    api: 'derivativeV2',
-    accessToken: TOKEN,
-    useADP: false
-  }, function(){
-    var el = document.getElementById('apsViewer');
-    var viewer = new Autodesk.Viewing.GuiViewer3D(el, {
-      theme: 'dark-theme',
-      disabledExtensions: {
-        measure: false,
-        section: false,
-        explode: false,
-        viewcube: false,
-        bimwalk: false,
-        fusionOrbit: false,
-        hyperlink: false,
-        layerManager: false,
-        modelBrowser: false,
-        propertiesPanel: false
-      },
-      extensions: EXTRAS
+  function setBadge(asset, risk, partName){
+    var nameEl = document.getElementById('aps-name');
+    var riskEl = document.getElementById('aps-risk');
+    var partWrap = document.getElementById('aps-part');
+    var partEl = document.getElementById('aps-part-name');
+    if (nameEl) nameEl.textContent = asset || 'asset';
+    if (riskEl){
+      riskEl.textContent = risk || 'Unknown';
+      var hex = {High:'#e74c3c', Medium:'#f39c12', Low:'#27ae60', Unknown:'#7f8c8d'};
+      riskEl.style.color = hex[risk] || hex.Unknown;
+    }
+    if (partWrap && partEl){
+      if (partName){ partEl.textContent = partName; partWrap.style.display = 'inline'; }
+      else { partWrap.style.display = 'none'; partEl.textContent = ''; }
+    }
+  }
+  function riskVec(risk){
+    var row = RISK_RGBA && RISK_RGBA[risk];
+    if (!row || !row.length || typeof THREE === 'undefined') return null;
+    return new THREE.Vector4(row[0], row[1], row[2], row[3]);
+  }
+  function applyAssetTheming(v, risk){
+    try {
+      if (!v || !v.model) return;
+      if (typeof v.clearThemingColors === 'function') v.clearThemingColors(v.model);
+      var color = riskVec(risk);
+      if (!color){
+        if (v.impl) v.impl.invalidate(true);
+        lastRisk = risk;
+        return;
+      }
+      var tree = v.model.getInstanceTree && v.model.getInstanceTree();
+      if (!tree) return;
+      var root = tree.getRootId();
+      function paint(id){
+        try { v.setThemingColor(id, color, v.model, true); } catch (e1) {
+          try { v.setThemingColor(id, color); } catch (e2) {}
+        }
+      }
+      paint(root);
+      tree.enumNodeChildren(root, function(id){ paint(id); }, true);
+      if (v.impl) v.impl.invalidate(true);
+      lastRisk = risk;
+    } catch (e) {}
+  }
+  function wireSelection(v){
+    if (selectionWired) return;
+    selectionWired = true;
+    function onSel(event){
+      var ids = [];
+      if (event && event.dbIdArray && event.dbIdArray.length) ids = event.dbIdArray;
+      else if (event && event.selections && event.selections[0] && event.selections[0].dbIdArray)
+        ids = event.selections[0].dbIdArray;
+      else {
+        try { ids = (v.getSelection && v.getSelection()) || []; } catch (e) {}
+      }
+      if (!ids.length){
+        setBadge(ASSET, RISK, '');
+        emitSelection({ name: '', dbId: null, properties: {}, cleared: true, ts: Date.now() });
+        return;
+      }
+      var dbId = ids[0];
+      var nodeName = 'Node ' + dbId;
+      try {
+        var tree = v.model && v.model.getInstanceTree && v.model.getInstanceTree();
+        if (tree && tree.getNodeName) nodeName = tree.getNodeName(dbId) || nodeName;
+      } catch (e) {}
+      function finish(nm, props){
+        setBadge(ASSET, RISK, nm);
+        emitSelection({
+          name: nm || nodeName,
+          dbId: dbId,
+          properties: props || {},
+          cleared: false,
+          ts: Date.now()
+        });
+      }
+      try {
+        v.getProperties(dbId, function(result){
+          var props = {};
+          var nm = (result && result.name) || nodeName;
+          (result && result.properties || []).forEach(function(p){
+            var k = p.displayName || p.attributeName || '';
+            var val = p.displayValue;
+            if (k && val != null && val !== '') props[k] = String(val);
+          });
+          finish(nm, props);
+        }, function(){ finish(nodeName, {}); });
+      } catch (e) { finish(nodeName, {}); }
+    }
+    try { v.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, onSel); } catch (e) {}
+    try {
+      if (Autodesk.Viewing.AGGREGATE_SELECTION_CHANGED_EVENT)
+        v.addEventListener(Autodesk.Viewing.AGGREGATE_SELECTION_CHANGED_EVENT, onSel);
+    } catch (e) {}
+  }
+  function fitUi(v){
+    try { v.resize(); } catch (e) {}
+    try { if (v.showViewCube) v.showViewCube(true); } catch (e) {}
+  }
+  function loadExtras(v, extras){
+    (extras || []).forEach(function(name){
+      try { v.loadExtension(name).catch(function(){}); } catch (e) {}
     });
-    var started = viewer.start();
-    if (started === false) {
-      fail('GuiViewer3D failed to start (container has no size).');
-      return;
-    }
-    function fitUi(){
-      try { viewer.resize(); } catch (e) {}
-      try { if (viewer.showViewCube) viewer.showViewCube(true); } catch (e) {}
-    }
-    window.addEventListener('resize', fitUi);
-    setTimeout(fitUi, 250);
-    function loadExtras(){
-      EXTRAS.forEach(function(name){
-        try {
-          viewer.loadExtension(name).catch(function(){ /* optional: FirstPerson / MarkupsGui */ });
-        } catch (e) {}
-      });
-    }
-    Autodesk.Viewing.Document.load('urn:'+URN, function(doc){
+  }
+  function loadModel(v, urn, risk, extras){
+    Autodesk.Viewing.Document.load('urn:'+urn, function(doc){
       var node = doc.getRoot().getDefaultGeometry();
       if (!node) { fail('No viewable geometry in this URN.'+publicHint()); return; }
-      viewer.loadDocumentNode(doc, node).then(function(){
-        fitUi();
-        loadExtras();
-        try { viewer.getToolbar(true); } catch (e) {}
-        if (RISK==='High' || RISK==='Medium'){
-          viewer.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, function(){
-            try{
-              var color = RISK==='High' ? new THREE.Vector4(0.9,0.1,0.1,0.7)
-                                        : new THREE.Vector4(0.95,0.6,0.1,0.55);
-              var tree = viewer.model.getInstanceTree();
-              var ids=[]; tree.enumNodeChildren(tree.getRootId(), function(id){ids.push(id);}, true);
-              var on=true;
-              setInterval(function(){
-                ids.forEach(function(id){ on ? viewer.setThemingColor(id,color) : viewer.clearThemingColor(id); });
-                viewer.impl.invalidate(true); on=!on;
-              }, RISK==='High'?450:900);
-            }catch(e){/* theming best-effort */}
-          });
-        }
+      v.loadDocumentNode(doc, node).then(function(){
+        fitUi(v);
+        loadExtras(v, extras);
+        try { v.getToolbar(true); } catch (e) {}
+        wireSelection(v);
+        function tint(){ applyAssetTheming(v, risk); }
+        try { v.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, tint); } catch (e) {}
+        tint();
       }).catch(function(err){ fail('loadDocumentNode failed: '+describeErr(err)+publicHint()); });
     }, function(err){ fail('Model load failed: '+describeErr(err)+publicHint()); });
-  });
+  }
+  function startViewer(args){
+    args = args || {};
+    if (args.token) TOKEN = args.token;
+    if (args.urn) URN = args.urn;
+    if (args.asset) ASSET = args.asset;
+    if (args.risk) RISK = args.risk;
+    if (args.public != null) PUBLIC = !!args.public;
+    if (args.public_viewer != null) PUBLIC = !!args.public_viewer;
+    if (args.extras) EXTRAS = args.extras;
+    if (args.viewer_err) VIEWER_ERR = args.viewer_err;
+    if (args.height) HEIGHT = args.height;
+    setBadge(ASSET, RISK, '');
+    if (PUBLIC){
+      fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+        + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
+      return;
+    }
+    if (!TOKEN || !URN){
+      if (!BRIDGE) fail('Missing APS token or URN.');
+      return;
+    }
+    if (viewer && lastUrn === URN){
+      if (TOKEN && TOKEN !== lastToken){
+        try { Autodesk.Viewing.token.accessToken = TOKEN; } catch (e) {}
+        lastToken = TOKEN;
+      }
+      applyAssetTheming(viewer, RISK);
+      return;
+    }
+    if (typeof Autodesk === 'undefined'){
+      fail('APS Viewer script failed to load (needs internet to Autodesk).');
+      return;
+    }
+    lastUrn = URN;
+    lastToken = TOKEN;
+    Autodesk.Viewing.Initializer({
+      env: 'AutodeskProduction',
+      api: 'derivativeV2',
+      accessToken: TOKEN,
+      useADP: false
+    }, function(){
+      var el = document.getElementById('apsViewer');
+      if (viewer){
+        try { viewer.tearDown(); } catch (e) {}
+        try { viewer.finish(); } catch (e) {}
+        selectionWired = false;
+        if (el) el.innerHTML = '';
+      }
+      viewer = new Autodesk.Viewing.GuiViewer3D(el, {
+        theme: 'dark-theme',
+        disabledExtensions: {
+          measure: false,
+          section: false,
+          explode: false,
+          viewcube: false,
+          bimwalk: false,
+          fusionOrbit: false,
+          hyperlink: false,
+          layerManager: false,
+          modelBrowser: false,
+          propertiesPanel: false
+        },
+        extensions: EXTRAS
+      });
+      var started = viewer.start();
+      if (started === false) {
+        fail('GuiViewer3D failed to start (container has no size).');
+        return;
+      }
+      window.addEventListener('resize', function(){ fitUi(viewer); });
+      setTimeout(function(){ fitUi(viewer); }, 250);
+      loadModel(viewer, URN, RISK, EXTRAS);
+    });
+  }
+  function whenAutodesk(cb, n){
+    n = n || 0;
+    if (typeof Autodesk !== 'undefined') { cb(); return; }
+    if (n > 80) { fail('APS Viewer script failed to load (needs internet to Autodesk).'); return; }
+    setTimeout(function(){ whenAutodesk(cb, n + 1); }, 100);
+  }
+  if (BRIDGE){
+    window.addEventListener('message', function(ev){
+      var data = ev.data || {};
+      if (data.type === 'streamlit:render'){
+        var a = data.args || {};
+        whenAutodesk(function(){ startViewer(a); });
+      }
+    });
+    sendToStreamlit('streamlit:componentReady', { apiVersion: 1 });
+    sendToStreamlit('streamlit:setFrameHeight', { height: HEIGHT + 16 });
+  } else if (PUBLIC){
+    fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+      + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
+  } else {
+    whenAutodesk(function(){ startViewer({}); });
+  }
 })();
 </script>
 """
@@ -1447,6 +1607,12 @@ _VIEWER_TEMPLATE = """
 _RISK_HEX = {"High": "#e74c3c", "Medium": "#f39c12", "Low": "#27ae60", "Unknown": "#7f8c8d"}
 
 DEFAULT_VIEWER_HEIGHT = 840
+CAD_VIEWER_COMPONENT_DIR = Path(__file__).resolve().parent / "cad_viewer_component"
+
+
+def _risk_rgba_js() -> str:
+    payload = {k: list(v) for k, v in RISK_THEME_RGBA.items()}
+    return json.dumps(payload)
 
 
 def build_viewer_html(
@@ -1457,20 +1623,52 @@ def build_viewer_html(
     risk: str,
     height: int = DEFAULT_VIEWER_HEIGHT,
     public_viewer: bool = False,
+    bridge: bool = False,
 ) -> str:
-    """Embed GuiViewer3D (full toolbar), not a headless Viewer3D."""
+    """Embed GuiViewer3D (full toolbar), not a headless Viewer3D.
+
+    ``bridge=True`` waits for Streamlit ``streamlit:render`` args and posts
+    click events via ``streamlit:setComponentValue`` (custom component iframe).
+    ``components.html`` / dashboard export use ``bridge=False``.
+    """
     risk = risk if risk in _RISK_HEX else "Unknown"
     urn = normalize_model_urn(urn)
     extras_js = json.dumps(list(VIEWER_EXTRA_EXTENSIONS))
     err_js = json.dumps({str(k): v for k, v in VIEWER_ERROR_CODES.items()})
+    safe_asset = str(asset).replace("\\", "\\\\").replace('"', '\\"')
+    safe_token = str(token).replace("\\", "\\\\").replace('"', '\\"')
     return (
-        _VIEWER_TEMPLATE.replace("__TOKEN__", token)
+        _VIEWER_TEMPLATE.replace("__TOKEN__", safe_token)
         .replace("__URN__", urn)
-        .replace("__ASSET__", str(asset))
-        .replace("__RISK__", risk)
+        .replace("__ASSET__", safe_asset)
         .replace("__RISK_HEX__", _RISK_HEX[risk])
+        .replace("__RISK_RGBA__", _risk_rgba_js())
+        .replace("__RISK__", risk)
         .replace("__HEIGHT__", str(int(height)))
         .replace("__PUBLIC__", "true" if public_viewer else "false")
         .replace("__EXTRAS__", extras_js)
         .replace("__VIEWER_ERR__", err_js)
+        .replace("__BRIDGE__", "true" if bridge else "false")
     )
+
+
+def viewer_bridge_html(*, height: int = DEFAULT_VIEWER_HEIGHT) -> str:
+    """Static ``index.html`` for the Streamlit custom component (token/URN via RENDER)."""
+    return build_viewer_html(
+        "",
+        "",
+        asset="asset",
+        risk="Unknown",
+        height=height,
+        public_viewer=False,
+        bridge=True,
+    )
+
+
+def write_cad_viewer_component(directory: Optional[Path] = None) -> Path:
+    """Write ``index.html`` so ``declare_component(path=...)`` can serve GuiViewer3D."""
+    folder = Path(directory) if directory is not None else CAD_VIEWER_COMPONENT_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "index.html"
+    path.write_text(viewer_bridge_html(), encoding="utf-8")
+    return path

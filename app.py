@@ -88,11 +88,14 @@ from src.aps_viewer import (
     A360_PUBLIC_URN_ERROR,
     CAD_SIZE_ZIP_FALLBACK,
     CAD_UPLOAD_EXTENSIONS,
+    CAD_VIEWER_COMPONENT_DIR,
     DEFAULT_VIEWER_HEIGHT,
     INSUFFICIENT_SCOPE_HINT,
     MAX_CAD_UPLOAD_MB,
     PUBLIC_VIEWER_NO_URN_WARNING,
     PUBLIC_VIEWER_WARNING,
+    VIEWER_ERROR_CODES,
+    VIEWER_EXTRA_EXTENSIONS,
     ZIP_ROOT_MISSING_MSG,
     aps_available,
     aps_model_urn,
@@ -112,6 +115,13 @@ from src.aps_viewer import (
     saved_urn_caption,
     saved_urn_for_pack,
     translate_cad_bytes,
+)
+from src.cad_part import (
+    build_part_card,
+    latest_asset_sensors,
+    parse_cad_part_event,
+    part_sensor_hint,
+    risk_theme_hex,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
@@ -213,6 +223,8 @@ def init_session_state():
         "dashboard_tiles": None,
         # Autodesk APS CAD twin — URN from APS_MODEL_URN, pack JSON save, or paste
         "aps_urn": "",
+        "cad_selected_part": None,
+        "pipeline_page": "1. Upload & Clean",
         # Industry pack (Plant is the default; 3D + KPIs switch with this)
         "industry_pack": DEFAULT_PACK_ID,
         "pack_kpis": {},
@@ -289,15 +301,19 @@ def register_table(name: str, df: pd.DataFrame):
 # selectbox exists — Streamlit raises StreamlitAPIException even for the same value.
 PENDING_INDUSTRY_PACK = "_pending_industry_pack"
 PENDING_ZIP_ROOT = "_pending_aps_zip_root_filename"
+PENDING_PIPELINE_PAGE = "_pending_pipeline_page"
+ANOMALY_RUL_PAGE = "4. Anomaly & RUL"
 
 # Functions allowed to write widget-bound keys because they run before those widgets.
-# init_session_state / apply_pending_industry_pack: top of main() before the sidebar.
+# init_session_state / apply_pending_industry_pack / apply_pending_pipeline_page:
+# top of main() before the sidebar.
 # _seed_cad_urn_widgets: top of page_cad_twin before key="aps_urn_input".
 # _seed_zip_root_widget: top of page_cad_twin before key="aps_zip_root_filename".
 PRE_WIDGET_SESSION_FUNCS = frozenset(
     {
         "init_session_state",
         "apply_pending_industry_pack",
+        "apply_pending_pipeline_page",
         "_seed_cad_urn_widgets",
         "_seed_zip_root_widget",
     }
@@ -315,6 +331,18 @@ def active_pack() -> dict:
 def request_industry_pack(pack_id: str) -> None:
     """Queue a pack change. Applied at the start of the next run, before the sidebar widget."""
     st.session_state[PENDING_INDUSTRY_PACK] = pack_id
+
+
+def request_pipeline_page(page: str) -> None:
+    """Queue a pipeline radio change. Applied at the start of the next run, before the widget."""
+    st.session_state[PENDING_PIPELINE_PAGE] = page
+
+
+def apply_pending_pipeline_page() -> None:
+    """Copy a queued pipeline page into ``pipeline_page`` BEFORE the sidebar radio is created."""
+    pending = st.session_state.pop(PENDING_PIPELINE_PAGE, None)
+    if pending:
+        st.session_state.pipeline_page = pending
 
 
 def apply_pending_industry_pack() -> None:
@@ -1506,6 +1534,91 @@ def _cad_iframe_height(viewer_h: int = DEFAULT_VIEWER_HEIGHT) -> int:
     return int(viewer_h) + 36
 
 
+_CAD_VIEWER_COMPONENT = None
+
+
+def _cad_viewer_component():
+    """GuiViewer3D as a Streamlit custom component so part clicks reach Python."""
+    global _CAD_VIEWER_COMPONENT
+    if _CAD_VIEWER_COMPONENT is None:
+        index = CAD_VIEWER_COMPONENT_DIR / "index.html"
+        if not index.is_file():
+            from src.aps_viewer import write_cad_viewer_component
+
+            write_cad_viewer_component(CAD_VIEWER_COMPONENT_DIR)
+        _CAD_VIEWER_COMPONENT = components.declare_component(
+            "pdm_cad_viewer",
+            path=str(CAD_VIEWER_COMPONENT_DIR),
+        )
+    return _CAD_VIEWER_COMPONENT
+
+
+def _store_cad_part_event(event: Any) -> None:
+    parsed = parse_cad_part_event(event)
+    if parsed is None:
+        return
+    if parsed.get("cleared"):
+        st.session_state.cad_selected_part = None
+        return
+    st.session_state.cad_selected_part = parsed
+
+
+def render_cad_part_card(sel: dict[str, Any], pack_id: str) -> None:
+    """Asset identity + optional clicked Autodesk part. Isolation Forest is per-asset."""
+    asset_id = str(sel.get("machine_id") or "asset")
+    risk = str(sel.get("risk_level") or "Unknown")
+    rul = sel.get("predicted_rul_days")
+    df = get_active_df()
+    sensors = latest_asset_sensors(df, asset_id)
+    part = st.session_state.get("cad_selected_part") or {}
+    part_name = str(part.get("name") or "")
+    hint = part_sensor_hint(part_name, pack_id=pack_id, available=list(sensors.keys())) if part_name else None
+    card = build_part_card(
+        part_name=part_name,
+        asset_id=asset_id,
+        risk=risk,
+        rul_days=rul,
+        sensors=sensors,
+        hint=hint,
+    )
+
+    st.markdown("#### Selected part")
+    st.caption(card["honesty"])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"**Part:** `{card['part_name']}`")
+        if part.get("dbId") is not None:
+            st.caption(f"Viewer dbId `{part['dbId']}`")
+    with c2:
+        st.markdown(f"**Asset:** `{card['asset_id']}`")
+    with c3:
+        hex_color = risk_theme_hex(card["risk"])
+        st.markdown(
+            f'**Risk:** <span style="color:{hex_color};font-weight:700">{card["risk"]}</span>',
+            unsafe_allow_html=True,
+        )
+        if card["rul_days"] is not None and card["rul_days"] != "":
+            st.caption(f"RUL ≈ {card['rul_days']} days")
+
+    if sensors:
+        st.markdown("**Mapped sensors** (latest row for this asset)")
+        for name, value in sensors.items():
+            if isinstance(value, float):
+                shown = f"{value:.3g}"
+            else:
+                shown = str(value)
+            if hint and name == hint:
+                st.success(f"**{name}:** {shown}  — matches this part name")
+            else:
+                st.write(f"{name}: {shown}")
+    else:
+        st.caption("No mapped sensor values in session yet — clean / map a CSV, then run Anomaly & RUL.")
+
+    if st.button("Open Anomaly & RUL", type="primary", key="cad_open_anomaly_rul"):
+        request_pipeline_page(ANOMALY_RUL_PAGE)
+        st.rerun()
+
+
 def _seed_cad_urn_widgets(pack_id: str) -> dict:
     """Prefill URN widgets BEFORE they are created. Streamlit forbids writing the key after."""
     env_urn = normalize_model_urn(aps_model_urn())
@@ -1600,8 +1713,26 @@ def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_vi
     )
     st.session_state.aps_viewer_html = html
     st.session_state.aps_viewer_urn = urn
+    st.session_state.aps_viewer_token = token
     st.session_state.aps_viewer_at = datetime.now().timestamp()
-    components.html(html, height=_cad_iframe_height())
+    event = None
+    try:
+        event = _cad_viewer_component()(
+            token=token,
+            urn=normalize_model_urn(urn),
+            asset=str(asset),
+            risk=str(risk if risk in ("High", "Medium", "Low") else "Unknown"),
+            height=DEFAULT_VIEWER_HEIGHT,
+            public=bool(public_viewer),
+            extras=list(VIEWER_EXTRA_EXTENSIONS),
+            viewer_err={str(k): v for k, v in VIEWER_ERROR_CODES.items()},
+            default=None,
+            key="cad_gui_viewer",
+        )
+    except Exception:
+        components.html(html, height=_cad_iframe_height())
+        event = None
+    _store_cad_part_event(event)
 
 
 # ── CAD Twin — Autodesk APS (Upgrade 3) ───────────────────────────────────────
@@ -1611,6 +1742,8 @@ def page_cad_twin():
     pack_id = active_pack_id()
     st.markdown(
         f'<p class="sub-header">Real translated CAD for <b>{pack["label"]}</b> (Revit / Fusion / IFC / STEP → SVF). '
+        "Click a part for its Autodesk name + this <b>asset's</b> Isolation Forest risk "
+        "(the whole model tints red / amber / gray — not a guessed failing bolt). "
         "GuiViewer3D full toolbar. Last working URN is saved on this server per industry pack — "
         "not session-only. Credentials are runtime secrets.</p>",
         unsafe_allow_html=True,
@@ -1870,8 +2003,11 @@ def page_cad_twin():
         "Viewer is **GuiViewer3D** (not headless Viewer3D): Home, Fit, Pan, Zoom, Orbit, "
         "First Person / BimWalk, Measure, Section, Explode (slider), View cube, left Views "
         "(DocumentBrowser), Model browser, Properties, Settings. Markup loads when "
-        "`Autodesk.Viewing.MarkupsGui` is in the viewer library — no extra paid API."
+        "`Autodesk.Viewing.MarkupsGui` is in the viewer library — no extra paid API. "
+        "Selection highlight is the viewer's default outline; explode still works."
     )
+
+    render_cad_part_card(sel, pack_id)
 
     if not ok:
         components.html(cad_placeholder_html(status=status, height=280), height=300)
@@ -1931,7 +2067,17 @@ def page_cad_twin():
             if INSUFFICIENT_SCOPE_HINT in str(exc):
                 st.info(INSUFFICIENT_SCOPE_HINT)
     elif cache_fresh:
-        components.html(cache_html, height=_cad_iframe_height())
+        cached_token = str(st.session_state.get("aps_viewer_token") or "")
+        if cached_token:
+            _render_cad_viewer(
+                token=cached_token,
+                urn=urn,
+                asset=selected,
+                risk=sel.get("risk_level", "Unknown"),
+                public_viewer=False,
+            )
+        else:
+            components.html(cache_html, height=_cad_iframe_height())
         save_info = st.session_state.get("aps_save_log") or {}
         if save_info.get("saved") and save_info.get("urn") == urn:
             st.caption(save_info.get("message") or saved_urn_caption(pack_id))
@@ -2369,6 +2515,7 @@ def page_email_report():
 def main():
     init_session_state()
     apply_pending_industry_pack()
+    apply_pending_pipeline_page()
     st.sidebar.markdown(f"## {config.APP_TITLE}")
     st.sidebar.caption(config.TAGLINE)
     st.sidebar.markdown("---")
@@ -2391,7 +2538,7 @@ def main():
         "SQL lab": page_dwdm_sql,
     }
 
-    selection = st.sidebar.radio("Pipeline", list(pages.keys()))
+    selection = st.sidebar.radio("Pipeline", list(pages.keys()), key="pipeline_page")
     render_gemini_sidebar()
     st.sidebar.markdown("---")
     df = get_active_df()

@@ -1,0 +1,292 @@
+
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b1016; }
+  #aps-wrap { position:relative; width:100%; height:840px; min-height:840px;
+    border-radius:12px; background:#0b1016; }
+  #apsViewer, #apsViewer .adsk-viewing-viewer { width:100%; height:100% !important; }
+  #aps-badge { position:absolute; top:10px; left:12px; z-index:3; font-family:system-ui,sans-serif;
+    color:#fff; background:rgba(10,16,22,.55); padding:6px 10px; border-radius:8px; pointer-events:none; }
+  #aps-err { display:none; position:absolute; inset:0; z-index:8; color:#fff;
+    font-family:system-ui,sans-serif; padding:20px; font-size:13px; background:#101822; line-height:1.45; }
+</style>
+<link rel="stylesheet"
+  href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css" type="text/css">
+<div id="aps-wrap">
+  <div id="aps-badge">
+    <b id="aps-name">asset</b> · risk
+    <b id="aps-risk" style="color:#7f8c8d">Unknown</b>
+    <span id="aps-part" style="display:none; opacity:.9"> · <span id="aps-part-name"></span></span>
+  </div>
+  <div id="apsViewer"></div>
+  <div id="aps-err"></div>
+</div>
+<script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
+<script>
+(function(){
+  var TOKEN="", URN="", RISK="Unknown", PUBLIC=false;
+  var ASSET="asset";
+  var EXTRAS=["Autodesk.DocumentBrowser", "Autodesk.Viewing.MarkupsCore", "Autodesk.Viewing.MarkupsGui", "Autodesk.FirstPerson"];
+  var VIEWER_ERR={"1": "Unknown failure", "2": "Bad data", "3": "Network failure", "4": "Access denied (NETWORK_ACCESS_DENIED) \u2014 your APS app token cannot read this URN", "5": "File not found", "6": "Network server error", "7": "Unhandled network response", "8": "Browser WebGL not supported", "9": "Model is empty", "10": "Too many requests", "11": "Unhandled exception", "12": "WebGL context lost", "13": "Load canceled"};
+  var BRIDGE=true;
+  var HEIGHT=840;
+  var RISK_RGBA={"High": [0.91, 0.3, 0.24, 0.72], "Medium": [0.95, 0.61, 0.07, 0.58], "Low": [0.48, 0.55, 0.52, 0.32]};
+  var viewer=null, lastUrn=null, lastToken=null, lastRisk=null, selectionWired=false;
+  function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
+    e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
+  function errCode(err){
+    if (err == null) return null;
+    if (typeof err === 'number' && isFinite(err)) return err;
+    if (typeof err === 'string' && /^-?\d+$/.test(err.trim())) return Number(err.trim());
+    if (typeof err === 'object'){
+      var v = err.code != null ? err.code : err.errorCode;
+      if (v != null && v !== ''){
+        var n = Number(v);
+        if (isFinite(n)) return n;
+      }
+    }
+    return null;
+  }
+  function describeErr(err){
+    var n = errCode(err);
+    if (n === 4){
+      return 'Access denied (error 4 / NETWORK_ACCESS_DENIED). Your 2-legged APS token cannot '
+        + 'read this object. Autodesk public Viewer URNs (a360viewer-protected) are not in your bucket.';
+    }
+    if (n != null && VIEWER_ERR[String(n)]) return VIEWER_ERR[String(n)] + ' (error ' + n + ')';
+    try { return typeof err === 'string' ? err : JSON.stringify(err); } catch (e) { return String(err); }
+  }
+  function publicHint(){
+    return PUBLIC
+      ? '<br><br><b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+        + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.'
+      : '';
+  }
+  function sendToStreamlit(type, data){
+    try {
+      var msg = { isStreamlitMessage: true, type: type };
+      if (data) { for (var k in data) { if (Object.prototype.hasOwnProperty.call(data, k)) msg[k] = data[k]; } }
+      window.parent.postMessage(msg, '*');
+    } catch (e) {}
+  }
+  function emitSelection(payload){
+    try { window.parent.postMessage({ type: 'pdm-cad-part', payload: payload }, '*'); } catch (e) {}
+    if (BRIDGE) sendToStreamlit('streamlit:setComponentValue', { value: payload });
+  }
+  function setBadge(asset, risk, partName){
+    var nameEl = document.getElementById('aps-name');
+    var riskEl = document.getElementById('aps-risk');
+    var partWrap = document.getElementById('aps-part');
+    var partEl = document.getElementById('aps-part-name');
+    if (nameEl) nameEl.textContent = asset || 'asset';
+    if (riskEl){
+      riskEl.textContent = risk || 'Unknown';
+      var hex = {High:'#e74c3c', Medium:'#f39c12', Low:'#27ae60', Unknown:'#7f8c8d'};
+      riskEl.style.color = hex[risk] || hex.Unknown;
+    }
+    if (partWrap && partEl){
+      if (partName){ partEl.textContent = partName; partWrap.style.display = 'inline'; }
+      else { partWrap.style.display = 'none'; partEl.textContent = ''; }
+    }
+  }
+  function riskVec(risk){
+    var row = RISK_RGBA && RISK_RGBA[risk];
+    if (!row || !row.length || typeof THREE === 'undefined') return null;
+    return new THREE.Vector4(row[0], row[1], row[2], row[3]);
+  }
+  function applyAssetTheming(v, risk){
+    try {
+      if (!v || !v.model) return;
+      if (typeof v.clearThemingColors === 'function') v.clearThemingColors(v.model);
+      var color = riskVec(risk);
+      if (!color){
+        if (v.impl) v.impl.invalidate(true);
+        lastRisk = risk;
+        return;
+      }
+      var tree = v.model.getInstanceTree && v.model.getInstanceTree();
+      if (!tree) return;
+      var root = tree.getRootId();
+      function paint(id){
+        try { v.setThemingColor(id, color, v.model, true); } catch (e1) {
+          try { v.setThemingColor(id, color); } catch (e2) {}
+        }
+      }
+      paint(root);
+      tree.enumNodeChildren(root, function(id){ paint(id); }, true);
+      if (v.impl) v.impl.invalidate(true);
+      lastRisk = risk;
+    } catch (e) {}
+  }
+  function wireSelection(v){
+    if (selectionWired) return;
+    selectionWired = true;
+    function onSel(event){
+      var ids = [];
+      if (event && event.dbIdArray && event.dbIdArray.length) ids = event.dbIdArray;
+      else if (event && event.selections && event.selections[0] && event.selections[0].dbIdArray)
+        ids = event.selections[0].dbIdArray;
+      else {
+        try { ids = (v.getSelection && v.getSelection()) || []; } catch (e) {}
+      }
+      if (!ids.length){
+        setBadge(ASSET, RISK, '');
+        emitSelection({ name: '', dbId: null, properties: {}, cleared: true, ts: Date.now() });
+        return;
+      }
+      var dbId = ids[0];
+      var nodeName = 'Node ' + dbId;
+      try {
+        var tree = v.model && v.model.getInstanceTree && v.model.getInstanceTree();
+        if (tree && tree.getNodeName) nodeName = tree.getNodeName(dbId) || nodeName;
+      } catch (e) {}
+      function finish(nm, props){
+        setBadge(ASSET, RISK, nm);
+        emitSelection({
+          name: nm || nodeName,
+          dbId: dbId,
+          properties: props || {},
+          cleared: false,
+          ts: Date.now()
+        });
+      }
+      try {
+        v.getProperties(dbId, function(result){
+          var props = {};
+          var nm = (result && result.name) || nodeName;
+          (result && result.properties || []).forEach(function(p){
+            var k = p.displayName || p.attributeName || '';
+            var val = p.displayValue;
+            if (k && val != null && val !== '') props[k] = String(val);
+          });
+          finish(nm, props);
+        }, function(){ finish(nodeName, {}); });
+      } catch (e) { finish(nodeName, {}); }
+    }
+    try { v.addEventListener(Autodesk.Viewing.SELECTION_CHANGED_EVENT, onSel); } catch (e) {}
+    try {
+      if (Autodesk.Viewing.AGGREGATE_SELECTION_CHANGED_EVENT)
+        v.addEventListener(Autodesk.Viewing.AGGREGATE_SELECTION_CHANGED_EVENT, onSel);
+    } catch (e) {}
+  }
+  function fitUi(v){
+    try { v.resize(); } catch (e) {}
+    try { if (v.showViewCube) v.showViewCube(true); } catch (e) {}
+  }
+  function loadExtras(v, extras){
+    (extras || []).forEach(function(name){
+      try { v.loadExtension(name).catch(function(){}); } catch (e) {}
+    });
+  }
+  function loadModel(v, urn, risk, extras){
+    Autodesk.Viewing.Document.load('urn:'+urn, function(doc){
+      var node = doc.getRoot().getDefaultGeometry();
+      if (!node) { fail('No viewable geometry in this URN.'+publicHint()); return; }
+      v.loadDocumentNode(doc, node).then(function(){
+        fitUi(v);
+        loadExtras(v, extras);
+        try { v.getToolbar(true); } catch (e) {}
+        wireSelection(v);
+        function tint(){ applyAssetTheming(v, risk); }
+        try { v.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, tint); } catch (e) {}
+        tint();
+      }).catch(function(err){ fail('loadDocumentNode failed: '+describeErr(err)+publicHint()); });
+    }, function(err){ fail('Model load failed: '+describeErr(err)+publicHint()); });
+  }
+  function startViewer(args){
+    args = args || {};
+    if (args.token) TOKEN = args.token;
+    if (args.urn) URN = args.urn;
+    if (args.asset) ASSET = args.asset;
+    if (args.risk) RISK = args.risk;
+    if (args.public != null) PUBLIC = !!args.public;
+    if (args.public_viewer != null) PUBLIC = !!args.public_viewer;
+    if (args.extras) EXTRAS = args.extras;
+    if (args.viewer_err) VIEWER_ERR = args.viewer_err;
+    if (args.height) HEIGHT = args.height;
+    setBadge(ASSET, RISK, '');
+    if (PUBLIC){
+      fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+        + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
+      return;
+    }
+    if (!TOKEN || !URN){
+      if (!BRIDGE) fail('Missing APS token or URN.');
+      return;
+    }
+    if (viewer && lastUrn === URN){
+      if (TOKEN && TOKEN !== lastToken){
+        try { Autodesk.Viewing.token.accessToken = TOKEN; } catch (e) {}
+        lastToken = TOKEN;
+      }
+      applyAssetTheming(viewer, RISK);
+      return;
+    }
+    if (typeof Autodesk === 'undefined'){
+      fail('APS Viewer script failed to load (needs internet to Autodesk).');
+      return;
+    }
+    lastUrn = URN;
+    lastToken = TOKEN;
+    Autodesk.Viewing.Initializer({
+      env: 'AutodeskProduction',
+      api: 'derivativeV2',
+      accessToken: TOKEN,
+      useADP: false
+    }, function(){
+      var el = document.getElementById('apsViewer');
+      if (viewer){
+        try { viewer.tearDown(); } catch (e) {}
+        try { viewer.finish(); } catch (e) {}
+        selectionWired = false;
+        if (el) el.innerHTML = '';
+      }
+      viewer = new Autodesk.Viewing.GuiViewer3D(el, {
+        theme: 'dark-theme',
+        disabledExtensions: {
+          measure: false,
+          section: false,
+          explode: false,
+          viewcube: false,
+          bimwalk: false,
+          fusionOrbit: false,
+          hyperlink: false,
+          layerManager: false,
+          modelBrowser: false,
+          propertiesPanel: false
+        },
+        extensions: EXTRAS
+      });
+      var started = viewer.start();
+      if (started === false) {
+        fail('GuiViewer3D failed to start (container has no size).');
+        return;
+      }
+      window.addEventListener('resize', function(){ fitUi(viewer); });
+      setTimeout(function(){ fitUi(viewer); }, 250);
+      loadModel(viewer, URN, RISK, EXTRAS);
+    });
+  }
+  function whenAutodesk(cb, n){
+    n = n || 0;
+    if (typeof Autodesk !== 'undefined') { cb(); return; }
+    if (n > 80) { fail('APS Viewer script failed to load (needs internet to Autodesk).'); return; }
+    setTimeout(function(){ whenAutodesk(cb, n + 1); }, 100);
+  }
+  if (BRIDGE){
+    window.addEventListener('message', function(ev){
+      var data = ev.data || {};
+      if (data.type === 'streamlit:render'){
+        var a = data.args || {};
+        whenAutodesk(function(){ startViewer(a); });
+      }
+    });
+    sendToStreamlit('streamlit:componentReady', { apiVersion: 1 });
+    sendToStreamlit('streamlit:setFrameHeight', { height: HEIGHT + 16 });
+  } else if (PUBLIC){
+    fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
+      + 'Use Choose CAD file → Translate with the same STEP (Rotax 912), then Load, then Save URN.');
+  } else {
+    whenAutodesk(function(){ startViewer({}); });
+  }
+})();
+</script>

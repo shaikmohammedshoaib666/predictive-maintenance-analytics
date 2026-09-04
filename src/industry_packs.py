@@ -30,6 +30,21 @@ AUTOMOTIVE_OEM_TRIM_EV_NOTE = (
     "OBD-style engine / oil / coolant / load sensors drive health on that one template."
 )
 
+# Small Autodesk node-name → mapped-sensor hints for the aviation CAD Twin card.
+# Not a Rotax bill of materials — keyword matches only (exhaust/cyl/oil/crank).
+AVIATION_PART_HINTS: dict[str, str] = {
+    "exhaust": "egt",
+    "egt": "egt",
+    "cht": "cht",
+    "cylinder": "cht",
+    "cyl": "cht",
+    "oil": "oil_pressure",
+    "crank": "rpm",
+    "hobbs": "flight_hours",
+    "throttle": "throttle",
+    "manifold": "manifold_pressure",
+}
+
 # Extra Isolation Forest features when these columns exist (plant sample is unchanged).
 OPTIONAL_IF_SENSORS: tuple[str, ...] = (
     "egt",
@@ -72,6 +87,7 @@ def _pack(
     not_in_scope: str,
     cost_hour_label: str,
     cost_unit_label: str,
+    part_hints: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     extras = {
         name: {"label": label_, "aliases": aliases}
@@ -98,6 +114,8 @@ def _pack(
         "not_in_scope": not_in_scope,
         "cost_hour_label": cost_hour_label,
         "cost_unit_label": cost_unit_label,
+        # Aviation-only Autodesk node-name → sensor hints. Not a Rotax BOM.
+        "part_hints": dict(part_hints or {}),
     }
 
 
@@ -175,6 +193,7 @@ PACKS: dict[str, dict[str, Any]] = {
         not_in_scope="Not every airframe OEM, not commercial airliner twins, not jet/turbofan architectures.",
         cost_hour_label="$ / hour of lost sortie time",
         cost_unit_label="$ / aborted mission",
+        part_hints=AVIATION_PART_HINTS,
     ),
     "automotive_powertrain": _pack(
         pack_id="automotive_powertrain",
@@ -288,6 +307,12 @@ def extra_field_defs(pack_id: Optional[str]) -> list[tuple[str, str]]:
     return [(name, spec["label"]) for name, spec in extras.items()]
 
 
+def part_hints_for(pack_id: Optional[str]) -> dict[str, str]:
+    """Aviation keyword → sensor map. Other packs return {}."""
+    hints = get_pack(pack_id).get("part_hints") or {}
+    return {str(k): str(v) for k, v in hints.items() if k and v}
+
+
 def preferred_y_metric(df: Any, pack_id: Optional[str]) -> Optional[str]:
     """First pack chart metric that exists as a numeric column on df."""
     if df is None:
@@ -382,4 +407,13 @@ def validate_packs() -> list[str]:
         problems.append("aviation pack must cite SIH26054")
     if "SIH26120" not in PACKS["oil_srp"]["sih"]:
         problems.append("oil pack must cite SIH26120")
+    av_hints = PACKS["aviation_uav_piston"].get("part_hints") or {}
+    for token in ("exhaust", "cyl", "oil", "crank"):
+        if token not in av_hints:
+            problems.append(f"aviation part_hints missing '{token}'")
+    for pid in PACKS:
+        if pid == "aviation_uav_piston":
+            continue
+        if PACKS[pid].get("part_hints"):
+            problems.append(f"{pid} must not ship part_hints (aviation-only)")
     return problems
