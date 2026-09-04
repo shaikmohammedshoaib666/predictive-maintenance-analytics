@@ -414,6 +414,14 @@ def main() -> int:
         assert "needleFor" in html and "walkRegion" in html and "paintRegion" in html
         assert "sanitizeName" in html
         assert "Low" not in _RGBA and "Unknown" not in _RGBA
+        # Region reports go out on the component channel, which reruns the whole
+        # Streamlit script. A timestamped payload on every re-render would loop.
+        report_js = html.split("function reportRegion(", 1)[1].split("function walkRegion(", 1)[0]
+        assert "ts:" not in report_js, report_js
+        assert "lastRegionKey" in report_js
+        assert "lastRegionKey = null" in html, "reset the dedupe key when the viewer is rebuilt"
+        assert "ts: Date.now()" in html, "part clicks still need a timestamp"
+
         needled = build_viewer_html(
             "t", "dXJuOmFi", asset="a", risk="High", needles=["exhaust", "oilpress"]
         )
@@ -1849,10 +1857,16 @@ def main() -> int:
         try:
             at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
             at.run()
+            # A High-risk asset so the region-tint copy is exercised.
+            at.session_state["live_asset_states"] = [
+                {"machine_id": "UAV-03", "risk_level": "High", "predicted_rul_days": 3},
+                {"machine_id": "UAV-07", "risk_level": "Low", "predicted_rul_days": 28},
+            ]
             next(r for r in at.radio if "Pipeline" in (r.label or "")).set_value(
                 "CAD Twin (APS)"
             ).run()
             assert not _errs(at), "CAD Twin render: " + "; ".join(_errs(at))
+            assert at.session_state["aps_asset_pick"] == "UAV-03"
 
             md = _texts(at.markdown)
             part_at = next(i for i, t in enumerate(md) if t.startswith("**Part**"))
@@ -1860,6 +1874,7 @@ def main() -> int:
             sensors_at = next(i for i, t in enumerate(md) if "Mapped sensors" in t)
             source_at = next(i for i, t in enumerate(md) if "Choose CAD file" in t)
             assert part_at < risk_at < sensors_at < source_at, md
+            assert ">High<" in md[risk_at], md[risk_at]
             header = next(t for t in md if 'class="sub-header"' in t)
             assert "default dark gray" in header and "red" in header and "orange" in header
             assert "whole model tints" not in header
@@ -1870,8 +1885,10 @@ def main() -> int:
             assert getattr(load, "disabled", False) is True
             assert len([b for b in at.button if b.label == "Open Anomaly & RUL"]) == 1
 
+            # No report from the viewer yet: explain the rule, claim nothing.
             captions = " ".join(_texts(at.caption))
-            assert "no extra tint" in captions or "matched" in captions
+            assert "turn red" in captions and "default dark gray" in captions, captions
+            assert "Name needles" in captions and "exhaust" in captions
             warnings = " ".join(_texts(at.warning))
             assert "Translate to SVF" in warnings, warnings
 
@@ -1886,7 +1903,8 @@ def main() -> int:
             infos = " ".join(_texts(at.info))
             assert "Load CAD model" in infos, infos
 
-            # A viewer region report renders the honest "nothing matched" line.
+            # A viewer region report with zero matches shows the honest line, not
+            # a claim that the engine went red.
             at.session_state["cad_region_report"] = {
                 "risk": "High",
                 "matched": 0,
@@ -1897,6 +1915,24 @@ def main() -> int:
             }
             at.run()
             assert not _errs(at), "region report: " + "; ".join(_errs(at))
+            blank = " ".join(_texts(at.warning))
+            assert "No CAD region matched" in blank, blank
+            assert "Solid1" in blank and "whole engine" in blank
+
+            # A report with matches names them instead.
+            at.session_state["cad_region_report"] = {
+                "risk": "High",
+                "matched": 3,
+                "nodes": 812,
+                "names": ["Exhaust manifold", "Cylinder Head 1", "Solid-1"],
+                "source": "tree",
+                "message": "",
+            }
+            at.run()
+            assert not _errs(at), "matched report: " + "; ".join(_errs(at))
+            hit = " ".join(_texts(at.success))
+            assert "3" in hit and "Exhaust manifold" in hit, hit
+            assert "No CAD region matched" not in " ".join(_texts(at.warning))
         finally:
             urns_dir.cleanup()
             for key, val in prev.items():

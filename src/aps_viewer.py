@@ -1350,6 +1350,7 @@ _VIEWER_TEMPLATE = """
   // paint the whole engine: drop the result when it covers more than this share.
   var SEARCH_MAX_SHARE=0.35, SEARCH_MIN_CAP=12, SEARCH_TIMEOUT_MS=4000;
   var viewer=null, lastUrn=null, lastToken=null, lastRisk=null, selectionWired=false;
+  var lastRegionKey=null;
   function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
     e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
   function errCode(err){
@@ -1459,16 +1460,23 @@ _VIEWER_TEMPLATE = """
     }
     return '';
   }
+  // Deliberately no timestamp, and skipped when unchanged: Streamlit reruns the
+  // script whenever a component value changes, and every rerun re-renders this
+  // iframe, which would re-apply theming and post again — an endless loop.
   function reportRegion(matched, nodes, names, source){
-    emitSelection({
+    var payload = {
       kind: 'region',
       matched: matched,
       nodes: nodes,
       names: (names || []).slice(0, 8),
       risk: RISK,
-      source: source,
-      ts: Date.now()
-    });
+      source: source
+    };
+    var key = '';
+    try { key = JSON.stringify(payload); } catch (e) { key = String(matched) + source; }
+    if (key && key === lastRegionKey) return;
+    lastRegionKey = key;
+    emitSelection(payload);
   }
   function walkRegion(v){
     var res = { ids: [], names: [], nodes: 0 };
@@ -1678,6 +1686,7 @@ _VIEWER_TEMPLATE = """
         try { viewer.tearDown(); } catch (e) {}
         try { viewer.finish(); } catch (e) {}
         selectionWired = false;
+        lastRegionKey = null;
         if (el) el.innerHTML = '';
       }
       viewer = new Autodesk.Viewing.GuiViewer3D(el, {
