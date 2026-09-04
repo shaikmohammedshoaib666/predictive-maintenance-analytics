@@ -404,9 +404,26 @@ def main() -> int:
         assert "explode: false" in html
         low_html = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low")
         assert "RISK_RGBA" in low_html
-        from src.cad_part import RISK_THEME_RGBA as _RGBA
+        from src.cad_part import REGION_THEME_RGBA as _RGBA
 
         assert str(_RGBA["High"][0]) in html
+
+        # Region tint, not whole-model theming: no enumNodeChildren-paint-everything.
+        assert "applyRegionTheming" in html
+        assert "applyAssetTheming" not in html
+        assert "needleFor" in html and "walkRegion" in html and "paintRegion" in html
+        assert "sanitizeName" in html
+        assert "Low" not in _RGBA and "Unknown" not in _RGBA
+        needled = build_viewer_html(
+            "t", "dXJuOmFi", asset="a", risk="High", needles=["exhaust", "oilpress"]
+        )
+        assert '"exhaust"' in needled and '"oilpress"' in needled
+        assert "var NEEDLES=" in needled and "__NEEDLES__" not in needled
+        # Default needles come from cad_part so the two stay in sync.
+        from src.cad_part import region_hint_keywords as _needles
+
+        assert f'"{_needles()[0]}"' in html
+
         bridge = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low", bridge=True)
         assert "streamlit:componentReady" in bridge
         assert "var BRIDGE=true" in bridge
@@ -495,7 +512,7 @@ def main() -> int:
         assert "Rotax 912" in A360_PUBLIC_URN_ERROR
         app_src = (ROOT / "app.py").read_text(encoding="utf-8")
         assert "A360_PUBLIC_URN_ERROR" in app_src
-        assert "if public_paste:" in app_src
+        assert 'urn_state.get("public_paste")' in app_src
 
         import tempfile
         from pathlib import Path
@@ -618,6 +635,8 @@ def main() -> int:
         assert part_sensor_hint("Oil Temperature Sender") == "oil_temp"
         assert part_sensor_hint("Crankshaft") == "rpm"
         assert part_sensor_hint("Exhaust manifold") == "egt"
+        assert part_sensor_hint("Intake manifold") == "manifold_pressure"
+        assert part_sensor_hint("Manifold") == "manifold_pressure"
         assert part_sensor_hint("EGT probe") == "egt"
         assert part_sensor_hint("Temperature sensor") == "temperature"
         assert part_sensor_hint("Vibration pickup") == "vibration"
@@ -665,6 +684,157 @@ def main() -> int:
         assert parse_cad_part_event({"name": "Cyl", "dbId": 12, "properties": {"Name": "Cyl"}})["name"] == "Cyl"
         assert parse_cad_part_event({"cleared": True})["cleared"] is True
         assert parse_cad_part_event("nope") is None
+
+        # Region events share the component channel; they must not clobber the part.
+        assert parse_cad_part_event({"kind": "region", "matched": 0}) is None
+        assert parse_cad_part_event({"kind": "part", "name": "Cyl", "dbId": 1})["name"] == "Cyl"
+
+    def test_cad_node_name_sanitizer() -> None:
+        """Autodesk mojibake node names must never reach the UI as ``??????``."""
+        from src.cad_part import (
+            build_part_card,
+            parse_cad_part_event,
+            parse_cad_region_event,
+            sanitize_node_name,
+        )
+
+        # The exact live case: non-UTF8 STEP export of a Rotax solid.
+        assert sanitize_node_name("?????? ??????-1-solid1") == "Solid-1"
+        assert sanitize_node_name("?????? ??????-1-solid1", 55) == "Solid-1"
+        assert "?" not in sanitize_node_name("?????? ??????-1-solid1")
+        assert sanitize_node_name("?? ?? -2-solid4", 77) == "Solid-2"
+        assert sanitize_node_name("\ufffd\ufffd\ufffd", 42) == "Solid-42"
+        assert sanitize_node_name("", 7) == "Solid-7"
+        assert sanitize_node_name(None, 7) == "Solid-7"
+        assert sanitize_node_name("??????") == "Solid"
+        assert sanitize_node_name("??????", 12) == "Solid-12"
+        assert sanitize_node_name("?????-3", 99) == "Solid-3"
+        assert sanitize_node_name("solid9") == "solid9"
+        assert sanitize_node_name("??solid9", 4) == "Solid-9"
+        # Readable names pass through untouched; asset ids are never sanitized here.
+        assert sanitize_node_name("Cylinder Head", 3) == "Cylinder Head"
+        assert sanitize_node_name("  Oil  Pump   Housing ", 9) == "Oil Pump Housing"
+        assert sanitize_node_name("Cylinder ?? Head", 3) == "Cylinder Head"
+        assert sanitize_node_name("UAV-03") == "UAV-03"
+        assert sanitize_node_name("\x00\x01Exhaust\x07", 2) == "Exhaust"
+
+        parsed = parse_cad_part_event({"name": "?????? ??????-1-solid1", "dbId": 55})
+        assert parsed["display"] == "Solid-1"
+        assert parsed["name"] == "?????? ??????-1-solid1"
+        card = build_part_card(part_name="?????? ??????-1-solid1", asset_id="UAV-03", risk="High", db_id=55)
+        assert card["part_name"] == "Solid-1"
+        assert "?" not in card["part_name"]
+        assert card["raw_part_name"] == "?????? ??????-1-solid1"
+        assert card["asset_id"] == "UAV-03"
+        assert build_part_card(part_name="", asset_id="UAV-03", risk="Low")["part_name"] == "—"
+
+        report = parse_cad_region_event(
+            {"kind": "region", "matched": 2, "nodes": 40, "names": ["?????-1-solid1", "Exhaust"], "risk": "high"}
+        )
+        assert report["matched"] == 2 and report["risk"] == "High"
+        assert report["names"] == ["Solid-1", "Exhaust"]
+        assert report["message"] == ""
+        empty = parse_cad_region_event({"kind": "region", "matched": 0, "nodes": 40, "risk": "High"})
+        assert empty["matched"] == 0 and "No CAD region matched" in empty["message"]
+        assert parse_cad_region_event({"name": "Cyl", "dbId": 1}) is None
+        assert parse_cad_region_event("nope") is None
+
+    def test_cad_region_tint() -> None:
+        """Only hint-matched dbIds get tinted. Zero matches never reddens the model."""
+        from src.cad_part import (
+            NO_REGION_MATCH_MSG,
+            REGION_THEME_RGBA,
+            region_hint_keywords,
+            region_matches,
+            region_theme_plan,
+            region_theme_rgba,
+        )
+
+        assert region_theme_rgba("High") == REGION_THEME_RGBA["High"]
+        assert region_theme_rgba("medium") == REGION_THEME_RGBA["Medium"]
+        assert region_theme_rgba("Low") is None, "Low must not tint anything"
+        assert region_theme_rgba("Unknown") is None
+        assert region_theme_rgba("") is None
+        assert set(REGION_THEME_RGBA) == {"High", "Medium"}
+
+        needles = region_hint_keywords("aviation_uav_piston", available=["egt", "cht", "oil_pressure"])
+        assert all(len(n) >= 3 for n in needles)
+        assert needles == sorted(needles, key=len, reverse=True), "longest needle must win"
+        for want in ("exhaust", "manifold", "vibration", "crank", "rpm", "oilpressure"):
+            assert want in needles, (want, needles)
+        assert len(needles) == len(set(needles))
+        assert "machineid" not in needles and "timestamp" not in needles
+
+        # 1) High + zero name matches → empty dbId list, honest message, no tint.
+        solids = {0: "Assembly", 1: "Solid1", 2: "Solid2", 3: "?????? ??????-1-solid1"}
+        blank = region_theme_plan(solids, "High", pack_id="aviation_uav_piston")
+        assert blank["dbIds"] == [], blank
+        assert blank["matched"] == 0 and blank["tint"] is False
+        assert blank["nodes"] == 4
+        assert blank["message"] == NO_REGION_MATCH_MSG
+        assert "Solid1" in blank["message"] and "whole engine" in blank["message"]
+        assert blank["rgba"] == REGION_THEME_RGBA["High"], "color known, just nothing to paint"
+
+        # 2) High + an "exhaust" node → that id is in the red set, the bolt is not.
+        named = {0: "Rotax 912", 1: "Exhaust manifold", 2: "Bolt_14", 3: "Cylinder Head 3"}
+        hot = region_theme_plan(named, "High", pack_id="aviation_uav_piston", available=["egt", "cht"])
+        assert 1 in hot["dbIds"] and 3 in hot["dbIds"]
+        assert 2 not in hot["dbIds"] and 0 not in hot["dbIds"]
+        assert hot["tint"] is True and hot["message"] == ""
+        assert hot["rgba"] == REGION_THEME_RGBA["High"]
+        assert hot["matched"] == 2 and hot["nodes"] == 4
+        by_id = {m["dbId"]: m for m in hot["matches"]}
+        assert "exhaust" in by_id[1]["keyword"] and by_id[1]["sensor"] == "egt"
+        assert by_id[3]["sensor"] == "cht"
+
+        # 3) Same nodes, Medium → orange. Low / Unknown → nothing at all.
+        mid = region_theme_plan(named, "Medium", pack_id="aviation_uav_piston")
+        assert mid["dbIds"] == hot["dbIds"]
+        assert mid["rgba"] == REGION_THEME_RGBA["Medium"]
+        for quiet in ("Low", "Unknown", "", None):
+            plan = region_theme_plan(named, quiet, pack_id="aviation_uav_piston")
+            assert plan["rgba"] is None and plan["dbIds"] == [] and plan["message"] == ""
+
+        # Mojibake names still match on the readable fragment.
+        moji = region_theme_plan({7: "?????? exhaust-1-solid1"}, "High", pack_id="aviation_uav_piston")
+        assert moji["dbIds"] == [7]
+        assert moji["matches"][0]["display"] == "Solid-1"
+
+        # Node shapes: dict, (dbId, name) pairs, and [{"dbId":…, "name":…}].
+        pairs = region_matches([(11, "Oil Pump"), (12, "Washer")], pack_id="aviation_uav_piston")
+        assert [m["dbId"] for m in pairs] == [11]
+        dicts = region_matches([{"dbId": 21, "name": "Crankshaft"}, {"dbId": 22, "name": "Nut"}])
+        assert [m["dbId"] for m in dicts] == [21]
+        assert region_matches(None) == [] and region_matches([]) == []
+        assert region_theme_plan({}, "High")["dbIds"] == []
+        # A session sensor column widens matching beyond the built-in keyword table.
+        assert "coolanttemp" in region_hint_keywords("plant_rotating", available=["coolant_temp"])
+        assert "coolanttemp" not in region_hint_keywords("plant_rotating")
+        custom = region_matches(
+            {5: "Coolant temp housing"}, available=["coolant_temp"], pack_id="plant_rotating"
+        )
+        assert [m["dbId"] for m in custom] == [5]
+        assert custom[0]["keyword"] == "coolanttemp"
+        assert region_matches({5: "Coolant housing"}, available=["coolant_temp"]) == []
+
+    def test_cad_sensor_grid() -> None:
+        """Mapped sensors chunk into rows of 3–4 so the viewer stays on-screen."""
+        from src.cad_part import format_sensor_value, sensor_grid_rows
+
+        sensors = {"temperature": 71.23456, "egt": 700, "vibration": 0.0421, "rpm": 5400, "cht": 180.5}
+        rows = sensor_grid_rows(sensors, per_row=4)
+        assert [len(r) for r in rows] == [4, 1]
+        assert rows[0][0] == ("temperature", "71.2")
+        assert rows[0][1] == ("egt", "700")
+        assert rows[1] == [("cht", "180")]
+        assert sum(len(r) for r in rows) == len(sensors)
+        assert [len(r) for r in sensor_grid_rows(sensors, per_row=3)] == [3, 2]
+        assert sensor_grid_rows({}) == [] and sensor_grid_rows(None) == []
+        assert [len(r) for r in sensor_grid_rows(sensors, per_row=0)] == [1, 1, 1, 1, 1]
+        assert format_sensor_value(None) == "—"
+        assert format_sensor_value(1234567) == "1,234,567"
+        assert format_sensor_value(0.000123456) == "0.000123"
+        assert format_sensor_value("n/a") == "n/a"
 
     def test_aps_translate_mocked() -> None:
         """OSS signed-upload + MD job + poll — mocked HTTP only. Never hits Autodesk."""
@@ -1587,6 +1757,154 @@ def main() -> int:
         assert sidebar is not None
         assert "industry_pack" not in {k for _, k in _session_state_writes(sidebar)}
 
+    def test_cad_twin_layout_order() -> None:
+        """CAD Twin renders strip → GuiViewer3D → sensors → admin, in that order.
+
+        The whole point of the layout: the user sees the engine without scrolling
+        past a tall sensor column, and the uploader / URN controls never push the
+        viewer off-screen.
+        """
+        import ast
+
+        _, tree = _app_ast()
+        page = _fn_named(tree, "page_cad_twin")
+        assert page is not None
+
+        wanted = (
+            "render_cad_part_card",
+            "_render_cad_viewer_section",
+            "render_cad_region_note",
+            "render_cad_sensor_grid",
+            "_render_cad_source_panel",
+        )
+        seen: dict[str, int] = {}
+        for n in ast.walk(page):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in wanted:
+                seen.setdefault(n.func.id, n.lineno)
+        missing = [name for name in wanted if name not in seen]
+        assert not missing, f"page_cad_twin must call {missing}"
+        order = [seen[name] for name in wanted]
+        assert order == sorted(order), f"CAD Twin layout out of order: {seen}"
+
+        # The viewer itself is only rendered from the viewer section.
+        callers = {
+            fn.name
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef)
+            and any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_render_cad_viewer"
+                for n in ast.walk(fn)
+            )
+        }
+        assert callers == {"_render_cad_viewer_section"}, callers
+
+        strip = _fn_named(tree, "render_cad_part_card")
+        grid = _fn_named(tree, "render_cad_sensor_grid")
+        assert strip is not None and grid is not None
+        strip_keys = {k for _, k in _literal_widget_keys(strip)}
+        assert {"aps_asset_pick", "aps_load_cad_btn", "cad_open_anomaly_rul"} <= strip_keys
+        strip_src = ast.dump(strip)
+        assert "sensor_grid_rows" not in strip_src, "sensors belong below the viewer"
+        assert "sensor_grid_rows" in ast.dump(grid)
+
+        # 3–4 mapped sensor values per row, never one tall column.
+        per_row = None
+        for n in ast.walk(grid):
+            if isinstance(n, ast.arg) and n.arg == "per_row":
+                per_row = n
+        assert per_row is not None, "render_cad_sensor_grid needs a per_row width"
+        default = grid.args.kw_defaults[-1] if grid.args.kw_defaults else None
+        assert isinstance(default, ast.Constant) and 3 <= int(default.value) <= 4, ast.dump(grid.args)
+
+        # The admin controls live inside an expander so they stay collapsed.
+        page_src = (ROOT / "app.py").read_text(encoding="utf-8")
+        assert 'with st.expander("CAD source' in page_src
+        assert "_render_cad_source_panel(pack, pack_id" in page_src
+
+    def test_cad_twin_apptest_layout() -> None:
+        """Render the CAD Twin page and assert the on-page order + honest copy."""
+        import tempfile as _tf
+        from pathlib import Path as _Path
+
+        from streamlit.testing.v1 import AppTest
+
+        from src.cad_part import NO_REGION_MATCH_MSG
+
+        def _errs(at) -> list[str]:
+            return [getattr(e, "message", str(e)) for e in at.exception]
+
+        def _texts(items) -> list[str]:
+            out: list[str] = []
+            for item in items:
+                out.append(
+                    str(getattr(item, "value", None) or getattr(item, "body", None) or "")
+                )
+            return out
+
+        prev = {k: os.environ.get(k) for k in ("APS_CLIENT_ID", "APS_CLIENT_SECRET", "PDM_CAD_URNS_PATH")}
+        urns_dir = _tf.TemporaryDirectory()
+        os.environ["PDM_CAD_URNS_PATH"] = str(_Path(urns_dir.name) / "cad_urns.json")
+        os.environ["APS_CLIENT_ID"] = "LayoutTestClientId"
+        os.environ["APS_CLIENT_SECRET"] = "layout-test-secret-not-real"
+        try:
+            at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+            at.run()
+            next(r for r in at.radio if "Pipeline" in (r.label or "")).set_value(
+                "CAD Twin (APS)"
+            ).run()
+            assert not _errs(at), "CAD Twin render: " + "; ".join(_errs(at))
+
+            md = _texts(at.markdown)
+            part_at = next(i for i, t in enumerate(md) if t.startswith("**Part**"))
+            risk_at = next(i for i, t in enumerate(md) if t.startswith("**Risk**"))
+            sensors_at = next(i for i, t in enumerate(md) if "Mapped sensors" in t)
+            source_at = next(i for i, t in enumerate(md) if "Choose CAD file" in t)
+            assert part_at < risk_at < sensors_at < source_at, md
+            header = next(t for t in md if 'class="sub-header"' in t)
+            assert "default dark gray" in header and "red" in header and "orange" in header
+            assert "whole model tints" not in header
+
+            # Asset picker sits in the strip; Load CAD is disabled with no URN.
+            assert any((s.label or "") == "Asset" for s in at.selectbox)
+            load = next(b for b in at.button if b.label == "Load CAD model")
+            assert getattr(load, "disabled", False) is True
+            assert len([b for b in at.button if b.label == "Open Anomaly & RUL"]) == 1
+
+            captions = " ".join(_texts(at.caption))
+            assert "no extra tint" in captions or "matched" in captions
+            warnings = " ".join(_texts(at.warning))
+            assert "Translate to SVF" in warnings, warnings
+
+            # Paste a URN from our own bucket: Load enables, nothing auto-loads
+            # (no saved / env URN), so no Autodesk call happens in this test.
+            own = "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6cGRtLWFwcC1jYWQvcm90YXguc3RlcA"
+            next(t for t in at.text_input if "URN" in (t.label or "")).set_value(own).run()
+            assert not _errs(at), "URN paste: " + "; ".join(_errs(at))
+            assert at.session_state["aps_urn"] == own
+            load2 = next(b for b in at.button if b.label == "Load CAD model")
+            assert getattr(load2, "disabled", False) is False
+            infos = " ".join(_texts(at.info))
+            assert "Load CAD model" in infos, infos
+
+            # A viewer region report renders the honest "nothing matched" line.
+            at.session_state["cad_region_report"] = {
+                "risk": "High",
+                "matched": 0,
+                "nodes": 812,
+                "names": [],
+                "source": "none",
+                "message": NO_REGION_MATCH_MSG,
+            }
+            at.run()
+            assert not _errs(at), "region report: " + "; ".join(_errs(at))
+        finally:
+            urns_dir.cleanup()
+            for key, val in prev.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+
     def test_upload_load_buttons_apptest() -> None:
         """Clicking Load Plant / Load pack demo / CSV upload must not raise StreamlitAPIException."""
         from streamlit.testing.v1 import AppTest
@@ -1721,6 +2039,9 @@ def main() -> int:
     check("polars_engine", test_polars_engine)
     check("aps_viewer", test_aps_viewer)
     check("cad_part_click", test_cad_part_click)
+    check("cad_node_name_sanitizer", test_cad_node_name_sanitizer)
+    check("cad_region_tint", test_cad_region_tint)
+    check("cad_sensor_grid", test_cad_sensor_grid)
     check("aps_translate_mocked", test_aps_translate_mocked)
     check("aps_zip_root_filename", test_aps_zip_root_filename)
     check("charts_layout", test_charts)
@@ -1734,6 +2055,8 @@ def main() -> int:
     check("streamlit_widget_keys_unique", test_streamlit_widget_keys_unique)
     check("no_widget_key_writes_after_instantiate", test_no_widget_key_writes_after_instantiate)
     check("load_pack_sample_queues_pending", test_load_pack_sample_queues_pending)
+    check("cad_twin_layout_order", test_cad_twin_layout_order)
+    check("cad_twin_apptest_layout", test_cad_twin_apptest_layout)
     check("upload_load_buttons_apptest", test_upload_load_buttons_apptest)
 
     if errors:
