@@ -117,11 +117,16 @@ from src.aps_viewer import (
     translate_cad_bytes,
 )
 from src.cad_part import (
+    NO_REGION_MATCH_MSG,
     build_part_card,
     latest_asset_sensors,
     parse_cad_part_event,
+    parse_cad_region_event,
     part_sensor_hint,
+    region_hint_keywords,
     risk_theme_hex,
+    sanitize_node_name,
+    sensor_grid_rows,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
@@ -140,7 +145,12 @@ from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
 from src.pack_kpis import compute_pack_kpis, insight_cards_from_kpis
-from src.twin3d import RISK_COLORS, asset_states_from_predictions, build_twin_html
+from src.twin3d import (
+    RISK_COLORS,
+    asset_states_from_predictions,
+    build_twin_html,
+    normalize_risk,
+)
 from src.quality_checks import QUALITY_STAGE_COUNT
 from src.sensor_map import CANONICAL_FIELDS, apply_mapping, mapping_status, suggest_mapping
 from src.polars_clean import clean_with_polars, polars_available
@@ -224,6 +234,8 @@ def init_session_state():
         # Autodesk APS CAD twin — URN from APS_MODEL_URN, pack JSON save, or paste
         "aps_urn": "",
         "cad_selected_part": None,
+        # Region-tint report posted back by GuiViewer3D (how many dbIds matched)
+        "cad_region_report": None,
         "pipeline_page": "1. Upload & Clean",
         # Industry pack (Plant is the default; 3D + KPIs switch with this)
         "industry_pack": DEFAULT_PACK_ID,
@@ -1541,11 +1553,20 @@ def _cad_viewer_component():
     """GuiViewer3D as a Streamlit custom component so part clicks reach Python."""
     global _CAD_VIEWER_COMPONENT
     if _CAD_VIEWER_COMPONENT is None:
-        index = CAD_VIEWER_COMPONENT_DIR / "index.html"
-        if not index.is_file():
-            from src.aps_viewer import write_cad_viewer_component
+        from src.aps_viewer import viewer_bridge_html, write_cad_viewer_component
 
-            write_cad_viewer_component(CAD_VIEWER_COMPONENT_DIR)
+        # Self-heal a missing or stale index.html (the region-tint needles and the
+        # name sanitizer are baked into it) so a Render deploy never serves old JS.
+        index = CAD_VIEWER_COMPONENT_DIR / "index.html"
+        try:
+            current = index.read_text(encoding="utf-8") if index.is_file() else ""
+        except OSError:
+            current = ""
+        if current != viewer_bridge_html():
+            try:
+                write_cad_viewer_component(CAD_VIEWER_COMPONENT_DIR)
+            except OSError:
+                pass
         _CAD_VIEWER_COMPONENT = components.declare_component(
             "pdm_cad_viewer",
             path=str(CAD_VIEWER_COMPONENT_DIR),
@@ -1554,6 +1575,11 @@ def _cad_viewer_component():
 
 
 def _store_cad_part_event(event: Any) -> None:
+    """Route one component payload: a clicked part, or a region-tint report."""
+    region = parse_cad_region_event(event)
+    if region is not None:
+        st.session_state.cad_region_report = region
+        return
     parsed = parse_cad_part_event(event)
     if parsed is None:
         return
@@ -1563,60 +1589,133 @@ def _store_cad_part_event(event: Any) -> None:
     st.session_state.cad_selected_part = parsed
 
 
-def render_cad_part_card(sel: dict[str, Any], pack_id: str) -> None:
-    """Asset identity + optional clicked Autodesk part. Isolation Forest is per-asset."""
+def _cad_asset_context(sel: dict[str, Any], pack_id: str) -> dict[str, Any]:
+    """Card model + mapped sensors + clicked-part hint. Pure read of session state."""
     asset_id = str(sel.get("machine_id") or "asset")
-    risk = str(sel.get("risk_level") or "Unknown")
-    rul = sel.get("predicted_rul_days")
-    df = get_active_df()
-    sensors = latest_asset_sensors(df, asset_id)
+    sensors = latest_asset_sensors(get_active_df(), asset_id)
     part = st.session_state.get("cad_selected_part") or {}
     part_name = str(part.get("name") or "")
-    hint = part_sensor_hint(part_name, pack_id=pack_id, available=list(sensors.keys())) if part_name else None
+    hint = (
+        part_sensor_hint(part_name, pack_id=pack_id, available=list(sensors.keys()))
+        if part_name
+        else None
+    )
     card = build_part_card(
         part_name=part_name,
         asset_id=asset_id,
-        risk=risk,
-        rul_days=rul,
+        risk=str(sel.get("risk_level") or "Unknown"),
+        rul_days=sel.get("predicted_rul_days"),
         sensors=sensors,
         hint=hint,
+        db_id=part.get("dbId"),
     )
+    return {"card": card, "sensors": sensors, "hint": hint, "part": part}
 
-    st.markdown("#### Selected part")
-    st.caption(card["honesty"])
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(f"**Part:** `{card['part_name']}`")
+
+def render_cad_part_card(
+    states: list[dict[str, Any]],
+    pack_id: str,
+    *,
+    can_load: bool = False,
+) -> dict[str, Any]:
+    """Part · Asset · Risk strip + page actions, rendered **above** the viewer.
+
+    Returns the picked asset state plus whether Load CAD model was clicked. The
+    mapped-sensor values live in ``render_cad_sensor_grid`` below the viewer so a
+    long sensor list never pushes GuiViewer3D off-screen.
+    """
+    ids = [s["machine_id"] for s in states] or ["asset"]
+    strip = st.columns([1.2, 1.7, 1.1, 1.5])
+    with strip[0]:
+        selected = st.selectbox("Asset", ids, key="aps_asset_pick")
+    sel = next(
+        (s for s in states if s["machine_id"] == selected),
+        {"machine_id": selected, "risk_level": "Unknown"},
+    )
+    ctx = _cad_asset_context(sel, pack_id)
+    card = ctx["card"]
+    part = ctx["part"]
+
+    with strip[1]:
+        st.markdown(f"**Part** `{card['part_name']}`")
         if part.get("dbId") is not None:
-            st.caption(f"Viewer dbId `{part['dbId']}`")
-    with c2:
-        st.markdown(f"**Asset:** `{card['asset_id']}`")
-    with c3:
-        hex_color = risk_theme_hex(card["risk"])
+            st.caption(f"Viewer dbId `{part['dbId']}` · click a part in the viewer")
+        else:
+            st.caption("Click any part in the viewer to name it")
+    with strip[2]:
         st.markdown(
-            f'**Risk:** <span style="color:{hex_color};font-weight:700">{card["risk"]}</span>',
+            f'**Risk** <span style="color:{risk_theme_hex(card["risk"])};font-weight:700">'
+            f'{card["risk"]}</span>',
             unsafe_allow_html=True,
         )
         if card["rul_days"] is not None and card["rul_days"] != "":
             st.caption(f"RUL ≈ {card['rul_days']} days")
+    with strip[3]:
+        load_clicked = st.button(
+            "Load CAD model",
+            type="primary",
+            key="aps_load_cad_btn",
+            disabled=not can_load,
+            help=(
+                "Fetch an APS token and open this URN in GuiViewer3D."
+                if can_load
+                else "Add APS credentials and a translated URN below first."
+            ),
+        )
+        if st.button("Open Anomaly & RUL", key="cad_open_anomaly_rul"):
+            request_pipeline_page(ANOMALY_RUL_PAGE)
+            st.rerun()
+    st.caption(card["honesty"])
+    return {"sel": sel, "selected": selected, "load_clicked": bool(load_clicked), **ctx}
 
-    if sensors:
-        st.markdown("**Mapped sensors** (latest row for this asset)")
-        for name, value in sensors.items():
-            if isinstance(value, float):
-                shown = f"{value:.3g}"
-            else:
-                shown = str(value)
-            if hint and name == hint:
-                st.success(f"**{name}:** {shown}  — matches this part name")
-            else:
-                st.write(f"{name}: {shown}")
-    else:
-        st.caption("No mapped sensor values in session yet — clean / map a CSV, then run Anomaly & RUL.")
 
-    if st.button("Open Anomaly & RUL", type="primary", key="cad_open_anomaly_rul"):
-        request_pipeline_page(ANOMALY_RUL_PAGE)
-        st.rerun()
+def render_cad_sensor_grid(ctx: dict[str, Any], *, per_row: int = 4) -> None:
+    """Mapped sensors **below** the viewer, ``per_row`` values per row."""
+    sensors = ctx.get("sensors") or {}
+    hint = ctx.get("hint")
+    st.markdown("##### Mapped sensors — latest row for this asset")
+    if not sensors:
+        st.caption(
+            "No mapped sensor values in session yet — clean / map a CSV, then run Anomaly & RUL."
+        )
+        return
+    for row in sensor_grid_rows(sensors, per_row=per_row):
+        cols = st.columns(per_row)
+        for col, (name, shown) in zip(cols, row):
+            with col:
+                st.metric(name, shown)
+                if hint and name == hint:
+                    st.caption("matches the clicked part")
+
+
+def render_cad_region_note(risk: str, pack_id: str) -> None:
+    """What the region tint did, or why it left the engine its default color."""
+    level = normalize_risk(risk)
+    report = st.session_state.get("cad_region_report") or {}
+    tint_word = {"High": "red", "Medium": "orange"}.get(level, "")
+    if not tint_word:
+        st.caption(
+            f"Asset risk is **{level}** — no extra tint. The engine keeps its default "
+            "dark gray; only High (red) and Medium (orange) tint the matched CAD region."
+        )
+        return
+    matched = int(report.get("matched") or 0)
+    if report and matched:
+        names = ", ".join(f"`{n}`" for n in report.get("names") or [])
+        st.success(
+            f"Region tint: **{matched}** CAD node(s) matching this asset's hot sensors are "
+            f"**{tint_word}**. Everything else keeps the default color."
+            + (f" Matched: {names}." if names else "")
+        )
+        return
+    if report:
+        st.warning(NO_REGION_MATCH_MSG)
+        return
+    keywords = ", ".join(f"`{k}`" for k in region_hint_keywords(pack_id)[:8])
+    st.caption(
+        f"Asset risk is **{level}** — CAD nodes whose Autodesk name matches a mapped sensor "
+        f"turn {tint_word}; the rest stay default dark gray. Name needles: {keywords}, …"
+    )
 
 
 def _seed_cad_urn_widgets(pack_id: str) -> dict:
@@ -1702,7 +1801,17 @@ def _delete_pack_urn(pack_id: str) -> dict:
     return result
 
 
-def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_viewer: bool) -> None:
+def _render_cad_viewer(
+    *,
+    token: str,
+    urn: str,
+    asset: str,
+    risk: str,
+    public_viewer: bool,
+    needles: Optional[list[str]] = None,
+) -> None:
+    """GuiViewer3D + the node-name needles that decide which dbIds get tinted."""
+    hints = list(needles or [])
     html = build_viewer_html(
         token,
         urn,
@@ -1710,6 +1819,7 @@ def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_vi
         risk=risk,
         height=DEFAULT_VIEWER_HEIGHT,
         public_viewer=public_viewer,
+        needles=hints,
     )
     st.session_state.aps_viewer_html = html
     st.session_state.aps_viewer_urn = urn
@@ -1726,6 +1836,7 @@ def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_vi
             public=bool(public_viewer),
             extras=list(VIEWER_EXTRA_EXTENSIONS),
             viewer_err={str(k): v for k, v in VIEWER_ERROR_CODES.items()},
+            needles=hints,
             default=None,
             key="cad_gui_viewer",
         )
@@ -1736,65 +1847,152 @@ def _render_cad_viewer(*, token: str, urn: str, asset: str, risk: str, public_vi
 
 
 # ── CAD Twin — Autodesk APS (Upgrade 3) ───────────────────────────────────────
-def page_cad_twin():
-    st.markdown('<p class="main-header">CAD Twin (Autodesk APS)</p>', unsafe_allow_html=True)
-    pack = active_pack()
-    pack_id = active_pack_id()
-    st.markdown(
-        f'<p class="sub-header">Real translated CAD for <b>{pack["label"]}</b> (Revit / Fusion / IFC / STEP → SVF). '
-        "Click a part for its Autodesk name + this <b>asset's</b> Isolation Forest risk "
-        "(the whole model tints red / amber / gray — not a guessed failing bolt). "
-        "GuiViewer3D full toolbar. Last working URN is saved on this server per industry pack — "
-        "not session-only. Credentials are runtime secrets.</p>",
-        unsafe_allow_html=True,
+def _cad_urn_state(pack_id: str) -> dict[str, Any]:
+    """URN + public-viewer verdict read from session state, before any widget.
+
+    GuiViewer3D renders near the top of the page — above the CAD-source panel
+    that owns ``key="aps_urn_input"`` — so the URN has to come from the session
+    value ``_seed_cad_urn_widgets`` already normalized this run.
+    """
+    raw = str(st.session_state.get("aps_urn_input") or st.session_state.get("aps_urn") or "")
+    extracted, meta = extract_model_urn(raw)
+    urn = extracted or normalize_model_urn(raw)
+    st.session_state.aps_urn = urn
+    public_paste = bool(
+        meta.get("public_viewer")
+        or meta.get("a360_protected")
+        or meta.get("block_load")
+        or looks_like_public_viewer(raw)
+        or looks_like_public_viewer(urn)
+        or (
+            st.session_state.get("aps_urn_from_public_viewer")
+            and urn
+            and urn == st.session_state.get("aps_public_viewer_urn")
+        )
     )
-
-    ok, msg = aps_available()
-    _seed_cad_urn_widgets(pack_id)
-    _seed_zip_root_widget()
-    status = cad_slot_status(st.session_state.get("aps_urn") or "", pack_id=pack_id)
     env_urn = normalize_model_urn(aps_model_urn())
+    return {
+        "raw": raw,
+        "urn": urn,
+        "meta": meta,
+        "public_paste": public_paste,
+        "env_urn": env_urn,
+        "seed_urn": env_urn or saved_urn_for_pack(pack_id),
+    }
 
+
+def _render_cad_viewer_section(
+    *,
+    ok: bool,
+    urn_state: dict[str, Any],
+    selected: str,
+    risk: str,
+    load_clicked: bool,
+    pack_id: str,
+    status: dict[str, Any],
+    needles: list[str],
+) -> None:
+    """The viewer slot itself — GuiViewer3D, or an honest placeholder."""
+    urn = str(urn_state.get("urn") or "").strip()
+    if not ok:
+        components.html(cad_placeholder_html(status=status, height=280), height=300)
+        return
+    if urn_state.get("public_paste"):
+        components.html(cad_placeholder_html(status=status, height=280), height=300)
+        st.error(f"**{A360_PUBLIC_URN_ERROR}**")
+        st.caption(
+            (urn_state.get("meta") or {}).get("warning")
+            or (PUBLIC_VIEWER_WARNING if urn else PUBLIC_VIEWER_NO_URN_WARNING)
+        )
+        st.session_state.aps_viewer_html = ""
+        st.session_state.aps_viewer_urn = ""
+        if load_clicked:
+            _persist_pack_urn(pack_id, urn, source="load", public_viewer=True)
+        return
+    if not urn:
+        components.html(cad_placeholder_html(status=status, height=280), height=300)
+        st.warning(
+            "Open **CAD source** below: choose a CAD file and click **Translate to SVF / get "
+            "URN**, paste a translated SVF URN from **your** bucket, or set APS_MODEL_URN on Render."
+        )
+        return
+
+    cache_urn = str(st.session_state.get("aps_viewer_urn") or "")
+    cache_html = str(st.session_state.get("aps_viewer_html") or "")
+    cache_at = float(st.session_state.get("aps_viewer_at") or 0)
+    cache_fresh = bool(
+        cache_html and cache_urn == urn and (datetime.now().timestamp() - cache_at) < 50 * 60
+    )
+    translate_log = st.session_state.get("aps_translate_log") or {}
+    translated = normalize_model_urn(str(translate_log.get("urn") or ""))
+    force = bool(st.session_state.get("aps_force_load"))
+    should_auto = urn == urn_state.get("seed_urn") or force or (
+        bool(translate_log.get("ok")) and urn == translated
+    )
+    if load_clicked or force:
+        st.session_state.aps_force_load = False
+
+    if load_clicked or (should_auto and not cache_fresh):
+        try:
+            with st.spinner("Fetching APS token and loading GuiViewer3D…"):
+                token = get_access_token()
+                _render_cad_viewer(
+                    token=token["access_token"],
+                    urn=urn,
+                    asset=selected,
+                    risk=risk,
+                    public_viewer=False,
+                    needles=needles,
+                )
+            persist = _persist_pack_urn(
+                pack_id, urn, source="load" if load_clicked else "auto", public_viewer=False
+            )
+            if persist.get("saved"):
+                st.caption(persist.get("message") or saved_urn_caption(pack_id))
+            elif persist.get("reason") == "public_viewer":
+                st.error(f"**{A360_PUBLIC_URN_ERROR}**")
+        except Exception as exc:
+            st.error(f"APS error: {exc}")
+            if INSUFFICIENT_SCOPE_HINT in str(exc):
+                st.info(INSUFFICIENT_SCOPE_HINT)
+        return
+    if cache_fresh:
+        cached_token = str(st.session_state.get("aps_viewer_token") or "")
+        if cached_token:
+            _render_cad_viewer(
+                token=cached_token,
+                urn=urn,
+                asset=selected,
+                risk=risk,
+                public_viewer=False,
+                needles=needles,
+            )
+        else:
+            components.html(cache_html, height=_cad_iframe_height())
+        save_info = st.session_state.get("aps_save_log") or {}
+        if save_info.get("saved") and save_info.get("urn") == urn:
+            st.caption(save_info.get("message") or saved_urn_caption(pack_id))
+        return
+    components.html(cad_placeholder_html(status=status, height=280), height=300)
+    st.info("URN is ready — click **Load CAD model** above to open it in GuiViewer3D.")
+
+
+def _render_cad_source_panel(
+    pack: dict[str, Any],
+    pack_id: str,
+    *,
+    ok: bool,
+    urn_state: dict[str, Any],
+) -> bool:
+    """Uploader → translate → URN → save/delete. Returns True when we must rerun.
+
+    Lives **below** the viewer so admin controls never push the engine off-screen.
+    Write order matters: anything that seeds ``aps_zip_root_filename`` or
+    ``aps_urn_input`` must run before that widget is created in this function.
+    """
+    needs_rerun = False
     if ok:
-        st.success(f"APS: {msg}")
-    else:
-        st.info(
-            "APS credentials are not on this deploy yet. The **3D Twin** (pack mesh) is the "
-            "credential-free twin. Add `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional "
-            "`APS_MODEL_URN`) on Render, reload, and this tile loads."
-        )
-        st.caption(f"Status: {msg}")
-
-    with st.expander("How to generate a URN (APS app + this page)", expanded=not ok):
-        st.markdown(
-            "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) with "
-            "**Model Derivative** and **Data Management** APIs enabled. Copy **Client ID** + **Client Secret**.\n"
-            "2. On Render → Environment, set `APS_CLIENT_ID` and `APS_CLIENT_SECRET` "
-            "(optional `APS_MODEL_URN` if you already have a translated model — that env var is the "
-            "override that survives Render redeploys).\n"
-            "3. **Generate a URN here:** choose a CAD file → **Translate to SVF / get URN**. "
-            "That puts the model in **your** OSS bucket (using `APS_CLIENT_ID` / `APS_CLIENT_SECRET` on Render). "
-            "viewer.autodesk.com is Autodesk’s public website — it does **not** put the file in your bucket; "
-            "there is no “move from viewer to my bucket” button. "
-            "We then save that URN for this pack "
-            f"({pack['short']}) in a JSON file on this server.\n"
-            "4. Pasting a [viewer.autodesk.com](https://viewer.autodesk.com) link only extracts the "
-            "`dXJu…` URN. It will **not** load with your app token unless that object is in your bucket. "
-            "Do not rely on saving a public-viewer URN.\n"
-            "5. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
-            "`bucket:read` in addition to `viewables:read`.\n"
-            "6. **Save URN for this pack** / **Delete saved URN** write or clear `data/cad_urns.json` "
-            "for this industry pack. Close the tab and come back — CAD Twin auto-loads the saved URN "
-            "while this service is up. After a Render **redeploy** the disk is wiped; set `APS_MODEL_URN` too."
-        )
-        st.caption(INSUFFICIENT_SCOPE_HINT)
-        st.markdown(
-            f"Need a tiny test file? Autodesk’s Model Derivative tutorial includes a sample Inventor "
-            f"part (`box.ipt`): [prep a file for the viewer]({APS_SAMPLE_CAD_URL})."
-        )
-
-    if ok:
-        st.subheader("Choose CAD file → translate → URN")
+        st.markdown("**Choose CAD file → translate → URN**")
         cad_file = st.file_uploader(
             "CAD file for Model Derivative",
             type=list(CAD_UPLOAD_EXTENSIONS),
@@ -1900,6 +2098,8 @@ def page_cad_twin():
                             st.session_state.aps_translate_log = result
                             st.session_state.aps_force_load = True
                             box.update(label="Translation succeeded", state="complete")
+                            # The viewer slot is above this panel; rerun so it loads now.
+                            needs_rerun = True
                         elif result.get("phase") == "timeout":
                             box.update(label="Still translating on Autodesk", state="running")
                         else:
@@ -1920,45 +2120,21 @@ def page_cad_twin():
                 if INSUFFICIENT_SCOPE_HINT in str(log.get("message") or ""):
                     st.info(INSUFFICIENT_SCOPE_HINT)
 
-    states = asset_states_from_predictions(st.session_state.get("predictions") or []) or (
-        st.session_state.get("live_asset_states") or []
+    st.text_input(
+        "Translated model URN (base64) or viewer.autodesk.com URL",
+        key="aps_urn_input",
+        help=(
+            "Paste a dXJu URN, an Autodesk viewer URL (we extract the URN), "
+            "or use Translate above. APS_MODEL_URN on Render overrides the saved pack file."
+        ),
     )
-    ids = [s["machine_id"] for s in states] or ["asset"]
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        urn_raw = st.text_input(
-            "Translated model URN (base64) or viewer.autodesk.com URL",
-            key="aps_urn_input",
-            help=(
-                "Paste a dXJu URN, an Autodesk viewer URL (we extract the URN), "
-                "or use Translate above. APS_MODEL_URN on Render overrides the saved pack file."
-            ),
-        )
-        extracted, meta = extract_model_urn(urn_raw)
-        urn = extracted or normalize_model_urn(urn_raw)
-        st.session_state.aps_urn = urn
-        public_paste = bool(
-            meta.get("public_viewer")
-            or meta.get("a360_protected")
-            or meta.get("block_load")
-            or looks_like_public_viewer(urn_raw)
-            or looks_like_public_viewer(urn)
-            or (
-                st.session_state.get("aps_urn_from_public_viewer")
-                and urn
-                and urn == st.session_state.get("aps_public_viewer_urn")
-            )
-        )
-    with c2:
-        selected = st.selectbox("Asset", ids, key="aps_asset_pick")
-    sel = next((s for s in states if s["machine_id"] == selected), {"machine_id": selected, "risk_level": "Unknown"})
-
-    if public_paste:
+    urn = str(urn_state.get("urn") or "")
+    if urn_state.get("public_paste"):
         st.error(f"**{A360_PUBLIC_URN_ERROR}**")
-        if not urn:
-            st.caption(PUBLIC_VIEWER_NO_URN_WARNING)
-        else:
-            st.caption(meta.get("warning") or PUBLIC_VIEWER_WARNING)
+        st.caption(
+            (urn_state.get("meta") or {}).get("warning")
+            or (PUBLIC_VIEWER_WARNING if urn else PUBLIC_VIEWER_NO_URN_WARNING)
+        )
 
     save_col, delete_col = st.columns(2)
     with save_col:
@@ -1967,11 +2143,13 @@ def page_cad_twin():
         delete_clicked = st.button("Delete saved URN", key="aps_delete_urn_btn")
 
     if save_clicked:
-        if public_paste:
+        if urn_state.get("public_paste"):
             persist = _persist_pack_urn(pack_id, urn, source="save", public_viewer=True)
             st.warning(persist.get("message") or PUBLIC_VIEWER_WARNING)
         elif not urn:
-            st.warning("Nothing to save — paste a dXJu URN from your bucket or translate a CAD file first.")
+            st.warning(
+                "Nothing to save — paste a dXJu URN from your bucket or translate a CAD file first."
+            )
         else:
             persist = _persist_pack_urn(pack_id, urn, source="save", public_viewer=False)
             if persist.get("saved"):
@@ -1985,103 +2163,121 @@ def page_cad_twin():
         else:
             st.info(gone.get("message") or "No saved URN for this pack on this server.")
 
-    seed_urn = env_urn or saved_urn_for_pack(pack_id)
-    if env_urn:
+    if urn_state.get("env_urn"):
         st.caption(
             "Render `APS_MODEL_URN` is set and overrides the pack JSON as the default URN. "
             "We do not write Render env from this app."
         )
-    elif seed_urn:
+    elif urn_state.get("seed_urn"):
         st.caption(saved_urn_caption(pack_id))
     else:
         st.caption(
             f"No saved URN for {pack['short']} on this server yet. "
             "Translate a CAD file or click **Save URN for this pack**."
         )
+    return needs_rerun
 
-    st.caption(
-        "Viewer is **GuiViewer3D** (not headless Viewer3D): Home, Fit, Pan, Zoom, Orbit, "
-        "First Person / BimWalk, Measure, Section, Explode (slider), View cube, left Views "
-        "(DocumentBrowser), Model browser, Properties, Settings. Markup loads when "
-        "`Autodesk.Viewing.MarkupsGui` is in the viewer library — no extra paid API. "
-        "Selection highlight is the viewer's default outline; explode still works."
+
+def page_cad_twin():
+    st.markdown('<p class="main-header">CAD Twin (Autodesk APS)</p>', unsafe_allow_html=True)
+    pack = active_pack()
+    pack_id = active_pack_id()
+    st.markdown(
+        f'<p class="sub-header">Real translated CAD for <b>{pack["label"]}</b> '
+        "(Revit / Fusion / IFC / STEP → SVF). The engine keeps its <b>default dark gray</b>: only the "
+        "CAD nodes whose Autodesk name matches one of this asset's mapped sensors get tinted — "
+        "<b>red</b> on High risk, <b>orange</b> on Medium, nothing on Low. Click any part for its "
+        "Autodesk name. GuiViewer3D full toolbar; the light-blue selection outline and Explode are "
+        "the viewer's own. Last working URN is saved on this server per industry pack. "
+        "Credentials are runtime secrets.</p>",
+        unsafe_allow_html=True,
     )
 
-    render_cad_part_card(sel, pack_id)
+    ok, msg = aps_available()
+    _seed_cad_urn_widgets(pack_id)
+    _seed_zip_root_widget()
+    urn_state = _cad_urn_state(pack_id)
+    status = cad_slot_status(urn_state["urn"], pack_id=pack_id)
 
-    if not ok:
-        components.html(cad_placeholder_html(status=status, height=280), height=300)
-        return
-    if not (urn or "").strip():
-        st.warning(
-            "Choose a CAD file and click **Translate to SVF / get URN**, paste a translated "
-            "SVF URN from **your** bucket, or set APS_MODEL_URN on Render."
+    if ok:
+        st.caption(f"APS: {msg}")
+    else:
+        st.info(
+            "APS credentials are not on this deploy yet. The **3D Twin** (pack mesh) is the "
+            "credential-free twin. Add `APS_CLIENT_ID` + `APS_CLIENT_SECRET` (and optional "
+            "`APS_MODEL_URN`) on Render, reload, and this tile loads."
         )
-        return
+        st.caption(f"Status: {msg}")
 
-    load_clicked = st.button("Load CAD model", type="primary", key="aps_load_cad_btn")
-    cache_urn = str(st.session_state.get("aps_viewer_urn") or "")
-    cache_html = str(st.session_state.get("aps_viewer_html") or "")
-    cache_at = float(st.session_state.get("aps_viewer_at") or 0)
-    cache_fresh = bool(cache_html and cache_urn == urn and (datetime.now().timestamp() - cache_at) < 50 * 60)
-    translated = str((st.session_state.get("aps_translate_log") or {}).get("urn") or "")
-    translate_ok = bool((st.session_state.get("aps_translate_log") or {}).get("ok"))
-    force = bool(st.session_state.get("aps_force_load"))
-    should_auto = (not public_paste) and bool(urn) and not save_clicked and not delete_clicked and (
-        urn == seed_urn
-        or force
-        or (translate_ok and urn == normalize_model_urn(translated))
+    states = asset_states_from_predictions(st.session_state.get("predictions") or []) or (
+        st.session_state.get("live_asset_states") or []
     )
-    if load_clicked or force:
-        st.session_state.aps_force_load = False
+    actions = render_cad_part_card(
+        states,
+        pack_id,
+        can_load=bool(ok and urn_state["urn"] and not urn_state["public_paste"]),
+    )
+    risk = str(actions["card"]["risk"])
+    needles = region_hint_keywords(pack_id, available=list((actions["sensors"] or {}).keys()))
 
-    if public_paste:
-        st.session_state.aps_viewer_html = ""
-        st.session_state.aps_viewer_urn = ""
-        if load_clicked or force:
-            st.error(f"**{A360_PUBLIC_URN_ERROR}**")
-            persist = _persist_pack_urn(pack_id, urn, source="load", public_viewer=True)
-            if persist.get("reason") == "public_viewer":
-                st.caption(persist.get("message") or PUBLIC_VIEWER_WARNING)
-    elif load_clicked or (should_auto and not cache_fresh):
-        try:
-            with st.spinner("Fetching APS token and loading GuiViewer3D…"):
-                token = get_access_token()
-                _render_cad_viewer(
-                    token=token["access_token"],
-                    urn=urn,
-                    asset=selected,
-                    risk=sel.get("risk_level", "Unknown"),
-                    public_viewer=False,
-                )
-            if load_clicked or should_auto:
-                persist = _persist_pack_urn(
-                    pack_id, urn, source="load" if load_clicked else "auto", public_viewer=False
-                )
-                if persist.get("saved"):
-                    st.info(persist.get("message") or saved_urn_caption(pack_id))
-                elif persist.get("reason") == "public_viewer":
-                    st.error(f"**{A360_PUBLIC_URN_ERROR}**")
-        except Exception as exc:
-            st.error(f"APS error: {exc}")
-            if INSUFFICIENT_SCOPE_HINT in str(exc):
-                st.info(INSUFFICIENT_SCOPE_HINT)
-    elif cache_fresh:
-        cached_token = str(st.session_state.get("aps_viewer_token") or "")
-        if cached_token:
-            _render_cad_viewer(
-                token=cached_token,
-                urn=urn,
-                asset=selected,
-                risk=sel.get("risk_level", "Unknown"),
-                public_viewer=False,
-            )
-        else:
-            components.html(cache_html, height=_cad_iframe_height())
-        save_info = st.session_state.get("aps_save_log") or {}
-        if save_info.get("saved") and save_info.get("urn") == urn:
-            st.caption(save_info.get("message") or saved_urn_caption(pack_id))
+    _render_cad_viewer_section(
+        ok=ok,
+        urn_state=urn_state,
+        selected=str(actions["selected"]),
+        risk=risk,
+        load_clicked=bool(actions["load_clicked"]),
+        pack_id=pack_id,
+        status=status,
+        needles=needles,
+    )
+    render_cad_region_note(risk, pack_id)
+    render_cad_sensor_grid(actions)
 
+    with st.expander("CAD source — upload, translate, URN, save", expanded=not urn_state["urn"]):
+        if _render_cad_source_panel(pack, pack_id, ok=ok, urn_state=urn_state):
+            st.rerun()
+
+    with st.expander("How to generate a URN (APS app + this page)", expanded=not ok):
+        st.markdown(
+            "1. Create an app at [aps.autodesk.com](https://aps.autodesk.com) with "
+            "**Model Derivative** and **Data Management** APIs enabled. Copy **Client ID** + **Client Secret**.\n"
+            "2. On Render → Environment, set `APS_CLIENT_ID` and `APS_CLIENT_SECRET` "
+            "(optional `APS_MODEL_URN` if you already have a translated model — that env var is the "
+            "override that survives Render redeploys).\n"
+            "3. **Generate a URN here:** open **CAD source** above, choose a CAD file → "
+            "**Translate to SVF / get URN**. "
+            "That puts the model in **your** OSS bucket (using `APS_CLIENT_ID` / `APS_CLIENT_SECRET` on Render). "
+            "viewer.autodesk.com is Autodesk’s public website — it does **not** put the file in your bucket; "
+            "there is no “move from viewer to my bucket” button. "
+            "We then save that URN for this pack "
+            f"({pack['short']}) in a JSON file on this server.\n"
+            "4. Pasting a [viewer.autodesk.com](https://viewer.autodesk.com) link only extracts the "
+            "`dXJu…` URN. It will **not** load with your app token unless that object is in your bucket. "
+            "Do not rely on saving a public-viewer URN.\n"
+            "5. The 2-legged token needs `data:write` / `data:create` and `bucket:create` / "
+            "`bucket:read` in addition to `viewables:read`.\n"
+            "6. **Save URN for this pack** / **Delete saved URN** write or clear `data/cad_urns.json` "
+            "for this industry pack. Close the tab and come back — CAD Twin auto-loads the saved URN "
+            "while this service is up. After a Render **redeploy** the disk is wiped; set `APS_MODEL_URN` too."
+        )
+        st.caption(INSUFFICIENT_SCOPE_HINT)
+        st.markdown(
+            f"Need a tiny test file? Autodesk’s Model Derivative tutorial includes a sample Inventor "
+            f"part (`box.ipt`): [prep a file for the viewer]({APS_SAMPLE_CAD_URL})."
+        )
+        st.caption(
+            "Viewer is **GuiViewer3D** (not headless Viewer3D): Home, Fit, Pan, Zoom, Orbit, "
+            "First Person / BimWalk, Measure, Section, Explode (slider), View cube, left Views "
+            "(DocumentBrowser), Model browser, Properties, Settings. Markup loads when "
+            "`Autodesk.Viewing.MarkupsGui` is in the viewer library — no extra paid API. "
+            "Selection highlight is the viewer's default outline; explode still works."
+        )
+        st.caption(
+            "Autodesk node names that come back empty, control-byte or mojibake "
+            "(`?????? ??????-1-solid1`) are shown as `Solid-1` / `Solid-{dbId}`. Asset ids are never "
+            "rewritten. Region tint themes only matching dbIds — with `Solid1`-only names nothing "
+            "matches and the model stays default gray."
+        )
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
@@ -2371,6 +2567,7 @@ def page_dashboard_builder():
                 asset=cad_asset,
                 risk=cad_risk,
                 height=DEFAULT_VIEWER_HEIGHT,
+                needles=region_hint_keywords(active_pack_id()),
             )
         except Exception as exc:
             cad_status = dict(cad_status)
