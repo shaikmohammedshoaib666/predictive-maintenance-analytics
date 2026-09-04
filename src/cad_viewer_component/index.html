@@ -1,11 +1,13 @@
 
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0b1016; }
-  #aps-wrap { position:relative; width:100%; height:840px; min-height:840px;
+  #aps-wrap { position:relative; width:100%; height:660px; min-height:660px;
     border-radius:12px; background:#0b1016; }
   #apsViewer, #apsViewer .adsk-viewing-viewer { width:100%; height:100% !important; }
   #aps-badge { position:absolute; top:10px; left:12px; z-index:3; font-family:system-ui,sans-serif;
-    color:#fff; background:rgba(10,16,22,.55); padding:6px 10px; border-radius:8px; pointer-events:none; }
+    color:#fff; background:rgba(10,16,22,.55); padding:6px 10px; border-radius:8px; pointer-events:none;
+    font-size:13px; max-width:calc(100% - 24px); }
+  #aps-region { opacity:.78; }
   #aps-err { display:none; position:absolute; inset:0; z-index:8; color:#fff;
     font-family:system-ui,sans-serif; padding:20px; font-size:13px; background:#101822; line-height:1.45; }
 </style>
@@ -16,6 +18,7 @@
     <b id="aps-name">asset</b> · risk
     <b id="aps-risk" style="color:#7f8c8d">Unknown</b>
     <span id="aps-part" style="display:none; opacity:.9"> · <span id="aps-part-name"></span></span>
+    <span id="aps-region"></span>
   </div>
   <div id="apsViewer"></div>
   <div id="aps-err"></div>
@@ -28,8 +31,12 @@
   var EXTRAS=["Autodesk.DocumentBrowser", "Autodesk.Viewing.MarkupsCore", "Autodesk.Viewing.MarkupsGui", "Autodesk.FirstPerson"];
   var VIEWER_ERR={"1": "Unknown failure", "2": "Bad data", "3": "Network failure", "4": "Access denied (NETWORK_ACCESS_DENIED) \u2014 your APS app token cannot read this URN", "5": "File not found", "6": "Network server error", "7": "Unhandled network response", "8": "Browser WebGL not supported", "9": "Model is empty", "10": "Too many requests", "11": "Unhandled exception", "12": "WebGL context lost", "13": "Load canceled"};
   var BRIDGE=true;
-  var HEIGHT=840;
-  var RISK_RGBA={"High": [0.91, 0.3, 0.24, 0.72], "Medium": [0.95, 0.61, 0.07, 0.58], "Low": [0.48, 0.55, 0.52, 0.32]};
+  var HEIGHT=660;
+  var RISK_RGBA={"High": [0.91, 0.3, 0.24, 0.85], "Medium": [0.95, 0.61, 0.07, 0.78]};
+  var NEEDLES=["exhaustmanifold", "oiltemperature", "intakemanifold", "cylinderhead", "temperature", "oilpressure", "vibration", "cylinder", "oilpress", "manifold", "exhaust", "cylhead", "oiltemp", "vibra", "crank", "temp", "egt", "cht", "cyl", "vib", "oil", "rpm"];
+  // Fallback name search can match property values, not just nodes. Never let it
+  // paint the whole engine: drop the result when it covers more than this share.
+  var SEARCH_MAX_SHARE=0.35, SEARCH_MIN_CAP=12, SEARCH_TIMEOUT_MS=4000;
   var viewer=null, lastUrn=null, lastToken=null, lastRisk=null, selectionWired=false;
   function fail(m){var e=document.getElementById('aps-err');e.style.display='block';
     e.innerHTML='<b>APS Viewer error.</b><br>'+m;}
@@ -72,6 +79,32 @@
     try { window.parent.postMessage({ type: 'pdm-cad-part', payload: payload }, '*'); } catch (e) {}
     if (BRIDGE) sendToStreamlit('streamlit:setComponentValue', { value: payload });
   }
+  // Autodesk hands back empty / control-byte / mojibake names for non-UTF8 STEP
+  // exports. Mirror src/cad_part.sanitize_node_name so a CEO never sees ??????.
+  function sanitizeName(name, dbId){
+    var raw = (name == null ? '' : String(name));
+    var printable = '';
+    for (var i = 0; i < raw.length; i++){
+      var code = raw.charCodeAt(i);
+      if (code < 32 || (code >= 127 && code <= 159)) continue;
+      printable += raw.charAt(i);
+    }
+    printable = printable.replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    var bad = /[?\uFFFD\uFFFE\uFFFF]/;
+    if (printable && !bad.test(printable)) return printable;
+    var pair = /(\d+)\s*[-_ ]\s*solid\s*(\d+)/i.exec(printable);
+    if (pair) return 'Solid-' + parseInt(pair[1], 10);
+    var single = /solid\s*[-_ ]?\s*(\d+)/i.exec(printable);
+    if (single) return 'Solid-' + parseInt(single[1], 10);
+    var stripped = printable.replace(/[?\uFFFD\uFFFE\uFFFF]+/g, ' ')
+      .replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+    var bare = /^[\s\-_.]*(\d+)[\s\-_.]*$/.exec(stripped);
+    if (bare) return 'Solid-' + parseInt(bare[1], 10);
+    var trimmed = stripped.replace(/^[-_.,;:\/\\ ]+/, '').replace(/[-_.,;:\/\\ ]+$/, '');
+    if (trimmed && /[A-Za-z]/.test(trimmed)) return trimmed;
+    var n = parseInt(dbId, 10);
+    return isFinite(n) ? ('Solid-' + n) : 'Solid';
+  }
   function setBadge(asset, risk, partName){
     var nameEl = document.getElementById('aps-name');
     var riskEl = document.getElementById('aps-risk');
@@ -88,33 +121,123 @@
       else { partWrap.style.display = 'none'; partEl.textContent = ''; }
     }
   }
-  function riskVec(risk){
+  function setRegionBadge(matched, source){
+    var el = document.getElementById('aps-region');
+    if (!el) return;
+    if (source === 'off'){ el.textContent = ' · default color (no risk tint)'; return; }
+    if (matched > 0){
+      el.textContent = ' · ' + matched + ' matched node' + (matched === 1 ? '' : 's') + ' tinted';
+      return;
+    }
+    el.textContent = ' · no CAD region matched — default color';
+  }
+  function regionVec(risk){
     var row = RISK_RGBA && RISK_RGBA[risk];
     if (!row || !row.length || typeof THREE === 'undefined') return null;
     return new THREE.Vector4(row[0], row[1], row[2], row[3]);
   }
-  function applyAssetTheming(v, risk){
+  function normPart(s){
+    return String(s == null ? '' : s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  }
+  function needleFor(name){
+    var blob = normPart(name);
+    if (!blob) return '';
+    for (var i = 0; i < NEEDLES.length; i++){
+      if (NEEDLES[i] && blob.indexOf(NEEDLES[i]) >= 0) return NEEDLES[i];
+    }
+    return '';
+  }
+  function reportRegion(matched, nodes, names, source){
+    emitSelection({
+      kind: 'region',
+      matched: matched,
+      nodes: nodes,
+      names: (names || []).slice(0, 8),
+      risk: RISK,
+      source: source,
+      ts: Date.now()
+    });
+  }
+  function walkRegion(v){
+    var res = { ids: [], names: [], nodes: 0 };
+    var tree = null;
+    try { tree = v.model && v.model.getInstanceTree && v.model.getInstanceTree(); } catch (e) {}
+    if (!tree) return res;
+    var seen = {};
+    function visit(id){
+      if (id == null || seen[id]) return;
+      seen[id] = 1;
+      res.nodes++;
+      var nm = '';
+      try { nm = tree.getNodeName(id) || ''; } catch (e) {}
+      if (nm && needleFor(nm)){ res.ids.push(id); res.names.push(nm); }
+    }
+    var root = null;
+    try { root = tree.getRootId(); } catch (e) {}
+    if (root == null) return res;
+    visit(root);
+    try { tree.enumNodeChildren(root, visit, true); } catch (e) {}
+    return res;
+  }
+  function searchRegion(v, done){
+    var wanted = (NEEDLES || []).slice(0, 12);
+    if (!wanted.length || !v || typeof v.search !== 'function'){ done([]); return; }
+    var ids = [], pending = wanted.length, finished = false;
+    function finish(){ if (finished) return; finished = true; done(ids); }
+    function step(res){
+      (res || []).forEach(function(id){ ids.push(id); });
+      pending -= 1;
+      if (pending <= 0) finish();
+    }
+    wanted.forEach(function(needle){
+      try { v.search(needle, step, function(){ step([]); }); } catch (e) { step([]); }
+    });
+    setTimeout(finish, SEARCH_TIMEOUT_MS);
+  }
+  function paintRegion(v, color, ids){
+    var painted = 0, seen = {};
+    (ids || []).forEach(function(id){
+      if (id == null || seen[id]) return;
+      seen[id] = 1;
+      try { v.setThemingColor(id, color, v.model, true); painted++; }
+      catch (e1) { try { v.setThemingColor(id, color); painted++; } catch (e2) {} }
+    });
+    if (v.impl) v.impl.invalidate(true);
+    return painted;
+  }
+  // Region tint, never whole-model. High → matched nodes red, Medium → orange,
+  // Low / Unknown → nothing. Zero matches keeps the default dark gray engine.
+  function applyRegionTheming(v, risk){
     try {
       if (!v || !v.model) return;
       if (typeof v.clearThemingColors === 'function') v.clearThemingColors(v.model);
-      var color = riskVec(risk);
+      lastRisk = risk;
+      var color = regionVec(risk);
       if (!color){
         if (v.impl) v.impl.invalidate(true);
-        lastRisk = risk;
+        setRegionBadge(0, 'off');
+        reportRegion(0, 0, [], 'off');
         return;
       }
-      var tree = v.model.getInstanceTree && v.model.getInstanceTree();
-      if (!tree) return;
-      var root = tree.getRootId();
-      function paint(id){
-        try { v.setThemingColor(id, color, v.model, true); } catch (e1) {
-          try { v.setThemingColor(id, color); } catch (e2) {}
-        }
+      var walk = walkRegion(v);
+      if (walk.ids.length){
+        var painted = paintRegion(v, color, walk.ids);
+        setRegionBadge(painted, 'tree');
+        reportRegion(painted, walk.nodes, walk.names, 'tree');
+        return;
       }
-      paint(root);
-      tree.enumNodeChildren(root, function(id){ paint(id); }, true);
-      if (v.impl) v.impl.invalidate(true);
-      lastRisk = risk;
+      searchRegion(v, function(found){
+        var cap = Math.max(SEARCH_MIN_CAP, Math.floor(walk.nodes * SEARCH_MAX_SHARE));
+        if (!found.length || found.length > cap){
+          if (v.impl) v.impl.invalidate(true);
+          setRegionBadge(0, 'none');
+          reportRegion(0, walk.nodes, [], found.length ? 'search_too_broad' : 'none');
+          return;
+        }
+        var painted2 = paintRegion(v, color, found);
+        setRegionBadge(painted2, 'search');
+        reportRegion(painted2, walk.nodes, [], 'search');
+      });
     } catch (e) {}
   }
   function wireSelection(v){
@@ -130,19 +253,23 @@
       }
       if (!ids.length){
         setBadge(ASSET, RISK, '');
-        emitSelection({ name: '', dbId: null, properties: {}, cleared: true, ts: Date.now() });
+        emitSelection({ kind: 'part', name: '', dbId: null, properties: {}, cleared: true, ts: Date.now() });
         return;
       }
       var dbId = ids[0];
-      var nodeName = 'Node ' + dbId;
+      var nodeName = '';
       try {
         var tree = v.model && v.model.getInstanceTree && v.model.getInstanceTree();
-        if (tree && tree.getNodeName) nodeName = tree.getNodeName(dbId) || nodeName;
+        if (tree && tree.getNodeName) nodeName = tree.getNodeName(dbId) || '';
       } catch (e) {}
       function finish(nm, props){
-        setBadge(ASSET, RISK, nm);
+        var raw = nm || nodeName;
+        var shown = sanitizeName(raw, dbId);
+        setBadge(ASSET, RISK, shown);
         emitSelection({
-          name: nm || nodeName,
+          kind: 'part',
+          name: raw || shown,
+          display: shown,
           dbId: dbId,
           properties: props || {},
           cleared: false,
@@ -186,7 +313,7 @@
         loadExtras(v, extras);
         try { v.getToolbar(true); } catch (e) {}
         wireSelection(v);
-        function tint(){ applyAssetTheming(v, risk); }
+        function tint(){ applyRegionTheming(v, risk); }
         try { v.addEventListener(Autodesk.Viewing.GEOMETRY_LOADED_EVENT, tint); } catch (e) {}
         tint();
       }).catch(function(err){ fail('loadDocumentNode failed: '+describeErr(err)+publicHint()); });
@@ -203,6 +330,7 @@
     if (args.extras) EXTRAS = args.extras;
     if (args.viewer_err) VIEWER_ERR = args.viewer_err;
     if (args.height) HEIGHT = args.height;
+    if (args.needles && args.needles.length) NEEDLES = args.needles;
     setBadge(ASSET, RISK, '');
     if (PUBLIC){
       fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
@@ -218,7 +346,7 @@
         try { Autodesk.Viewing.token.accessToken = TOKEN; } catch (e) {}
         lastToken = TOKEN;
       }
-      applyAssetTheming(viewer, RISK);
+      applyRegionTheming(viewer, RISK);
       return;
     }
     if (typeof Autodesk === 'undefined'){

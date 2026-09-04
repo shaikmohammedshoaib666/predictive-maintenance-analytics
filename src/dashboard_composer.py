@@ -229,8 +229,12 @@ def board_cad_html(
     asset: str,
     risk: str,
     height: int = DEFAULT_VIEWER_HEIGHT,
+    needles: Optional[list[str]] = None,
 ) -> str:
-    return build_viewer_html(token, urn, asset=asset, risk=risk, height=height)
+    """Exported CAD tile. ``needles`` decide which dbIds the risk tint reaches."""
+    return build_viewer_html(
+        token, urn, asset=asset, risk=risk, height=height, needles=needles
+    )
 
 
 def risk_legend_html() -> str:
