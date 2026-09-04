@@ -34,6 +34,8 @@
   var HEIGHT=660;
   var RISK_RGBA={"High": [0.91, 0.3, 0.24, 0.85], "Medium": [0.95, 0.61, 0.07, 0.78]};
   var NEEDLES=["exhaustmanifold", "oiltemperature", "intakemanifold", "cylinderhead", "temperature", "oilpressure", "vibration", "cylinder", "oilpress", "manifold", "exhaust", "cylhead", "oiltemp", "vibra", "crank", "temp", "egt", "cht", "cyl", "vib", "oil", "rpm"];
+  // dbIds the user assigned to the driver region on the Click-to-assign panel.
+  var ASSIGNED=[];
   // Fallback name search can match property values, not just nodes. Never let it
   // paint the whole engine: drop the result when it covers more than this share.
   var SEARCH_MAX_SHARE=0.35, SEARCH_MIN_CAP=12, SEARCH_TIMEOUT_MS=4000;
@@ -127,7 +129,8 @@
     if (!el) return;
     if (source === 'off'){ el.textContent = ' · default color (no risk tint)'; return; }
     if (matched > 0){
-      el.textContent = ' · ' + matched + ' matched node' + (matched === 1 ? '' : 's') + ' tinted';
+      var what = (source === 'assigned') ? 'assigned part' : 'matched node';
+      el.textContent = ' · ' + matched + ' ' + what + (matched === 1 ? '' : 's') + ' tinted';
       return;
     }
     el.textContent = ' · no CAD region matched — default color';
@@ -228,6 +231,14 @@
         return;
       }
       var walk = walkRegion(v);
+      // Click-to-assign wins: High + driver region paints the saved dbIds, even
+      // when Autodesk names are Solid1. Name matching is the fallback.
+      if (ASSIGNED && ASSIGNED.length){
+        var paintedA = paintRegion(v, color, ASSIGNED);
+        setRegionBadge(paintedA, 'assigned');
+        reportRegion(paintedA, walk.nodes, [], 'assigned');
+        return;
+      }
       if (walk.ids.length){
         var painted = paintRegion(v, color, walk.ids);
         setRegionBadge(painted, 'tree');
@@ -339,6 +350,7 @@
     if (args.viewer_err) VIEWER_ERR = args.viewer_err;
     if (args.height) HEIGHT = args.height;
     if (args.needles && args.needles.length) NEEDLES = args.needles;
+    if (args.region_ids != null) ASSIGNED = args.region_ids;
     setBadge(ASSET, RISK, '');
     if (PUBLIC){
       fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '

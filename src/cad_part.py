@@ -453,6 +453,161 @@ def latest_asset_sensors(df: Any, machine_id: str) -> dict[str, Any]:
     return out
 
 
+def _column_floats(df: Any, column: str) -> list[float]:
+    """Every finite numeric value in one column, as plain floats."""
+    try:
+        series = df[column]
+    except Exception:
+        return []
+    out: list[float] = []
+    for raw in list(series):
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val != val or val in (float("inf"), float("-inf")):  # NaN / inf
+            continue
+        out.append(val)
+    return out
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _std(values: list[float], mu: float) -> float:
+    if len(values) < 2:
+        return 0.0
+    return (sum((v - mu) ** 2 for v in values) / len(values)) ** 0.5
+
+
+def sensor_score(value: float, population: list[float]) -> tuple[float, str]:
+    """How unusual ``value`` is against the rest of that column.
+
+    Deliberately simple and defensible: a z-score against the other rows of the
+    same column, falling back to a median/MAD score when the column has no spread.
+    """
+    if not population:
+        return 0.0, "none"
+    mu = _mean(population)
+    sd = _std(population, mu)
+    if sd > 1e-12:
+        return (value - mu) / sd, "z-score"
+    med = _median(population)
+    mad = _median([abs(v - med) for v in population])
+    if mad > 1e-12:
+        return (value - med) / (1.4826 * mad), "median"
+    if abs(value - med) > 1e-12:
+        return 1.0 if value > med else -1.0, "median"
+    return 0.0, "flat"
+
+
+NO_DRIVER_MSG = (
+    "No mapped sensor stands out for this asset yet — load a CSV and run Anomaly & RUL "
+    "so there are other rows to compare against."
+)
+
+DRIVER_HONESTY = (
+    "Driver is the mapped sensor with the largest |z-score| against the other rows of that "
+    "column. Isolation Forest scores the asset, not this CAD part."
+)
+
+
+def sensor_driver(
+    df: Any,
+    machine_id: str,
+    risk: Optional[str],
+    *,
+    sensors: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Which mapped sensor most explains a High / Medium asset, and its CAD region.
+
+    Low / Unknown returns an empty ``line``: no "driven by" scare line when the
+    asset is healthy.
+    """
+    from src.cad_regions import sensor_display, sensor_region
+
+    level = normalize_risk(risk)
+    latest = dict(sensors) if sensors is not None else latest_asset_sensors(df, machine_id)
+    blank = {
+        "risk": level,
+        "sensor": "",
+        "display": "",
+        "value": None,
+        "z": 0.0,
+        "basis": "none",
+        "region": "",
+        "region_label": "",
+        "related": [],
+        "line": "",
+        "message": "",
+        "honesty": DRIVER_HONESTY,
+        "ranked": [],
+    }
+    if level not in ("High", "Medium"):
+        return blank
+
+    ranked: list[dict[str, Any]] = []
+    for name, value in latest.items():
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            continue
+        # Compare the asset's latest reading against the *rest* of that column.
+        population = _column_floats(df, name)
+        if population:
+            for idx, item in enumerate(population):
+                if abs(item - val) < 1e-12:
+                    population.pop(idx)
+                    break
+        score, basis = sensor_score(val, population)
+        region = sensor_region(name)
+        ranked.append(
+            {
+                "sensor": name,
+                "display": sensor_display(name),
+                "value": val,
+                "z": score,
+                "abs_z": abs(score),
+                "basis": basis,
+                "region": region["region"],
+                "region_label": region["phrase"],
+                "related": list(region["related"]),
+            }
+        )
+
+    ranked.sort(key=lambda row: row["abs_z"], reverse=True)
+    blank["ranked"] = ranked[:5]
+    if not ranked or ranked[0]["abs_z"] <= 1e-12:
+        blank["message"] = NO_DRIVER_MSG
+        return blank
+
+    top = ranked[0]
+    return {
+        **blank,
+        "sensor": top["sensor"],
+        "display": top["display"],
+        "value": top["value"],
+        "z": top["z"],
+        "basis": top["basis"],
+        "region": top["region"],
+        "region_label": top["region_label"],
+        "related": list(top["related"]),
+        "line": f"{level} driven by {top['display']} → {top['region_label']}",
+        "ranked": ranked[:5],
+    }
+
+
 def _event_db_id(event: dict[str, Any]) -> Optional[int]:
     raw = event.get("dbId")
     try:

@@ -432,6 +432,18 @@ def main() -> int:
 
         assert f'"{_needles()[0]}"' in html
 
+        assigned_html = build_viewer_html(
+            "t", "dXJuOmFi", asset="a", risk="High", region_ids=[412, 418, 424]
+        )
+        assert "var ASSIGNED=" in assigned_html and "__ASSIGNED__" not in assigned_html
+        assert "[412, 418, 424]" in assigned_html
+        apply_js = assigned_html.split("function applyRegionTheming(", 1)[1].split(
+            "function wireSelection(", 1
+        )[0]
+        assert apply_js.find("ASSIGNED && ASSIGNED.length") < apply_js.find("walk.ids.length"), apply_js
+        empty_assigned = build_viewer_html("t", "dXJuOmFi", asset="a", risk="High", region_ids=[])
+        assert "ASSIGNED=[]" in empty_assigned.replace(" ", "")
+
         bridge = build_viewer_html("t", "dXJuOmFi", asset="a", risk="Low", bridge=True)
         assert "streamlit:componentReady" in bridge
         assert "var BRIDGE=true" in bridge
@@ -824,6 +836,163 @@ def main() -> int:
         assert [m["dbId"] for m in custom] == [5]
         assert custom[0]["keyword"] == "coolanttemp"
         assert region_matches({5: "Coolant housing"}, available=["coolant_temp"]) == []
+
+    def test_cad_sensor_driver() -> None:
+        """High/Med card line is the mapped sensor with max |z-score|, not Isolation Forest on a CAD part."""
+        import pandas as pd
+
+        from src.cad_part import DRIVER_HONESTY, sensor_driver
+        from src.cad_regions import sensor_display, sensor_region
+
+        assert sensor_region("exhaust_temp")["phrase"] == "heads / exhaust"
+        assert sensor_region("exhaust_temp")["region"] == "heads_exhaust"
+        assert sensor_display("exhaust_temp") == "exhaust_temp (EGT)"
+        assert sensor_region("egt")["phrase"] == "heads / exhaust"
+        assert sensor_region("oil_temp")["region"] == "oil_system"
+        assert sensor_region("oil_pressure")["region"] == "oil_system"
+        assert sensor_region("vibration")["phrase"] == "rotating assembly"
+        assert sensor_region("rpm")["phrase"] == "crank / prop"
+        assert sensor_region("manifold_pressure")["phrase"] == "intake"
+        assert sensor_region("cht")["region"] == "heads_exhaust"
+
+        rows = []
+        for i in range(12):
+            rows.append(
+                {
+                    "machine_id": "UAV-07" if i < 10 else "UAV-03",
+                    "timestamp": pd.Timestamp("2026-09-01") + pd.Timedelta(hours=i),
+                    "exhaust_temp": 700.0 if i < 10 else (980.0 if i == 11 else 710.0),
+                    "oil_temp": 90.0,
+                    "vibration": 0.4,
+                    "rpm": 5400.0,
+                    "manifold_pressure": 28.0,
+                }
+            )
+        df = pd.DataFrame(rows)
+
+        high = sensor_driver(df, "UAV-03", "High")
+        assert high["sensor"] == "exhaust_temp", high
+        assert high["display"] == "exhaust_temp (EGT)"
+        assert high["region"] == "heads_exhaust"
+        assert high["region_label"] == "heads / exhaust"
+        assert high["line"] == "High driven by exhaust_temp (EGT) → heads / exhaust"
+        assert abs(high["z"]) > abs(high["ranked"][1]["z"])
+        assert high["basis"] in ("z-score", "median")
+        assert "Isolation Forest" in high["honesty"]
+        assert "not this CAD part" in high["honesty"]
+        assert "Isolation Forest scores the asset, not this CAD part" in DRIVER_HONESTY
+
+        med = sensor_driver(df, "UAV-03", "Medium")
+        assert med["line"] == "Medium driven by exhaust_temp (EGT) → heads / exhaust"
+
+        low = sensor_driver(df, "UAV-03", "Low")
+        assert low["line"] == "" and low["sensor"] == ""
+        unknown = sensor_driver(df, "UAV-03", "Unknown")
+        assert unknown["line"] == ""
+
+        # Pack-median fallback: a flat column still ranks the one different reading.
+        flat = pd.DataFrame(
+            {
+                "machine_id": ["UAV-03"] + ["UAV-07"] * 8,
+                "oil_temp": [140.0] + [90.0] * 8,
+                "vibration": [0.4] * 9,
+            }
+        )
+        driven = sensor_driver(flat, "UAV-03", "High")
+        assert driven["sensor"] == "oil_temp"
+        assert driven["region"] == "oil_system"
+        assert "oil system" in driven["line"]
+        assert "Isolation Forest scored a CAD part" not in driven["line"]
+
+    def test_cad_region_map() -> None:
+        """Save/load the pack+URN map. High tints assigned ids; empty map tints nothing."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from src.cad_part import REGION_THEME_RGBA
+        from src.cad_regions import (
+            NO_ASSIGNMENT_MSG,
+            REGIONS,
+            assign_region,
+            assigned_theme_plan,
+            assignment_summary,
+            clear_region_map,
+            load_region_map,
+            model_key,
+            region_label,
+            regions_for_model,
+        )
+
+        labels = [label for _, label in REGIONS]
+        assert labels == ["Heads/exhaust", "Oil", "Rotating/crank", "Intake", "Other"]
+        assert region_label("heads_exhaust") == "Heads/exhaust"
+        assert region_label("oil_system") == "Oil"
+
+        pack = "aviation_uav_piston"
+        urn = "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6cGRtLWV4YW1wbGUtY2FkL3JvdGF4OTEyLnN0ZXA"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cad_region_map.json"
+            empty = assigned_theme_plan(pack, urn, "High", "heads_exhaust", path=path)
+            assert empty["dbIds"] == [] and empty["tint"] is False
+            assert empty["rgba"] == REGION_THEME_RGBA["High"]
+            assert empty["message"] == NO_ASSIGNMENT_MSG
+            quiet = assigned_theme_plan(pack, urn, "Low", "heads_exhaust", path=path)
+            assert quiet["dbIds"] == [] and quiet["rgba"] is None and quiet["tint"] is False
+
+            a1 = assign_region(pack, urn, 412, "Heads/exhaust", path=path)
+            assert a1["ok"] and a1["saved"] and a1["dbId"] == 412
+            a2 = assign_region(pack, urn, 418, "heads_exhaust", path=path)
+            a3 = assign_region(pack, urn, 424, "Heads/exhaust", path=path)
+            a4 = assign_region(pack, urn, 531, "Oil", path=path)
+            a5 = assign_region(pack, urn, 307, "Rotating/crank", path=path)
+            a6 = assign_region(pack, urn, 309, "rotating_crank", path=path)
+            assert all(r["saved"] for r in (a2, a3, a4, a5, a6))
+
+            # Re-assign moves, never duplicates.
+            moved = assign_region(pack, urn, 531, "Heads/exhaust", path=path)
+            assert moved["moved_from"] == "oil_system"
+            assert 531 in regions_for_model(pack, urn, path=path)["heads_exhaust"]
+            assert "oil_system" not in regions_for_model(pack, urn, path=path)
+
+            doc = load_region_map(path=path)
+            key = model_key(pack, urn)
+            assert key in doc["models"]
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            assert saved["models"][key]["pack_id"] == pack
+            assert saved["models"][key]["urn"] == urn
+            assert set(saved["models"][key]["regions"]["heads_exhaust"]) == {412, 418, 424, 531}
+
+            hot = assigned_theme_plan(pack, urn, "High", "heads_exhaust", path=path)
+            assert hot["tint"] is True
+            assert hot["rgba"] == REGION_THEME_RGBA["High"]
+            assert hot["hex"] == "#e74c3c"
+            assert set(hot["dbIds"]) == {412, 418, 424, 531}
+            assert 307 not in hot["dbIds"] and 309 not in hot["dbIds"]
+
+            mid = assigned_theme_plan(pack, urn, "Medium", "heads_exhaust", path=path)
+            assert mid["rgba"] == REGION_THEME_RGBA["Medium"]
+            assert set(mid["dbIds"]) == set(hot["dbIds"])
+
+            for quiet_risk in ("Low", "Unknown", ""):
+                plan = assigned_theme_plan(pack, urn, quiet_risk, "heads_exhaust", path=path)
+                assert plan["dbIds"] == [] and plan["rgba"] is None and plan["tint"] is False
+
+            other = assigned_theme_plan("plant_rotating", urn, "High", "heads_exhaust", path=path)
+            assert other["dbIds"] == [] and other["tint"] is False
+
+            summary = assignment_summary(pack, urn, path=path)
+            assert summary["total"] == 6
+            cleared = clear_region_map(pack, urn, path=path)
+            assert cleared["cleared"] is True and cleared["had"] == 6
+            blank = assigned_theme_plan(pack, urn, "High", "heads_exhaust", path=path)
+            assert blank["dbIds"] == [] and blank["tint"] is False
+            assert blank["message"] == NO_ASSIGNMENT_MSG
+
+        example = Path(__file__).resolve().parent / "data" / "cad_region_map.example.json"
+        assert example.is_file()
+        sample = json.loads(example.read_text(encoding="utf-8"))
+        assert sample["version"] == 1 and sample["models"]
 
     def test_cad_sensor_grid() -> None:
         """Mapped sensors chunk into rows of 3–4 so the viewer stays on-screen."""
@@ -1781,6 +1950,7 @@ def main() -> int:
         wanted = (
             "render_cad_part_card",
             "_render_cad_viewer_section",
+            "render_cad_region_assign",
             "render_cad_region_note",
             "render_cad_sensor_grid",
             "_render_cad_source_panel",
@@ -1849,9 +2019,13 @@ def main() -> int:
                 )
             return out
 
-        prev = {k: os.environ.get(k) for k in ("APS_CLIENT_ID", "APS_CLIENT_SECRET", "PDM_CAD_URNS_PATH")}
+        prev = {
+            k: os.environ.get(k)
+            for k in ("APS_CLIENT_ID", "APS_CLIENT_SECRET", "PDM_CAD_URNS_PATH", "PDM_CAD_REGION_MAP_PATH")
+        }
         urns_dir = _tf.TemporaryDirectory()
         os.environ["PDM_CAD_URNS_PATH"] = str(_Path(urns_dir.name) / "cad_urns.json")
+        os.environ["PDM_CAD_REGION_MAP_PATH"] = str(_Path(urns_dir.name) / "cad_region_map.json")
         os.environ["APS_CLIENT_ID"] = "LayoutTestClientId"
         os.environ["APS_CLIENT_SECRET"] = "layout-test-secret-not-real"
         try:
@@ -1878,12 +2052,25 @@ def main() -> int:
             header = next(t for t in md if 'class="sub-header"' in t)
             assert "default dark gray" in header and "red" in header and "orange" in header
             assert "whole model tints" not in header
+            assert "Heads/exhaust" in header and "Solid1" in header
 
             # Asset picker sits in the strip; Load CAD is disabled with no URN.
             assert any((s.label or "") == "Asset" for s in at.selectbox)
+            region_box = next(s for s in at.selectbox if "Region" in (s.label or ""))
+            assert list(region_box.options) == [
+                "Heads/exhaust",
+                "Oil",
+                "Rotating/crank",
+                "Intake",
+                "Other",
+            ]
             load = next(b for b in at.button if b.label == "Load CAD model")
             assert getattr(load, "disabled", False) is True
             assert len([b for b in at.button if b.label == "Open Anomaly & RUL"]) == 1
+            assign_btn = next(b for b in at.button if "Assign selected part" in (b.label or ""))
+            assert getattr(assign_btn, "disabled", False) is True
+            assert any("Clear region map" in (b.label or "") for b in at.button)
+            assert any("Click-to-assign" in t for t in md)
 
             # No report from the viewer yet: explain the rule, claim nothing.
             captions = " ".join(_texts(at.caption))
@@ -1978,11 +2165,13 @@ def main() -> int:
 
         prev_id, prev_sec = os.environ.get("APS_CLIENT_ID"), os.environ.get("APS_CLIENT_SECRET")
         prev_urns = os.environ.get("PDM_CAD_URNS_PATH")
+        prev_map = os.environ.get("PDM_CAD_REGION_MAP_PATH")
         import tempfile as _tf
         from pathlib import Path as _Path
 
         _urns_dir = _tf.TemporaryDirectory()
         os.environ["PDM_CAD_URNS_PATH"] = str(_Path(_urns_dir.name) / "cad_urns.json")
+        os.environ["PDM_CAD_REGION_MAP_PATH"] = str(_Path(_urns_dir.name) / "cad_region_map.json")
         os.environ["APS_CLIENT_ID"] = "UiTestClientId"
         os.environ["APS_CLIENT_SECRET"] = "ui-test-secret-not-real"
         try:
@@ -2045,6 +2234,10 @@ def main() -> int:
                 os.environ.pop("PDM_CAD_URNS_PATH", None)
             else:
                 os.environ["PDM_CAD_URNS_PATH"] = prev_urns
+            if prev_map is None:
+                os.environ.pop("PDM_CAD_REGION_MAP_PATH", None)
+            else:
+                os.environ["PDM_CAD_REGION_MAP_PATH"] = prev_map
             if prev_id is None:
                 os.environ.pop("APS_CLIENT_ID", None)
             else:
@@ -2077,6 +2270,8 @@ def main() -> int:
     check("cad_part_click", test_cad_part_click)
     check("cad_node_name_sanitizer", test_cad_node_name_sanitizer)
     check("cad_region_tint", test_cad_region_tint)
+    check("cad_sensor_driver", test_cad_sensor_driver)
+    check("cad_region_map", test_cad_region_map)
     check("cad_sensor_grid", test_cad_sensor_grid)
     check("aps_translate_mocked", test_aps_translate_mocked)
     check("aps_zip_root_filename", test_aps_zip_root_filename)

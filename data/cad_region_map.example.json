@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "models": {
+    "aviation_uav_piston::dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6cGRtLWV4YW1wbGUtY2FkL3JvdGF4OTEyLnN0ZXA": {
+      "pack_id": "aviation_uav_piston",
+      "regions": {
+        "heads_exhaust": [412, 418, 424],
+        "oil_system": [531],
+        "rotating_crank": [307, 309]
+      },
+      "updated_at": "2026-09-04T08:00:00Z",
+      "urn": "dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6cGRtLWV4YW1wbGUtY2FkL3JvdGF4OTEyLnN0ZXA"
+    }
+  }
+}

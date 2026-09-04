@@ -101,6 +101,7 @@ from src.aps_viewer import (
     aps_model_urn,
     build_viewer_html,
     cad_size_issue,
+    coerce_db_ids,
     extract_model_urn,
     get_access_token,
     is_cad_zip_name,
@@ -117,8 +118,10 @@ from src.aps_viewer import (
     translate_cad_bytes,
 )
 from src.cad_part import (
+    DRIVER_HONESTY,
     NO_REGION_MATCH_MSG,
     build_part_card,
+    format_sensor_value,
     latest_asset_sensors,
     parse_cad_part_event,
     parse_cad_region_event,
@@ -126,7 +129,17 @@ from src.cad_part import (
     region_hint_keywords,
     risk_theme_hex,
     sanitize_node_name,
+    sensor_driver,
     sensor_grid_rows,
+)
+from src.cad_regions import (
+    NO_ASSIGNMENT_MSG,
+    REGIONS,
+    assign_region,
+    assigned_theme_plan,
+    assignment_summary,
+    clear_region_map,
+    region_label,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
@@ -1600,16 +1613,18 @@ def _cad_asset_context(sel: dict[str, Any], pack_id: str) -> dict[str, Any]:
         if part_name
         else None
     )
+    risk = str(sel.get("risk_level") or "Unknown")
     card = build_part_card(
         part_name=part_name,
         asset_id=asset_id,
-        risk=str(sel.get("risk_level") or "Unknown"),
+        risk=risk,
         rul_days=sel.get("predicted_rul_days"),
         sensors=sensors,
         hint=hint,
         db_id=part.get("dbId"),
     )
-    return {"card": card, "sensors": sensors, "hint": hint, "part": part}
+    driver = sensor_driver(get_active_df(), asset_id, risk, sensors=sensors)
+    return {"card": card, "sensors": sensors, "hint": hint, "part": part, "driver": driver}
 
 
 def render_cad_part_card(
@@ -1665,8 +1680,32 @@ def render_cad_part_card(
         if st.button("Open Anomaly & RUL", key="cad_open_anomaly_rul"):
             request_pipeline_page(ANOMALY_RUL_PAGE)
             st.rerun()
+    render_cad_driver_line(ctx.get("driver") or {}, card["risk"])
     st.caption(card["honesty"])
     return {"sel": sel, "selected": selected, "load_clicked": bool(load_clicked), **ctx}
+
+
+def render_cad_driver_line(driver: dict[str, Any], risk: str) -> None:
+    """``High driven by exhaust_temp (EGT) → heads / exhaust``, full width under the strip.
+
+    Low / Unknown gets no "driven by" line at all — a healthy asset is not scary.
+    """
+    if driver.get("line"):
+        st.markdown(
+            f'<div style="font-size:1.05rem;margin:.15rem 0 .1rem 0">'
+            f'<b style="color:{risk_theme_hex(risk)}">{driver["line"]}</b></div>',
+            unsafe_allow_html=True,
+        )
+        z = driver.get("z")
+        basis = "z-score" if driver.get("basis") == "z-score" else "median/MAD score"
+        st.caption(
+            f"Largest |{basis}| among this asset's mapped sensors "
+            f"({driver['sensor']} = {format_sensor_value(driver.get('value'))}, "
+            f"score {float(z):+.1f} vs the other rows of that column). {DRIVER_HONESTY}"
+        )
+        return
+    if driver.get("message"):
+        st.caption(driver["message"])
 
 
 def render_cad_sensor_grid(ctx: dict[str, Any], *, per_row: int = 4) -> None:
@@ -1688,10 +1727,111 @@ def render_cad_sensor_grid(ctx: dict[str, Any], *, per_row: int = 4) -> None:
                     st.caption("matches the clicked part")
 
 
-def render_cad_region_note(risk: str, pack_id: str) -> None:
+def render_cad_region_assign(
+    ctx: dict[str, Any],
+    pack_id: str,
+    urn: str,
+) -> None:
+    """Click a part → pick a region → **Assign**. That is what turns Solid1 red.
+
+    Autodesk node names from a STEP export are often ``Solid1`` / ``??????-1-solid1``,
+    so name matching has nothing to work with. The saved ``{pack + urn → region →
+    dbIds}`` map is what the viewer themes instead.
+    """
+    part = ctx.get("part") or {}
+    driver = ctx.get("driver") or {}
+    db_id = part.get("dbId")
+    summary = assignment_summary(pack_id, urn)
+
+    st.markdown("##### Click-to-assign CAD regions")
+    cols = st.columns([1.6, 1.5, 1.2, 1.4])
+    with cols[0]:
+        labels = [label for _, label in REGIONS]
+        default = region_label(driver.get("region") or "heads_exhaust")
+        picked_label = st.selectbox(
+            "Region for the clicked part",
+            labels,
+            index=labels.index(default) if default in labels else 0,
+            key="cad_region_pick",
+        )
+    region_id = next((rid for rid, label in REGIONS if label == picked_label), "other")
+    with cols[1]:
+        assign_clicked = st.button(
+            "Assign selected part to this region",
+            key="cad_assign_region_btn",
+            type="primary",
+            disabled=not (db_id is not None and urn),
+            help=(
+                "Saves this dbId for this pack + model URN."
+                if db_id is not None and urn
+                else "Click a part in the viewer (and load a model) first."
+            ),
+        )
+    with cols[2]:
+        clear_clicked = st.button(
+            "Clear region map",
+            key="cad_clear_region_btn",
+            disabled=not summary["total"],
+            help="Forget every assigned part for this model.",
+        )
+    with cols[3]:
+        st.checkbox(
+            "Also tint related regions",
+            value=False,
+            key="cad_region_include_related",
+            help="e.g. a heads/exhaust driver also tints related oil parts when those are assigned.",
+        )
+
+    if assign_clicked:
+        result = assign_region(pack_id, urn, db_id, region_id)
+        st.session_state.cad_region_assign_log = result
+        if result.get("saved"):
+            st.rerun()
+        else:
+            st.warning(result.get("message") or "Could not assign that part.")
+    if clear_clicked:
+        result = clear_region_map(pack_id, urn)
+        st.session_state.cad_region_assign_log = {}
+        st.session_state.cad_region_clear_log = result
+        st.rerun()
+
+    log = st.session_state.get("cad_region_assign_log") or {}
+    if log.get("saved"):
+        moved = log.get("moved_from")
+        st.success(
+            log.get("message", "")
+            + (f" Moved out of {region_label(moved)}." if moved else "")
+        )
+    cleared = st.session_state.pop("cad_region_clear_log", None)
+    if cleared:
+        st.info(cleared.get("message") or "Region map cleared.")
+
+    if db_id is None:
+        st.caption(
+            "Click a part in GuiViewer3D above — its Autodesk name and dbId appear in the strip, "
+            "then assign it here. Assign 4–6 parts (e.g. 3 heads + 2 exhaust stubs) for a "
+            "believable red region."
+        )
+    else:
+        st.caption(
+            f"Selected `{part.get('display') or part.get('name') or 'part'}` "
+            f"(dbId `{db_id}`) → will be saved under **{picked_label}**."
+        )
+    if summary["total"]:
+        st.caption(f"Saved for this model: {summary['text']} ({summary['total']} part(s)).")
+    else:
+        st.caption(NO_ASSIGNMENT_MSG)
+
+
+def render_cad_region_note(
+    risk: str,
+    pack_id: str,
+    assigned: Optional[dict[str, Any]] = None,
+) -> None:
     """What the region tint did, or why it left the engine its default color."""
     level = normalize_risk(risk)
     report = st.session_state.get("cad_region_report") or {}
+    plan = assigned or {}
     tint_word = {"High": "red", "Medium": "orange"}.get(level, "")
     if not tint_word:
         st.caption(
@@ -1702,19 +1842,36 @@ def render_cad_region_note(risk: str, pack_id: str) -> None:
     matched = int(report.get("matched") or 0)
     if report and matched:
         names = ", ".join(f"`{n}`" for n in report.get("names") or [])
+        what = (
+            "CAD part(s) you assigned to the driver region"
+            if report.get("source") == "assigned"
+            else "CAD node(s) matching this asset's hot sensors"
+        )
         st.success(
-            f"Region tint: **{matched}** CAD node(s) matching this asset's hot sensors are "
-            f"**{tint_word}**. Everything else keeps the default color."
+            f"Region tint: **{matched}** {what} are **{tint_word}**. "
+            "Everything else keeps the default color."
             + (f" Matched: {names}." if names else "")
         )
         return
     if report:
-        st.warning(NO_REGION_MATCH_MSG)
+        st.warning(
+            NO_REGION_MATCH_MSG
+            + (" " + NO_ASSIGNMENT_MSG if not plan.get("dbIds") else "")
+        )
+        return
+    if plan.get("dbIds"):
+        used = ", ".join(f"**{region_label(r)}**" for r in plan.get("regions_used") or [])
+        st.caption(
+            f"Asset risk is **{level}** — the {len(plan['dbIds'])} part(s) you assigned to "
+            f"{used or 'the driver region'} turn {tint_word} as soon as the model loads; "
+            "every other solid stays default dark gray."
+        )
         return
     keywords = ", ".join(f"`{k}`" for k in region_hint_keywords(pack_id)[:8])
     st.caption(
         f"Asset risk is **{level}** — CAD nodes whose Autodesk name matches a mapped sensor "
         f"turn {tint_word}; the rest stay default dark gray. Name needles: {keywords}, …"
+        + (f" {plan['message']}" if plan.get("message") else "")
     )
 
 
@@ -1809,9 +1966,11 @@ def _render_cad_viewer(
     risk: str,
     public_viewer: bool,
     needles: Optional[list[str]] = None,
+    region_ids: Optional[list[int]] = None,
 ) -> None:
-    """GuiViewer3D + the node-name needles that decide which dbIds get tinted."""
+    """GuiViewer3D + the node-name needles / assigned dbIds that decide the tint."""
     hints = list(needles or [])
+    assigned = coerce_db_ids(region_ids)
     html = build_viewer_html(
         token,
         urn,
@@ -1820,6 +1979,7 @@ def _render_cad_viewer(
         height=DEFAULT_VIEWER_HEIGHT,
         public_viewer=public_viewer,
         needles=hints,
+        region_ids=assigned,
     )
     st.session_state.aps_viewer_html = html
     st.session_state.aps_viewer_urn = urn
@@ -1837,6 +1997,7 @@ def _render_cad_viewer(
             extras=list(VIEWER_EXTRA_EXTENSIONS),
             viewer_err={str(k): v for k, v in VIEWER_ERROR_CODES.items()},
             needles=hints,
+            region_ids=assigned,
             default=None,
             key="cad_gui_viewer",
         )
@@ -1891,6 +2052,7 @@ def _render_cad_viewer_section(
     pack_id: str,
     status: dict[str, Any],
     needles: list[str],
+    region_ids: Optional[list[int]] = None,
 ) -> None:
     """The viewer slot itself — GuiViewer3D, or an honest placeholder."""
     urn = str(urn_state.get("urn") or "").strip()
@@ -1943,6 +2105,7 @@ def _render_cad_viewer_section(
                     risk=risk,
                     public_viewer=False,
                     needles=needles,
+                    region_ids=region_ids,
                 )
             persist = _persist_pack_urn(
                 pack_id, urn, source="load" if load_clicked else "auto", public_viewer=False
@@ -1966,6 +2129,7 @@ def _render_cad_viewer_section(
                 risk=risk,
                 public_viewer=False,
                 needles=needles,
+                region_ids=region_ids,
             )
         else:
             components.html(cache_html, height=_cad_iframe_height())
@@ -2184,12 +2348,13 @@ def page_cad_twin():
     pack_id = active_pack_id()
     st.markdown(
         f'<p class="sub-header">Real translated CAD for <b>{pack["label"]}</b> '
-        "(Revit / Fusion / IFC / STEP → SVF). The engine keeps its <b>default dark gray</b>: only the "
-        "CAD nodes whose Autodesk name matches one of this asset's mapped sensors get tinted — "
-        "<b>red</b> on High risk, <b>orange</b> on Medium, nothing on Low. Click any part for its "
-        "Autodesk name. GuiViewer3D full toolbar; the light-blue selection outline and Explode are "
-        "the viewer's own. Last working URN is saved on this server per industry pack. "
-        "Credentials are runtime secrets.</p>",
+        "(Revit / Fusion / IFC / STEP → SVF). The engine keeps its <b>default dark gray</b>. "
+        "Click a part, pick Heads/exhaust · Oil · Rotating/crank · Intake · Other, and assign it — "
+        "High tints those saved dbIds <b>red</b>, Medium <b>orange</b>, Low none. "
+        "Name-matched nodes still tint when the STEP has real names; Solid1 + an empty map "
+        "never reddens the whole engine. GuiViewer3D full toolbar; the light-blue selection "
+        "outline and Explode are the viewer's own. Last working URN is saved on this server "
+        "per industry pack. Credentials are runtime secrets.</p>",
         unsafe_allow_html=True,
     )
 
@@ -2219,6 +2384,15 @@ def page_cad_twin():
     )
     risk = str(actions["card"]["risk"])
     needles = region_hint_keywords(pack_id, available=list((actions["sensors"] or {}).keys()))
+    driver = actions.get("driver") or {}
+    assigned = assigned_theme_plan(
+        pack_id,
+        urn_state["urn"],
+        risk,
+        driver.get("region") or "",
+        related=driver.get("related") or [],
+        include_related=bool(st.session_state.get("cad_region_include_related")),
+    )
 
     _render_cad_viewer_section(
         ok=ok,
@@ -2229,8 +2403,10 @@ def page_cad_twin():
         pack_id=pack_id,
         status=status,
         needles=needles,
+        region_ids=assigned["dbIds"],
     )
-    render_cad_region_note(risk, pack_id)
+    render_cad_region_assign(actions, pack_id, urn_state["urn"])
+    render_cad_region_note(risk, pack_id, assigned)
     render_cad_sensor_grid(actions)
 
     with st.expander("CAD source — upload, translate, URN, save", expanded=not urn_state["urn"]):

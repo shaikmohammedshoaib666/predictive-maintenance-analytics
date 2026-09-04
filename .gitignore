@@ -12,6 +12,7 @@ graphs/*.html
 graphs/*.json
 data/*
 !data/cad_urns.example.json
+!data/cad_region_map.example.json
 *.db
 .DS_Store
 .cursor/

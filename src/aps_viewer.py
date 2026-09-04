@@ -26,7 +26,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import parse_qs, unquote, urlparse, quote
 
 from src.cad_part import REGION_THEME_RGBA, region_hint_keywords
@@ -1346,6 +1346,8 @@ _VIEWER_TEMPLATE = """
   var HEIGHT=__HEIGHT__;
   var RISK_RGBA=__RISK_RGBA__;
   var NEEDLES=__NEEDLES__;
+  // dbIds the user assigned to the driver region on the Click-to-assign panel.
+  var ASSIGNED=__ASSIGNED__;
   // Fallback name search can match property values, not just nodes. Never let it
   // paint the whole engine: drop the result when it covers more than this share.
   var SEARCH_MAX_SHARE=0.35, SEARCH_MIN_CAP=12, SEARCH_TIMEOUT_MS=4000;
@@ -1439,7 +1441,8 @@ _VIEWER_TEMPLATE = """
     if (!el) return;
     if (source === 'off'){ el.textContent = ' · default color (no risk tint)'; return; }
     if (matched > 0){
-      el.textContent = ' · ' + matched + ' matched node' + (matched === 1 ? '' : 's') + ' tinted';
+      var what = (source === 'assigned') ? 'assigned part' : 'matched node';
+      el.textContent = ' · ' + matched + ' ' + what + (matched === 1 ? '' : 's') + ' tinted';
       return;
     }
     el.textContent = ' · no CAD region matched — default color';
@@ -1540,6 +1543,14 @@ _VIEWER_TEMPLATE = """
         return;
       }
       var walk = walkRegion(v);
+      // Click-to-assign wins: High + driver region paints the saved dbIds, even
+      // when Autodesk names are Solid1. Name matching is the fallback.
+      if (ASSIGNED && ASSIGNED.length){
+        var paintedA = paintRegion(v, color, ASSIGNED);
+        setRegionBadge(paintedA, 'assigned');
+        reportRegion(paintedA, walk.nodes, [], 'assigned');
+        return;
+      }
       if (walk.ids.length){
         var painted = paintRegion(v, color, walk.ids);
         setRegionBadge(painted, 'tree');
@@ -1651,6 +1662,7 @@ _VIEWER_TEMPLATE = """
     if (args.viewer_err) VIEWER_ERR = args.viewer_err;
     if (args.height) HEIGHT = args.height;
     if (args.needles && args.needles.length) NEEDLES = args.needles;
+    if (args.region_ids != null) ASSIGNED = args.region_ids;
     setBadge(ASSET, RISK, '');
     if (PUBLIC){
       fail('<b>This URN is from Autodesk&apos;s public Viewer website. Your APS app cannot open it.</b> '
@@ -1754,6 +1766,22 @@ def _region_rgba_js() -> str:
     return json.dumps(payload)
 
 
+def coerce_db_ids(raw: Optional[Iterable[Any]]) -> list[int]:
+    """Clean a dbId list for the viewer: ints only, de-duplicated, order kept."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in raw or []:
+        try:
+            ident = int(item)
+        except (TypeError, ValueError):
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ident)
+    return out
+
+
 def build_viewer_html(
     token: str,
     urn: str,
@@ -1764,20 +1792,24 @@ def build_viewer_html(
     public_viewer: bool = False,
     bridge: bool = False,
     needles: Optional[list[str]] = None,
+    region_ids: Optional[Iterable[Any]] = None,
 ) -> str:
     """Embed GuiViewer3D (full toolbar), not a headless Viewer3D.
 
     ``needles`` are the normalized node-name keywords from
-    ``src.cad_part.region_hint_keywords``; only dbIds matching one of them get
-    the risk tint. ``bridge=True`` waits for Streamlit ``streamlit:render`` args
-    and posts click / region events via ``streamlit:setComponentValue`` (custom
-    component iframe). ``components.html`` / dashboard export use ``bridge=False``.
+    ``src.cad_part.region_hint_keywords``. ``region_ids`` are the dbIds the user
+    click-assigned to the driver's region — those win over name matching so a
+    ``Solid1`` STEP can still show a red heads/exhaust region.
+    ``bridge=True`` waits for Streamlit ``streamlit:render`` args and posts click
+    / region events via ``streamlit:setComponentValue`` (custom component
+    iframe). ``components.html`` / dashboard export use ``bridge=False``.
     """
     risk = risk if risk in _RISK_HEX else "Unknown"
     urn = normalize_model_urn(urn)
     extras_js = json.dumps(list(VIEWER_EXTRA_EXTENSIONS))
     err_js = json.dumps({str(k): v for k, v in VIEWER_ERROR_CODES.items()})
     hints = region_hint_keywords() if needles is None else [str(n) for n in needles if str(n)]
+    assigned = coerce_db_ids(region_ids)
     safe_asset = str(asset).replace("\\", "\\\\").replace('"', '\\"')
     safe_token = str(token).replace("\\", "\\\\").replace('"', '\\"')
     return (
@@ -1786,6 +1818,7 @@ def build_viewer_html(
         .replace("__ASSET__", safe_asset)
         .replace("__RISK_HEX__", _RISK_HEX[risk])
         .replace("__RISK_RGBA__", _region_rgba_js())
+        .replace("__ASSIGNED__", json.dumps(assigned))
         .replace("__NEEDLES__", json.dumps(hints))
         .replace("__RISK__", risk)
         .replace("__HEIGHT__", str(int(height)))
