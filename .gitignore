@@ -17,3 +17,4 @@ data/*
 .DS_Store
 .cursor/
 .streamlit/secrets.toml
+docs/*.pdf
