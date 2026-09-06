@@ -688,6 +688,24 @@ def _render_quality_subreports(report: dict) -> None:
                 st.error(flag)
 
 
+# Streamlit's dataframe grid virtualizes; keep a fixed height so 500+ rows scroll
+# instead of dumping a 10-row head() or exploding the page with st.table.
+_PREVIEW_GRID_HEIGHT = 420
+_PREVIEW_WARN_ROWS = 20_000
+
+
+def _scrollable_full_table(df: pd.DataFrame, *, height: int = _PREVIEW_GRID_HEIGHT) -> None:
+    """Forge-like preview: pass the full frame so the grid can scroll every row."""
+    n = len(df)
+    st.dataframe(df, height=height, use_container_width=True)
+    if n > _PREVIEW_WARN_ROWS:
+        st.caption(
+            f"{n:,} rows — scroll to see all (grid virtualizes; height capped at {height}px)."
+        )
+    else:
+        st.caption(f"{n:,} rows — scroll to see all")
+
+
 # ── Upload & Clean (19-stage quality) ─────────────────────────────────────────
 def page_upload_clean():
     st.markdown('<p class="main-header">1. Upload & Clean</p>', unsafe_allow_html=True)
@@ -745,7 +763,7 @@ def page_upload_clean():
 
     if st.session_state.raw_df is not None:
         st.subheader("Raw Data Preview")
-        st.dataframe(st.session_state.raw_df.head(10), use_container_width=True)
+        _scrollable_full_table(st.session_state.raw_df)
 
         engines = ["pandas"]
         polars_ok, polars_msg = polars_available()
@@ -797,7 +815,7 @@ def page_upload_clean():
 
         if st.session_state.cleaned_df is not None:
             st.subheader("Cleaned Data Preview")
-            st.dataframe(st.session_state.cleaned_df.head(10), use_container_width=True)
+            _scrollable_full_table(st.session_state.cleaned_df)
             st.download_button(
                 "Download Cleaned CSV",
                 st.session_state.cleaned_df.to_csv(index=False),

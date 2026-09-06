@@ -2149,6 +2149,30 @@ def main() -> int:
         assert at.session_state["raw_df"] is not None
         assert len(at.session_state["raw_df"]) > 10
         assert at.session_state["industry_pack"] == DEFAULT_PACK_ID
+        raw_n = len(at.session_state["raw_df"])
+        preview_rows = [
+            el.value.shape[0]
+            for el in at.dataframe
+            if getattr(el, "value", None) is not None and hasattr(el.value, "shape")
+        ]
+        assert raw_n in preview_rows, (
+            f"raw preview must show all {raw_n} rows, not a head(); got {preview_rows}"
+        )
+        caps = " ".join(str(getattr(c, "value", "") or "") for c in at.caption)
+        assert "scroll to see all" in caps, caps
+        at.session_state["cleaned_df"] = at.session_state["raw_df"]
+        at.run()
+        assert not _errs(at), "cleaned preview render: " + "; ".join(_errs(at))
+        cleaned_n = len(at.session_state["cleaned_df"])
+        preview_rows = [
+            el.value.shape[0]
+            for el in at.dataframe
+            if getattr(el, "value", None) is not None and hasattr(el.value, "shape")
+        ]
+        full_previews = [n for n in preview_rows if n == cleaned_n]
+        assert len(full_previews) >= 2, (
+            f"raw + cleaned previews must both show all {cleaned_n} rows; got {preview_rows}"
+        )
 
         demo_id = next(pid for pid in PACK_ORDER if pid != DEFAULT_PACK_ID)
         at2 = AppTest.from_file(app_path, default_timeout=45)
