@@ -2594,10 +2594,10 @@ def main() -> int:
         assert "MissionAdvisory" in after, after[:1200]
         assert "UAV-01:" in after and "UAV-02:" in after and "UAV-03:" in after, after[:1200]
         assert "flies next mission" in after and "% success chance" in after, after[:1200]
-        scored = at.session_state.get("cleaned_df")
+        scored = at.session_state["cleaned_df"]
         assert scored is not None and "physics_fault" in scored.columns
         assert "anomaly_score" in scored.columns
-        assert at.session_state.get("anomaly_detector") is not None
+        assert at.session_state["anomaly_detector"] is not None
 
         radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
         radio.set_value("7. Dashboard").run()
