@@ -42,7 +42,11 @@ def is_tabular_zip_name(filename: str) -> bool:
 
 
 def _zip_member_norm(name: str) -> str:
-    return (name or "").replace("\\", "/").lstrip("./")
+    # Do not lstrip("./") — that would turn ".DS_Store" into "DS_Store".
+    norm = (name or "").replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
 
 
 def _zip_member_basename(name: str) -> str:
