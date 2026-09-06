@@ -95,7 +95,7 @@ def _iframe(inner: str, height: int) -> str:
     )
 
 
-def _kpi_strip_html(bundle: dict[str, Any]) -> str:
+def _kpi_strip_html(bundle: dict[str, Any], *, mission_line: str = "", advisory: str = "") -> str:
     cards = []
     for k in bundle.get("kpis") or []:
         sev = k.get("severity") or "info"
@@ -114,7 +114,21 @@ def _kpi_strip_html(bundle: dict[str, Any]) -> str:
     title = html.escape(str(bundle.get("label") or "Pack"))
     sih = bundle.get("sih")
     sih_bit = f" · {html.escape(str(sih))}" if sih else ""
-    return f"<h2>{title}{sih_bit}</h2><div style='display:flex;gap:12px;flex-wrap:wrap'>{''.join(cards)}</div>"
+    extra = ""
+    if mission_line:
+        extra += (
+            f"<p style='margin:12px 0 4px;font-size:18px;font-weight:700'>"
+            f"{html.escape(mission_line)}</p>"
+        )
+    if advisory:
+        extra += (
+            f"<p style='margin:8px 0 0'><b>MissionAdvisory</b> — {html.escape(advisory)}</p>"
+        )
+    return (
+        f"<h2>{title}{sih_bit}</h2>"
+        f"<div style='display:flex;gap:12px;flex-wrap:wrap'>{''.join(cards)}</div>"
+        f"{extra}"
+    )
 
 
 def _insights_html(cards: list[dict[str, Any]]) -> str:
@@ -142,6 +156,8 @@ def compose_dashboard_html(
     cad_html: str = "",
     cad_status: Optional[dict[str, Any]] = None,
     title: str = "Reliability dashboard",
+    mission_line: str = "",
+    advisory: str = "",
 ) -> str:
     """Standalone HTML export (charts via Plotly CDN; 3D twin is inlined / offline)."""
     enabled = [t for t in (tiles or list(DEFAULT_TILES)) if t in DEFAULT_TILES]
@@ -160,7 +176,9 @@ def compose_dashboard_html(
         f"<p style='opacity:.75'>{html.escape(pack['scope'])}</p>",
     ]
     if "kpis" in enabled:
-        parts.append(f"<div class='tile'>{_kpi_strip_html(bundle)}</div>")
+        parts.append(
+            f"<div class='tile'>{_kpi_strip_html(bundle, mission_line=mission_line, advisory=advisory)}</div>"
+        )
     if "charts" in enabled:
         parts.append("<div class='tile'><h2>Charts</h2>")
         if chart_figs:

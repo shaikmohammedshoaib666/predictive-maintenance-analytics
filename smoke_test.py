@@ -1521,6 +1521,111 @@ def main() -> int:
             [{"machine_id": "M-1", "risk_level": "Low", "predicted_rul_days": 25}],
         )
         assert {k["id"] for k in plant_b["kpis"]} >= {"asset_health_index", "high_risk_assets"}
+        assert plant_b["by_asset"][0]["mission_success_pct"] == int(round(plant_b["by_asset"][0]["health_index"]))
+
+    def test_physics_rules() -> None:
+        from src.ml.anomaly_detector import AnomalyDetector
+        from src.physics_rules import (
+            FAULT_HIGH_VIB,
+            FAULT_LOW_OIL,
+            FAULT_NONE,
+            FAULT_OVERHEATING,
+            advisory_action,
+            apply_physics_rules,
+            build_advisory_items,
+            format_mission_advisory,
+            mission_success_line,
+            mission_success_pct,
+            physics_fault_region,
+            summarize_physics,
+        )
+
+        tiny = pd.DataFrame(
+            {
+                "machine_id": ["UAV-01", "UAV-02", "UAV-03", "UAV-04"],
+                "egt": [700.0, 850.0, 700.0, 700.0],
+                "cht": [170.0, 170.0, 260.0, 170.0],
+                "oil_pressure": [60.0, 60.0, 60.0, 30.0],
+                "vibration": [1.5, 6.2, 1.5, 1.5],
+            }
+        )
+        out = apply_physics_rules(tiny, "aviation_uav_piston")
+        assert list(out["physics_fault"]) == [
+            FAULT_NONE,
+            FAULT_OVERHEATING,  # EGT 850 + vib 6.2 → oil not fired; Low oil wins over overheat only if oil fires
+            FAULT_OVERHEATING,
+            FAULT_LOW_OIL,
+        ]
+        # UAV-02 also has high vibration; primary is Overheating (EGT) over vibration, oil not in play.
+        assert "EGT high" in str(out.loc[1, "physics_rule"])
+        assert "Vibration high" in str(out.loc[1, "physics_rule"])
+        assert out.loc[2, "physics_alert"] is True or bool(out.loc[2, "physics_alert"])
+        assert "CHT high" in str(out.loc[2, "physics_rule"])
+        assert out.loc[0, "physics_fault"] == FAULT_NONE
+
+        aliases = pd.DataFrame({"egt_c": [900.0], "oil_psi": [12.0], "vib": [9.0]})
+        aliased = apply_physics_rules(aliases, "aviation_uav_piston")
+        assert aliased.loc[0, "physics_fault"] == FAULT_LOW_OIL  # oil wins vs overheat vs vib
+        assert "EGT high" in str(aliased.loc[0, "physics_rule"])
+
+        default_oil = apply_physics_rules(
+            pd.DataFrame({"machine_id": ["ENG-01"], "oil_pressure": [30.0], "vibration": [1.0]}),
+            "automotive_powertrain",
+        )
+        assert default_oil.loc[0, "physics_fault"] == FAULT_NONE  # auto low-oil limit is 20 psi
+
+        assert mission_success_pct(-5) == 0
+        assert mission_success_pct(140) == 100
+        assert mission_success_pct(73.2) == 73
+        assert mission_success_pct(None) == 0
+        assert mission_success_pct(float("nan")) == 0
+        assert mission_success_line("UAV-03", 41.4) == "If UAV-03 flies next mission, 41% success chance"
+
+        assert advisory_action(risk_level="High", physics_fault=FAULT_LOW_OIL) == "Inspect oil"
+        assert advisory_action(risk_level="High", physics_fault=FAULT_OVERHEATING) == "Check cooling"
+        assert advisory_action(risk_level="High", driver_sensor="oil_pressure") == "Inspect oil"
+        assert advisory_action(risk_level="High", driver_sensor="egt") == "Check cooling"
+        assert "Monitor / inspect" in advisory_action(
+            risk_level="Medium", physics_fault=FAULT_NONE, region_phrase="oil"
+        )
+        assert advisory_action(risk_level="Low", physics_fault=FAULT_NONE) == "OK"
+        assert advisory_action(risk_level="Low", physics_fault=FAULT_LOW_OIL) == "Inspect oil"
+        assert advisory_action(risk_level="High", physics_fault=FAULT_HIGH_VIB) == "Inspect rotating assembly"
+        assert physics_fault_region(FAULT_LOW_OIL) == "oil_system"
+        assert physics_fault_region(FAULT_OVERHEATING) == "heads_exhaust"
+        assert physics_fault_region(FAULT_HIGH_VIB) == "rotating_crank"
+        assert physics_fault_region(FAULT_NONE) == ""
+
+        items = build_advisory_items(
+            machine_ids=["UAV-01", "UAV-02", "UAV-03"],
+            predictions=[
+                {"machine_id": "UAV-01", "risk_level": "High"},
+                {"machine_id": "UAV-02", "risk_level": "Low"},
+                {"machine_id": "UAV-03", "risk_level": "High"},
+            ],
+            physics_rows=[
+                {"machine_id": "UAV-01", "physics_fault": FAULT_LOW_OIL},
+                {"machine_id": "UAV-02", "physics_fault": FAULT_NONE},
+                {"machine_id": "UAV-03", "physics_fault": FAULT_OVERHEATING},
+            ],
+        )
+        text = format_mission_advisory(items)
+        assert text == "UAV-01: Inspect oil · UAV-02: OK · UAV-03: Check cooling"
+        assert {i["machine_id"] for i in items} == {"UAV-01", "UAV-02", "UAV-03"}
+
+        sample = pd.read_csv(ROOT / "sample_data" / "aviation_uav_piston.csv", parse_dates=["timestamp"])
+        scored = apply_physics_rules(sample, "aviation_uav_piston")
+        by_asset = {r["machine_id"]: r for r in summarize_physics(scored)}
+        assert by_asset["UAV-01"]["physics_fault"] == FAULT_NONE
+        assert by_asset["UAV-02"]["physics_fault"] == FAULT_NONE
+        assert by_asset["UAV-03"]["physics_fault"] in {FAULT_LOW_OIL, FAULT_OVERHEATING, FAULT_HIGH_VIB}
+        assert "CHT high" in by_asset["UAV-03"]["physics_rule"] or "Oil pressure low" in by_asset["UAV-03"]["physics_rule"]
+
+        det = AnomalyDetector(contamination=0.08)
+        det.fit(scored)
+        assert "physics_alert" not in det.feature_columns
+        assert "egt" in det.feature_columns
+
 
     def test_pack_samples_pipeline() -> None:
         from src.data_cleaner import clean_and_quality
@@ -1548,10 +1653,15 @@ def main() -> int:
             if pid == "oil_srp":
                 assert mapping.get("pump_fillage") == "pump_fillage"
             cleaned, _, _ = clean_and_quality(df, run_quality=False)
+            from src.physics_rules import PHYSICS_COLS, apply_physics_rules
+
+            cleaned = apply_physics_rules(cleaned, pid)
             det = AnomalyDetector(contamination=0.08)
             det.fit(cleaned)
+            assert not any(c in det.feature_columns for c in PHYSICS_COLS)
             if pid == "aviation_uav_piston":
                 assert "egt" in det.feature_columns
+                assert "physics_fault" in cleaned.columns
             rul = RULPredictor()
             rul.fit(cleaned)
             preds = rul.predict_latest_per_machine(cleaned)
@@ -2424,6 +2534,87 @@ def main() -> int:
         ]
         assert zip_boxes, [s.label for s in at6.selectbox]
 
+    def test_sih_physics_apptest() -> None:
+        """Judges path: Aviation demo → Anomaly physics table → Detect → MissionAdvisory on 4/6/7."""
+        from streamlit.testing.v1 import AppTest
+
+        from src.industry_packs import PACKS
+
+        def _errs(at) -> list[str]:
+            return [getattr(e, "message", str(e)) for e in at.exception]
+
+        def _blob(at) -> str:
+            parts: list[str] = []
+            for name in ("markdown", "caption", "subheader", "expander", "text"):
+                group = getattr(at, name, None)
+                if group is None:
+                    continue
+                try:
+                    items = list(group)
+                except Exception:
+                    continue
+                for item in items:
+                    parts.append(
+                        str(
+                            getattr(item, "value", None)
+                            or getattr(item, "body", None)
+                            or getattr(item, "label", None)
+                            or ""
+                        )
+                    )
+            return " ".join(parts)
+
+        app_path = str(ROOT / "app.py")
+        at = AppTest.from_file(app_path, default_timeout=120)
+        at.run()
+        assert not _errs(at), "initial: " + "; ".join(_errs(at))
+        next(b for b in at.button if b.label == "Load pack demo").click().run()
+        assert not _errs(at), "Load pack demo: " + "; ".join(_errs(at))
+        assert at.session_state["industry_pack"] == "aviation_uav_piston"
+        at.session_state["cleaned_df"] = at.session_state["raw_df"]
+        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+        radio.set_value("4. Anomaly & RUL").run()
+        assert not _errs(at), "Anomaly nav: " + "; ".join(_errs(at))
+        page = _blob(at)
+        assert "Physics rules" in page, page[:800]
+        assert "known red-line" in page and "slow degradation" in page, page[:800]
+        phys_tables = [
+            el.value
+            for el in at.dataframe
+            if getattr(el, "value", None) is not None and hasattr(el.value, "columns")
+            and "rule fired" in [str(c) for c in el.value.columns]
+        ]
+        assert phys_tables, "Physics rules table missing"
+        assets = set(str(a) for a in phys_tables[0]["asset"].tolist())
+        assert {"UAV-01", "UAV-02", "UAV-03"} <= assets
+
+        next(b for b in at.button if b.label == "Detect anomalies + predict RUL").click().run()
+        assert not _errs(at), "Detect: " + "; ".join(_errs(at))
+        after = _blob(at)
+        assert "MissionAdvisory" in after, after[:1200]
+        assert "UAV-01:" in after and "UAV-02:" in after and "UAV-03:" in after, after[:1200]
+        assert "flies next mission" in after and "% success chance" in after, after[:1200]
+        scored = at.session_state.get("cleaned_df")
+        assert scored is not None and "physics_fault" in scored.columns
+        assert "anomaly_score" in scored.columns
+        assert at.session_state.get("anomaly_detector") is not None
+
+        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+        radio.set_value("7. Dashboard").run()
+        assert not _errs(at), "Dashboard: " + "; ".join(_errs(at))
+        dash = _blob(at)
+        assert "MissionAdvisory" in dash, dash[:1200]
+        assert "flies next mission" in dash, dash[:1200]
+        assert "UAV-01:" in dash and "UAV-03:" in dash
+
+        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+        radio.set_value("6. Insights").run()
+        assert not _errs(at), "Insights: " + "; ".join(_errs(at))
+        ins = _blob(at)
+        assert "MissionAdvisory" in ins, ins[:1200]
+        assert "UAV-01:" in ins and "UAV-02:" in ins and "UAV-03:" in ins
+        assert PACKS["aviation_uav_piston"]["sih"] == "SIH26054"
+
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
@@ -2446,6 +2637,7 @@ def main() -> int:
     check("charts_layout", test_charts)
     check("industry_packs", test_industry_packs)
     check("pack_kpis_every_function", test_pack_kpis_every_function)
+    check("physics_rules", test_physics_rules)
     check("pack_samples_pipeline", test_pack_samples_pipeline)
     check("pack_mapping_does_not_steal_core", test_pack_mapping_does_not_steal_core)
     check("email_honesty", test_email_honesty)
@@ -2458,6 +2650,7 @@ def main() -> int:
     check("cad_twin_layout_order", test_cad_twin_layout_order)
     check("cad_twin_apptest_layout", test_cad_twin_apptest_layout)
     check("upload_load_buttons_apptest", test_upload_load_buttons_apptest)
+    check("sih_physics_apptest", test_sih_physics_apptest)
 
     if errors:
         print(f"\n{len(errors)} FAIL")

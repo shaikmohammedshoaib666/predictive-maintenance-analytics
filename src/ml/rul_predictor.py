@@ -11,6 +11,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
 import config
+from src.physics_rules import PHYSICS_COLS
 
 
 class RULPredictor:
@@ -37,7 +38,7 @@ class RULPredictor:
         sensor_cols = [c for c in config.SENSOR_COLUMNS if c in result.columns]
         if not sensor_cols:
             sensor_cols = result.select_dtypes(include="number").columns.tolist()
-            sensor_cols = [c for c in sensor_cols if c != "failure_within_days"]
+            sensor_cols = [c for c in sensor_cols if c != "failure_within_days" and c not in PHYSICS_COLS]
 
         group_col = "machine_id" if "machine_id" in result.columns else None
         window = config.ROLLING_WINDOW
@@ -70,6 +71,7 @@ class RULPredictor:
             "is_anomaly",
             "predicted_rul_days",
             "risk_level",
+            *PHYSICS_COLS,
         }
         feature_cols = [
             c

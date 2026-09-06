@@ -42,6 +42,10 @@ _SKIP_NUMERIC = frozenset(
         "predicted_rul_days",
         _SCORE_COL,
         "is_anomaly",
+        "physics_alert",
+        "physics_fault",
+        "physics_rule",
+        "physics_label",
     }
 )
 _PRODUCTION_HINTS = (

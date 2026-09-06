@@ -698,10 +698,28 @@ PAGE_ML: list[tuple[str, str, str, str]] = [
         "page_ml_predictions() · app.py",
     ),
     (
+        "Physics rules",
+        "Expander + table",
+        "Layer 1, <b>before</b> Isolation Forest. Table: asset → rule fired → human label (Overheating, Low oil, High vibration). Caption: rules = known red-line; Forest = slow degradation. Isolation Forest stays the default ML.",
+        "page_ml_predictions() · app.py → apply_physics_rules() · src/physics_rules.py",
+    ),
+    (
         "Detect anomalies + predict RUL",
         "Button",
         "Primary. Fits Isolation Forest (contamination from config or Optuna), annotates scores, fits Random Forest RUL, writes predictions per machine, attaches RUL columns, rebuilds the industrial brief (insights / ranking / inspect list). Warns if labels were synthetic.",
         "page_ml_predictions() · app.py → AnomalyDetector · src/ml/anomaly_detector.py → RULPredictor · src/ml/rul_predictor.py → build_industrial_brief() · src/insights_engine.py",
+    ),
+    (
+        "MissionAdvisory",
+        "Markdown",
+        "After RUL. Full fleet, not top-3: e.g. UAV-01: Inspect oil · UAV-02: OK · UAV-03: Check cooling. Combines physics fault + Isolation Forest risk + sensor driver.",
+        "page_ml_predictions() · app.py → build_sih_bundle() · src/physics_rules.py",
+    ),
+    (
+        "Mission reliability card",
+        "Markdown",
+        "If {machine_id} flies next mission, {N}% success chance. N = clamp(round(health_index), 0, 100) from pack KPIs. Not FADEC.",
+        "page_ml_predictions() · app.py → mission_success_pct() · src/physics_rules.py",
     ),
     (
         "Optuna tune RUL",
@@ -771,6 +789,12 @@ PAGE_CHARTS: list[tuple[str, str, str, str]] = [
         "Metrics + charts",
         "Aviation tiles include engine health, mission reliability, remaining mission hours, EGT margin (SIH26054). Plant / Auto / Oil have their own KPI ids.",
         "page_explore_graphs() · app.py → compute_pack_kpis() · src/pack_kpis.py → create_asset_health_chart / create_pack_kpi_bars · src/graphs/pack_kpis.py",
+    ),
+    (
+        "Mission reliability card  (Charts KPI strip)",
+        "Markdown",
+        "If {machine_id} flies next mission, {N}% success chance — N from pack health_index clamp 0–100. MissionAdvisory under the KPI strip when predictions exist.",
+        "page_explore_graphs() · app.py → render_mission_reliability_card() · src/physics_rules.py",
     ),
     (
         "Generate Sensor over time",
@@ -870,6 +894,12 @@ PAGE_INSIGHTS: list[tuple[str, str, str, str]] = [
         "Button",
         "Rewords the rule-based brief. Numbers stay from the table. Needs a key; otherwise shows the no-key message.",
         "page_business_insights() · app.py → polish_brief_with_gemini() · src/insights_engine.py",
+    ),
+    (
+        "MissionAdvisory  (Insights)",
+        "Markdown",
+        "Full-fleet line after Refresh brief: UAV-01: Inspect oil · UAV-02: OK · UAV-03: Check cooling. Also a mission success card.",
+        "page_business_insights() · app.py → _refresh_brief() → build_sih_bundle() · src/physics_rules.py",
     ),
     (
         "Asset rank",
@@ -1176,6 +1206,12 @@ PAGE_DASH: list[tuple[str, str, str, str]] = [
         "Metrics",
         "Rendered when the KPI checkbox is on.",
         "page_dashboard_builder() · app.py → compute_pack_kpis() · src/pack_kpis.py",
+    ),
+    (
+        "Mission reliability card + MissionAdvisory",
+        "Markdown",
+        "Always on the Dashboard (SIH26054). If {asset} flies next mission, {N}% success chance, then the full-fleet MissionAdvisory line.",
+        "page_dashboard_builder() · app.py → render_mission_reliability_card / render_mission_advisory · src/physics_rules.py",
     ),
     (
         "Charts  (section)",

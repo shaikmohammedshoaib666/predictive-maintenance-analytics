@@ -8,12 +8,13 @@ from sklearn.ensemble import IsolationForest
 
 import config
 from src.industry_packs import OPTIONAL_IF_SENSORS
+from src.physics_rules import PHYSICS_COLS
 
 _SKIP_SUFFIXES = ("_bin", "_smooth")
 SCORE_COL = "anomaly_score"
 FLAG_COL = "is_anomaly"
 _EXCLUDE_COLS = frozenset(
-    {"failure_within_days", "predicted_rul_days", SCORE_COL, FLAG_COL, "is_anomaly"}
+    {"failure_within_days", "predicted_rul_days", SCORE_COL, FLAG_COL, "is_anomaly", *PHYSICS_COLS}
 )
 
 

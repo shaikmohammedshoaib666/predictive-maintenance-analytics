@@ -48,10 +48,10 @@ Copy `.env.example` → `.env` and set `GEMINI_API_KEY` if you want Gemini on In
 1. **Upload & Clean** — Load sample CSV or upload sensors (CSV/TSV/XLSX/JSON, or a ZIP of those). Run industrial clean + quality checks (pandas or Polars).
 2. **Joins** — Optional: sensor ⋈ maintenance ⋈ cost on `machine_id` (I4.0 integrate). Skip if you only have one CSV.
 3. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label + pack extras.
-4. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
-5. **Charts** — Sensor over time, anomaly flags, risk by asset. Pack KPIs sit above the primary charts.
-6. **Insights** — Inspect-this-week list, slow-running assets, optional $ impact, pack KPI cards. Ask is scoped to this upload.
-7. **Dashboard** — Power BI-style board: KPI strip, charts, insights, 3D twin, CAD slot (APS when secrets exist). Export HTML.
+4. **Anomaly & RUL** — Layer 1 physics red-lines (EGT/CHT/oil/vibration), then Isolation Forest, then Random Forest remaining useful life / risk by asset. **MissionAdvisory** lists every asset.
+5. **Charts** — Sensor over time, anomaly flags, risk by asset. Pack KPIs sit above the primary charts, including a mission success card (`If {asset} flies next mission, {N}% success chance`).
+6. **Insights** — Inspect-this-week list, slow-running assets, optional $ impact, pack KPI cards, **MissionAdvisory**. Ask is scoped to this upload.
+7. **Dashboard** — Power BI-style board: KPI strip, mission reliability card, MissionAdvisory, charts, insights, 3D twin, CAD slot (APS when secrets exist). Export HTML.
 
 3D Twin, CAD Twin (APS), Live Connect, Email, and SQL lab sit beside that numbered path. SQL lab is the power-user workbench, not a shift-manager step.
 
@@ -106,7 +106,9 @@ Regenerate demos: `python generate_sample_data.py` (plant + three pack CSVs). To
 
 ### Anomaly Detection — Isolation Forest
 
-Unsupervised flags on multivariate sensors. No failure labels required.
+Unsupervised flags on multivariate sensors. No failure labels required. **Physics rules run first** (Layer 1): deterministic EGT / CHT / oil-pressure / vibration red-lines. Isolation Forest remains the default ML for slow degradation and is not replaced.
+
+Mission success chance is `clamp(round(health_index), 0, 100)` from pack KPIs — not FADEC.
 
 ### RUL — Random Forest
 

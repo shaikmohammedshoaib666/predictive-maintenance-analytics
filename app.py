@@ -168,6 +168,12 @@ from src.ml.anomaly_detector import AnomalyDetector
 from src.ml.optuna_tuner import tune_anomaly_contamination, tune_rul_model
 from src.ml.rul_predictor import RULPredictor
 from src.pack_kpis import compute_pack_kpis, insight_cards_from_kpis
+from src.physics_rules import (
+    LAYER1_CAPTION,
+    apply_physics_rules,
+    build_sih_bundle,
+    physics_fault_region,
+)
 from src.twin3d import (
     RISK_COLORS,
     asset_states_from_predictions,
@@ -264,6 +270,8 @@ def init_session_state():
         "industry_pack": DEFAULT_PACK_ID,
         "pack_kpis": {},
         "pack_suggest": None,
+        "physics_summary": [],
+        "mission_advisory": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -272,6 +280,65 @@ def init_session_state():
 
 def get_active_df() -> pd.DataFrame | None:
     return st.session_state.get("cleaned_df")
+
+
+def _sih_layer1(
+    df: pd.DataFrame | None,
+    predictions: list | None = None,
+    *,
+    selected_id: str | None = None,
+    include_drivers: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Physics flags + pack KPIs + MissionAdvisory. Isolation Forest is unchanged."""
+    preds = list(predictions if predictions is not None else st.session_state.get("predictions") or [])
+    bundle = compute_pack_kpis(active_pack_id(), df if df is not None else pd.DataFrame(), preds)
+    sih = build_sih_bundle(
+        df,
+        active_pack_id(),
+        preds,
+        bundle.get("by_asset"),
+        selected_id=selected_id,
+        include_drivers=include_drivers,
+    )
+    st.session_state.pack_kpis = bundle
+    st.session_state.physics_summary = sih.get("physics_rows") or []
+    st.session_state.mission_advisory = sih.get("advisory") or ""
+    return bundle, sih
+
+
+def render_physics_rules_panel(sih: dict[str, Any], *, key_prefix: str, expanded: bool = True) -> None:
+    """Anomaly & RUL Layer 1: asset → rule fired → human label."""
+    table = sih.get("physics_table")
+    with st.expander("Physics rules", expanded=expanded):
+        st.caption(LAYER1_CAPTION)
+        if table is None or getattr(table, "empty", True):
+            st.caption("No mapped EGT / CHT / oil pressure / vibration / temperature columns to score.")
+            return
+        st.dataframe(table, use_container_width=True, key=f"{key_prefix}_physics_table")
+
+
+def render_mission_reliability_card(sih: dict[str, Any], *, key_prefix: str) -> None:
+    line = (sih or {}).get("mission_line") or ""
+    extras = (sih or {}).get("advisory_items") or []
+    if not line and not extras:
+        return
+    if line:
+        st.markdown(f"**{line}**")
+        st.caption("Mission success % = clamp(round(health_index), 0, 100) from pack KPIs — not FADEC.")
+    other = [item for item in extras if item.get("mission_line") and item.get("mission_line") != line]
+    if other:
+        with st.expander("Mission success by asset", expanded=False):
+            for item in other:
+                st.caption(item["mission_line"])
+
+
+def render_mission_advisory(sih: dict[str, Any], *, key_prefix: str) -> None:
+    text = (sih or {}).get("advisory") or ""
+    if not text:
+        return
+    st.subheader("MissionAdvisory")
+    st.markdown(f"**{text}**")
+    st.caption("Physics red-line + Isolation Forest risk + sensor driver. Every asset, not top-3.")
 
 
 def get_numeric_columns(df: pd.DataFrame) -> list[str]:
@@ -1131,7 +1198,7 @@ def page_explore_graphs():
         machines = sorted(df["machine_id"].unique()) if "machine_id" in df.columns else []
         machine_filter = st.multiselect("Filter by Machine", machines, default=machines)
 
-    bundle = compute_pack_kpis(active_pack_id(), df, st.session_state.get("predictions") or [])
+    bundle, sih = _sih_layer1(df, st.session_state.get("predictions") or [], include_drivers=False)
     st.session_state.pack_kpis = bundle
     st.subheader(f"{pack['short']} KPIs" + (f" · {pack['sih']}" if pack.get("sih") else ""))
     st.caption(pack["scope"])
@@ -1139,6 +1206,9 @@ def page_explore_graphs():
     for col, kpi in zip(kpi_cols, bundle["kpis"]):
         with col:
             st.metric(kpi["label"], f"{kpi['value']} {kpi['unit']}".strip(), help=kpi["hint"])
+    render_mission_reliability_card(sih, key_prefix="charts_kpi")
+    if sih.get("advisory"):
+        render_mission_advisory(sih, key_prefix="charts_adv")
     if bundle["by_asset"]:
         health_fig = create_asset_health_chart(bundle["by_asset"], title=f"{pack['short']} health by asset")
         st.plotly_chart(health_fig, use_container_width=True, key="pack_health_chart")
@@ -1209,7 +1279,8 @@ def page_explore_graphs():
 def page_ml_predictions():
     st.markdown('<p class="main-header">4. Anomaly & RUL</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Isolation Forest anomalies, then Random Forest remaining useful life / risk.</p>',
+        '<p class="sub-header">Layer 1 physics red-lines, then Isolation Forest anomalies, '
+        "then Random Forest remaining useful life / risk.</p>",
         unsafe_allow_html=True,
     )
     st.caption(config.RUL_HONESTY_CAPTION)
@@ -1225,6 +1296,10 @@ def page_ml_predictions():
     if not status["has_rul_label"]:
         st.warning("No failure label column. RUL will train on a synthetic degradation proxy.")
 
+    # Layer 1 — physics rules BEFORE Isolation Forest (Forest stays default ML).
+    _, sih_pre = _sih_layer1(df, st.session_state.get("predictions") or [], include_drivers=False)
+    render_physics_rules_panel(sih_pre, key_prefix="anomaly_pre", expanded=True)
+
     trials = st.slider("Optuna trials (optional)", 5, 40, 15)
 
     c1, c2, c3 = st.columns(3)
@@ -1236,14 +1311,15 @@ def page_ml_predictions():
         tune_iso = st.button("Optuna tune anomalies", use_container_width=True)
 
     if train:
-        with st.spinner("Training Isolation Forest + Random Forest RUL..."):
+        with st.spinner("Physics rules, then Isolation Forest + Random Forest RUL..."):
             try:
                 cont = config.ANOMALY_CONTAMINATION
                 if st.session_state.optuna_anomaly:
                     cont = st.session_state.optuna_anomaly.get("best_contamination", cont)
+                physics_df = apply_physics_rules(df, active_pack_id())
                 detector = AnomalyDetector(contamination=cont)
-                detector.fit(df)
-                scored = detector.annotate(df)
+                detector.fit(physics_df)
+                scored = detector.annotate(physics_df)
                 st.session_state.anomaly_detector = detector
                 st.session_state.anomaly_summary = detector.summary(scored)
                 predictor = RULPredictor()
@@ -1267,7 +1343,7 @@ def page_ml_predictions():
                 st.session_state.asset_ranking = brief["ranked"]
                 st.session_state.inspect_list = brief["inspect"]
                 st.session_state.insight_index = None
-                st.success("Models trained. Isolation Forest scores and RUL are on the working table.")
+                st.success("Models trained. Physics flags, Isolation Forest scores, and RUL are on the working table.")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -1307,6 +1383,10 @@ def page_ml_predictions():
         st.json(st.session_state.optuna_anomaly)
 
     if st.session_state.predictions:
+        df_after = get_active_df()
+        _, sih_post = _sih_layer1(df_after, st.session_state.predictions, include_drivers=True)
+        render_mission_advisory(sih_post, key_prefix="anomaly_post")
+        render_mission_reliability_card(sih_post, key_prefix="anomaly_post")
         st.subheader("Failure Predictions")
         for p in st.session_state.predictions:
             risk_class = f"risk-{p['risk_level'].lower()}"
@@ -1355,9 +1435,17 @@ def _refresh_brief(df: pd.DataFrame) -> dict:
         hours_if_stop=float(st.session_state.get("hours_if_stop") or 8),
         used_synthetic=bool(st.session_state.get("rul_used_synthetic")),
     )
-    bundle = compute_pack_kpis(active_pack_id(), df, st.session_state.predictions)
-    st.session_state.pack_kpis = bundle
+    bundle, sih = _sih_layer1(df, st.session_state.predictions, include_drivers=True)
     brief["insights"] = list(brief["insights"]) + insight_cards_from_kpis(bundle)
+    if sih.get("advisory"):
+        brief["insights"].append(
+            {
+                "title": "MissionAdvisory",
+                "severity": "high" if "Inspect" in sih["advisory"] or "Check" in sih["advisory"] else "info",
+                "message": sih["advisory"],
+            }
+        )
+    brief["sih"] = sih
     st.session_state.business_insights = brief["insights"]
     st.session_state.asset_ranking = brief["ranked"]
     st.session_state.inspect_list = brief["inspect"]
@@ -1469,6 +1557,9 @@ def page_business_insights():
     refresh = b1.button("Refresh brief", type="primary")
     polish = b2.button("Gemini polish (wording only)")
     brief = _refresh_brief(df)
+    sih_ins = brief.get("sih") or {}
+    render_mission_advisory(sih_ins, key_prefix="insights_adv")
+    render_mission_reliability_card(sih_ins, key_prefix="insights_mission")
     if refresh or st.session_state.insight_index is None:
         idx, meta = make_insight_index(
             df,
@@ -2448,11 +2539,22 @@ def page_cad_twin():
     risk = str(actions["card"]["risk"])
     needles = region_hint_keywords(pack_id, available=list((actions["sensors"] or {}).keys()))
     driver = actions.get("driver") or {}
+    selected_mid = str(actions.get("selected") or "")
+    physics_rows = st.session_state.get("physics_summary") or []
+    if not physics_rows and get_active_df() is not None:
+        physics_rows = build_sih_bundle(
+            get_active_df(), pack_id, st.session_state.get("predictions") or [], include_drivers=False
+        ).get("physics_rows") or []
+    phys_fault = next(
+        (str(r.get("physics_fault") or "") for r in physics_rows if str(r.get("machine_id")) == selected_mid),
+        "",
+    )
+    theme_region = physics_fault_region(phys_fault) or driver.get("region") or ""
     assigned = assigned_theme_plan(
         pack_id,
         urn_state["urn"],
         risk,
-        driver.get("region") or "",
+        theme_region,
         related=driver.get("related") or [],
         include_related=bool(st.session_state.get("cad_region_include_related")),
     )
@@ -2778,11 +2880,21 @@ def page_dashboard_builder():
 
     df = get_active_df()
     preds = list(st.session_state.get("predictions") or [])
-    bundle = compute_pack_kpis(active_pack_id(), df if df is not None else pd.DataFrame(), preds)
-    st.session_state.pack_kpis = bundle
+    bundle, sih = _sih_layer1(df, preds, include_drivers=True)
     insight_cards = list(st.session_state.get("business_insights") or [])
     if not insight_cards:
         insight_cards = insight_cards_from_kpis(bundle)
+        if sih.get("advisory"):
+            insight_cards.append(
+                {
+                    "title": "MissionAdvisory",
+                    "severity": "info",
+                    "message": sih["advisory"],
+                }
+            )
+
+    render_mission_reliability_card(sih, key_prefix="dash_mission")
+    render_mission_advisory(sih, key_prefix="dash_adv")
 
     live_states = st.session_state.get("live_asset_states") or []
     twin_source = preds or live_states
@@ -2873,6 +2985,8 @@ def page_dashboard_builder():
         cad_html=cad_html,
         cad_status=cad_status,
         title=f"{pack['short']} reliability dashboard",
+        mission_line=sih.get("mission_line") or "",
+        advisory=sih.get("advisory") or "",
     )
     st.download_button(
         "Export dashboard (HTML) — KPIs + charts + 3D" + (" + CAD" if cad_status.get("ready") else " (CAD slot placeholder)"),

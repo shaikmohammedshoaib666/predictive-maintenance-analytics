@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from src.industry_packs import DEFAULT_PACK_ID, get_pack
+from src.physics_rules import mission_success_pct
 from src.quality_checks import find_col
 from src.twin3d import normalize_risk
 
@@ -191,6 +192,7 @@ def _asset_rows(
                     "predicted_rul_days": rul,
                     "health_index": health,
                     "remaining_mission_hours": remaining_mission_hours(rul),
+                    "mission_success_pct": mission_success_pct(health),
                 }
             )
     for p in predictions:
@@ -206,6 +208,7 @@ def _asset_rows(
                 "predicted_rul_days": rul,
                 "health_index": health,
                 "remaining_mission_hours": remaining_mission_hours(rul),
+                "mission_success_pct": mission_success_pct(health),
             }
         )
     rows.sort(key=lambda r: (r["health_index"], str(r["predicted_rul_days"] or 99)))

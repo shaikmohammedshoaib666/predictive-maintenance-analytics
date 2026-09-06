@@ -94,6 +94,10 @@ _SKIP_SENSOR_COLS = {
     "label_source",
     "is_proxy",
     "message",
+    "physics_alert",
+    "physics_fault",
+    "physics_rule",
+    "physics_label",
 }
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
