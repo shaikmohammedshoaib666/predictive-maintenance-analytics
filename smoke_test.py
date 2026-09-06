@@ -1684,6 +1684,103 @@ def main() -> int:
         assert len(merged) == 2 and "work_order" in merged.columns
         assert meta["how"] == "left"
 
+    def test_zip_tabular_upload() -> None:
+        """Upload & Clean zip: pick one table, ignore Finder junk, never treat as CAD STEP."""
+        import io
+        import zipfile
+
+        from src.data_integration import (
+            ZIP_NO_TABULAR_MSG,
+            is_ignored_zip_member,
+            is_tabular_zip_name,
+            list_zip_tabular_members,
+            load_tabular_file,
+            load_zip_tabular,
+            pick_zip_tabular_member,
+        )
+
+        def _zip_bytes(members: dict) -> bytes:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                for name, payload in members.items():
+                    zf.writestr(name, payload)
+            return buf.getvalue()
+
+        csv_small = b"machine_id,vibration\nA,1.0\n"
+        csv_big = b"machine_id,vibration\n" + b"B,2.0\n" * 40
+        tsv = b"machine_id\tvibration\nC\t3.0\n"
+
+        assert is_tabular_zip_name("sensors.ZIP")
+        assert is_tabular_zip_name("folder/pack.zip")
+        assert not is_tabular_zip_name("pack.ifczip")
+        assert not is_tabular_zip_name("sensor_readings.csv")
+        assert is_ignored_zip_member("__MACOSX/._sensors.csv")
+        assert is_ignored_zip_member(".DS_Store")
+        assert is_ignored_zip_member("folder/.DS_Store")
+        assert is_ignored_zip_member("._hidden.csv")
+        assert not is_ignored_zip_member("sensors.csv")
+
+        one = _zip_bytes(
+            {
+                "__MACOSX/._sensors.csv": b"junk",
+                ".DS_Store": b"finder",
+                "folder/sensors.csv": csv_small,
+            }
+        )
+        listed = list_zip_tabular_members(one)
+        assert [n for n, _s in listed] == ["folder/sensors.csv"]
+        df, used = load_zip_tabular(one)
+        assert used == "folder/sensors.csv"
+        assert list(df.columns) == ["machine_id", "vibration"]
+        assert len(df) == 1
+        named = io.BytesIO(one)
+        named.name = "plant_sensors.zip"
+        df2 = load_tabular_file(named)
+        assert len(df2) == 1
+
+        multi = _zip_bytes(
+            {
+                "tiny.csv": csv_small,
+                "notes.txt": b"ignore me",
+                "logs/big.csv": csv_big,
+                "sheet.xlsx": b"not-used-when-csv-exists",
+            }
+        )
+        names = [n for n, _s in list_zip_tabular_members(multi)]
+        assert "tiny.csv" in names and "logs/big.csv" in names
+        assert "notes.txt" not in names
+        assert pick_zip_tabular_member(list_zip_tabular_members(multi)) == "logs/big.csv"
+        df_big, used_big = load_zip_tabular(multi)
+        assert used_big == "logs/big.csv"
+        assert len(df_big) == 40
+        df_tiny, used_tiny = load_zip_tabular(multi, member="tiny.csv")
+        assert used_tiny == "tiny.csv"
+        assert len(df_tiny) == 1
+
+        tsv_zip = _zip_bytes({"a.tsv": tsv, "b.csv": csv_small})
+        picked = pick_zip_tabular_member(list_zip_tabular_members(tsv_zip))
+        assert picked in {"a.tsv", "b.csv"}
+
+        empty = _zip_bytes({"readme.txt": b"hello", "__MACOSX/._x": b"x", "model.step": b"ISO-10303-21;"})
+        assert list_zip_tabular_members(empty) == []
+        try:
+            load_zip_tabular(empty)
+            raise AssertionError("STEP-only zip must fail on Upload & Clean")
+        except ValueError as exc:
+            assert "CAD Twin" in str(exc)
+            assert "CSV" in str(exc)
+            assert ZIP_NO_TABULAR_MSG in str(exc)
+
+        app_src = (ROOT / "app.py").read_text(encoding="utf-8")
+        assert 'type=["csv", "tsv", "xlsx", "json", "zip"]' in app_src
+        assert "load_zip_tabular" in app_src
+        assert "upload_zip_member_" in app_src
+        assert "CAD Twin STEP" in app_src
+        assert "aps_cad_file_uploader" in app_src
+        # Sensor zip must not reuse CAD Twin widget keys.
+        assert 'key="aps_cad_file_uploader"' in app_src
+        assert 'key="upload_sensor_files"' in app_src
+
     def _app_ast():
         import ast
 
@@ -2275,10 +2372,57 @@ def main() -> int:
         at4 = AppTest.from_file(app_path, default_timeout=45)
         at4.run()
         uploader = next(u for u in at4.file_uploader if "sensor" in (u.label or "").lower())
+        help_text = str(getattr(uploader, "help", "") or "")
+        assert "zip" in help_text.lower(), help_text
+        assert "300" in help_text, help_text
+        assert "cad twin" in help_text.lower(), help_text
         uploader.set_value([("sensor_readings.csv", csv_bytes, "text/csv")]).run()
         assert not _errs(at4), "CSV upload: " + "; ".join(_errs(at4))
         assert at4.session_state["data_loaded"] is True
         assert at4.session_state["raw_df"] is not None
+
+        import io as _io
+        import zipfile as _zipfile
+
+        zbuf = _io.BytesIO()
+        with _zipfile.ZipFile(zbuf, "w") as zf:
+            zf.writestr("__MACOSX/._sensor_readings.csv", b"junk")
+            zf.writestr(".DS_Store", b"finder")
+            zf.writestr("nested/sensor_readings.csv", csv_bytes)
+        zip_one = zbuf.getvalue()
+        at5 = AppTest.from_file(app_path, default_timeout=45)
+        at5.run()
+        up5 = next(u for u in at5.file_uploader if "sensor" in (u.label or "").lower())
+        up5.set_value([("plant_sensors.zip", zip_one, "application/zip")]).run()
+        assert not _errs(at5), "ZIP upload: " + "; ".join(_errs(at5))
+        assert at5.session_state["data_loaded"] is True
+        assert at5.session_state["raw_df"] is not None
+        assert len(at5.session_state["raw_df"]) > 10
+        caps5 = " ".join(str(getattr(c, "value", "") or "") for c in at5.caption)
+        assert "sensor_readings.csv" in caps5, caps5
+        assert "CAD Twin" in caps5, caps5
+
+        zbuf2 = _io.BytesIO()
+        with _zipfile.ZipFile(zbuf2, "w") as zf:
+            zf.writestr("tiny.csv", b"machine_id,vibration\nA,1.0\n")
+            zf.writestr("nested/sensor_readings.csv", csv_bytes)
+        zip_multi = zbuf2.getvalue()
+        at6 = AppTest.from_file(app_path, default_timeout=45)
+        at6.run()
+        up6 = next(u for u in at6.file_uploader if "sensor" in (u.label or "").lower())
+        up6.set_value([("multi_tables.zip", zip_multi, "application/zip")]).run()
+        assert not _errs(at6), "multi-member ZIP: " + "; ".join(_errs(at6))
+        assert at6.session_state["data_loaded"] is True
+        assert len(at6.session_state["raw_df"]) > 10
+        caps6 = " ".join(str(getattr(c, "value", "") or "") for c in at6.caption)
+        assert "sensor_readings.csv" in caps6, caps6
+        assert "2 tables" in caps6, caps6
+        zip_boxes = [
+            s
+            for s in at6.selectbox
+            if "inside" in (s.label or "").lower() or "zip" in (s.label or "").lower()
+        ]
+        assert zip_boxes, [s.label for s in at6.selectbox]
 
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
@@ -2307,6 +2451,7 @@ def main() -> int:
     check("email_honesty", test_email_honesty)
     check("dashboard_composer", test_dashboard_composer)
     check("joins_step", test_joins_step)
+    check("zip_tabular_upload", test_zip_tabular_upload)
     check("streamlit_widget_keys_unique", test_streamlit_widget_keys_unique)
     check("no_widget_key_writes_after_instantiate", test_no_widget_key_writes_after_instantiate)
     check("load_pack_sample_queues_pending", test_load_pack_sample_queues_pending)

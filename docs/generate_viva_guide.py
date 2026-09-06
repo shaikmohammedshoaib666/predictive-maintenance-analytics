@@ -367,7 +367,7 @@ PAGE_UPLOAD: list[tuple[str, str, str, str]] = [
     (
         "Upload sensor / ops CSVs (multi-select OK)",
         "File uploader",
-        "Accepts csv / tsv / xlsx / json. Key <font face='DejaVuMono'>upload_sensor_files</font>. Each file → <font face='DejaVuMono'>load_tabular_file()</font> → <font face='DejaVuMono'>register_table(stem)</font> → <font face='DejaVuMono'>raw_df</font>.",
+        "Accepts csv / tsv / xlsx / json / zip (sensor tables, not CAD Twin STEP). Key <font face='DejaVuMono'>upload_sensor_files</font>. Each file → <font face='DejaVuMono'>load_tabular_file()</font> / <font face='DejaVuMono'>load_zip_tabular()</font> → <font face='DejaVuMono'>register_table(stem)</font> → <font face='DejaVuMono'>raw_df</font>.",
         "page_upload_clean() · app.py → load_tabular_file() · src/data_integration.py",
     ),
     (

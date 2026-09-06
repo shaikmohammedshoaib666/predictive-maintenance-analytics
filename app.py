@@ -39,7 +39,17 @@ from src.dashboard_composer import (
 )
 from src.data_cleaner import clean_and_quality
 from src.data_insights import analyze_columns, format_insights_markdown
-from src.data_integration import JOIN_TYPES, join_many, join_two, load_tabular_file, suggest_join_keys
+from src.data_integration import (
+    JOIN_TYPES,
+    is_tabular_zip_name,
+    join_many,
+    join_two,
+    list_zip_tabular_members,
+    load_tabular_file,
+    load_zip_tabular,
+    pick_zip_tabular_member,
+    suggest_join_keys,
+)
 from src.dwdm_sql import DWDM_CONCEPTS, apply_dwdm_transforms, default_sql_examples, run_sql
 from src.email_report import generate_email_body, send_email
 from src.live_connect import (
@@ -721,9 +731,14 @@ def page_upload_clean():
         with col1:
             uploaded_files = st.file_uploader(
                 "Upload sensor / ops CSVs (multi-select OK)",
-                type=["csv", "tsv", "xlsx", "json"],
+                type=["csv", "tsv", "xlsx", "json", "zip"],
                 accept_multiple_files=True,
                 key="upload_sensor_files",
+                help=(
+                    "CSV, TSV, XLSX, JSON, or a ZIP that contains one of those tables. "
+                    f"Up to {MAX_CAD_UPLOAD_MB} MB (Streamlit maxUploadSize; default was 200 MB). "
+                    "A ZIP here is sensor/ops data — not the CAD Twin STEP zip on the CAD Twin page."
+                ),
             )
         with col2:
             if st.button("Load Plant sample (default)", use_container_width=True, key="upload_load_plant_sample"):
@@ -742,16 +757,46 @@ def page_upload_clean():
                 st.rerun()
 
         if uploaded_files:
-            for uf in uploaded_files:
+            for i, uf in enumerate(uploaded_files):
+                name = getattr(uf, "name", "") or "upload"
                 try:
-                    df = load_tabular_file(uf)
-                    stem = Path(uf.name).stem.replace(" ", "_")
+                    used_member = None
+                    member_count = 0
+                    if is_tabular_zip_name(name):
+                        payload = uf.getvalue()
+                        members = list_zip_tabular_members(payload)
+                        member_count = len(members)
+                        default = pick_zip_tabular_member(members)
+                        chosen = default
+                        if member_count > 1:
+                            labels = [m[0] for m in members]
+                            stem_key = "".join(
+                                ch if ch.isalnum() else "_" for ch in Path(name).stem
+                            )[:40]
+                            chosen = st.selectbox(
+                                f"Table inside `{name}`",
+                                labels,
+                                index=labels.index(default) if default in labels else 0,
+                                key=f"upload_zip_member_{i}_{stem_key}",
+                                help="Several tables in this zip. Default is the largest CSV/TSV.",
+                            )
+                        df, used_member = load_zip_tabular(payload, chosen)
+                        stem = Path(used_member).stem.replace(" ", "_")
+                    else:
+                        df = load_tabular_file(uf)
+                        stem = Path(name).stem.replace(" ", "_")
                     register_table(stem, df)
                     st.session_state.raw_df = df
                     st.session_state.data_loaded = True
-                    st.success(f"Loaded `{uf.name}` → table `{stem}` ({len(df):,} rows)")
+                    st.success(f"Loaded `{name}` → table `{stem}` ({len(df):,} rows)")
+                    if used_member:
+                        extra = f" · {member_count} tables in zip" if member_count > 1 else ""
+                        st.caption(
+                            f"Used zip member `{used_member}`{extra}. "
+                            "Sensor/ops table — not CAD Twin STEP."
+                        )
                 except Exception as exc:
-                    st.error(f"Failed {uf.name}: {exc}")
+                    st.error(f"Failed {name}: {exc}")
 
     with tab_url:
         _ingest_from_url_tab()

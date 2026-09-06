@@ -45,7 +45,7 @@ Copy `.env.example` → `.env` and set `GEMINI_API_KEY` if you want Gemini on In
 
 ## Sample workflow
 
-1. **Upload & Clean** — Load sample CSV or upload sensors. Run industrial clean + quality checks (pandas or Polars).
+1. **Upload & Clean** — Load sample CSV or upload sensors (CSV/TSV/XLSX/JSON, or a ZIP of those). Run industrial clean + quality checks (pandas or Polars).
 2. **Joins** — Optional: sensor ⋈ maintenance ⋈ cost on `machine_id` (I4.0 integrate). Skip if you only have one CSV.
 3. **Map sensors** — Point messy headers at timestamp, `machine_id`, temperature / vibration / pressure / RPM, optional RUL label + pack extras.
 4. **Anomaly & RUL** — Isolation Forest, then Random Forest remaining useful life / risk by asset.
