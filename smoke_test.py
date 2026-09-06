@@ -1588,6 +1588,15 @@ def main() -> int:
         assert "Monitor / inspect" in advisory_action(
             risk_level="Medium", physics_fault=FAULT_NONE, region_phrase="oil"
         )
+        assert advisory_action(risk_level="Medium", physics_fault=FAULT_NONE) == "Monitor"
+        assert (
+            advisory_action(
+                risk_level="Medium",
+                physics_fault=FAULT_NONE,
+                region_phrase="other / unmapped region",
+            )
+            == "Monitor"
+        )
         assert advisory_action(risk_level="Low", physics_fault=FAULT_NONE) == "OK"
         assert advisory_action(risk_level="Low", physics_fault=FAULT_LOW_OIL) == "Inspect oil"
         assert advisory_action(risk_level="High", physics_fault=FAULT_HIGH_VIB) == "Inspect rotating assembly"

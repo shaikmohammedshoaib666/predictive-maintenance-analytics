@@ -404,7 +404,9 @@ def advisory_action(
             "heads_exhaust": "cooling",
             "rotating_crank": "rotating assembly",
             "intake": "intake",
-        }.get(region, region.replace("_", " ").strip() or "region")
+        }.get(region, region.replace("_", " ").strip())
+    if phrase.lower() in ("", "region", "other", "other / unmapped region"):
+        phrase = ""
 
     oil = _oilish(fault, sensor, region)
     cool = _coolish(fault, sensor, region)
@@ -419,10 +421,10 @@ def advisory_action(
         if vib:
             return "Inspect rotating assembly"
         if risk == "High":
-            return f"Inspect {phrase}" if phrase and phrase != "region" else "Inspect"
+            return f"Inspect {phrase}" if phrase else "Inspect"
 
     if risk == "Medium":
-        return f"Monitor / inspect {phrase}"
+        return f"Monitor / inspect {phrase}" if phrase else "Monitor"
 
     return "OK"
 
