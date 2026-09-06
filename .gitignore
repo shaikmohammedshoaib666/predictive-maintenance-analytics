@@ -18,3 +18,4 @@ data/*
 .cursor/
 .streamlit/secrets.toml
 docs/*.pdf
+!docs/PdM_SIH26054_Student_Viva_Guide.pdf
