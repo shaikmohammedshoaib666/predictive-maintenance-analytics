@@ -2702,7 +2702,16 @@ def main() -> int:
         assert "flies next mission" in dash, dash[:1200]
         assert "UAV-01:" in dash and "UAV-03:" in dash
         assert "Fleet health" in dash, dash[:1200]
-        assert "go/no-go" in dash.lower() or "NO-GO" in dash or "GO" in dash
+        fleet_tables = [
+            el.value
+            for el in at.dataframe
+            if getattr(el, "value", None) is not None
+            and hasattr(el.value, "columns")
+            and "go/no-go" in [str(c) for c in el.value.columns]
+        ]
+        assert fleet_tables, "Aviation Dashboard fleet strip missing go/no-go column"
+        decisions = {str(v) for v in fleet_tables[0]["go/no-go"].tolist()}
+        assert decisions <= {"GO", "NO-GO", "CAUTION"} and decisions
 
         radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
         radio.set_value("6. Insights").run()
