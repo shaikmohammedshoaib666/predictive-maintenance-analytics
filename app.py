@@ -148,9 +148,28 @@ from src.cad_regions import (
     assign_region,
     assigned_theme_plan,
     assignment_summary,
+    cad_map_localstorage_html,
     clear_region_map,
+    dumps_region_map,
+    import_region_map,
+    load_region_map,
+    map_persist_status,
     region_label,
+    seed_region_map_from_env,
 )
+from src.assets import assets_export_json, assets_table, build_asset_rows, go_nogo
+from src.health_events import (
+    build_health_events,
+    dumps_health_events,
+    health_events_document,
+)
+from src.ops_meta import (
+    data_source_label,
+    mqtt_broker_caption,
+    mqtt_defaults,
+    revision_caption,
+)
+from src.session_persist import restore_industry_pack, save_last_session
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
     AUTOMOTIVE_OEM_TRIM_EV_NOTE,
@@ -272,10 +291,17 @@ def init_session_state():
         "pack_suggest": None,
         "physics_summary": [],
         "mission_advisory": "",
+        "data_source": "",
+        "cad_region_map_cache": None,
+        "sih_path_banner": False,
     }
+    restored = restore_industry_pack()
+    if restored and "industry_pack" not in st.session_state:
+        defaults["industry_pack"] = restored
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
+    seed_region_map_from_env()
 
 
 def get_active_df() -> pd.DataFrame | None:
@@ -339,6 +365,186 @@ def render_mission_advisory(sih: dict[str, Any], *, key_prefix: str) -> None:
     st.subheader("MissionAdvisory")
     st.markdown(f"**{text}**")
     st.caption("Physics red-line + Isolation Forest risk + sensor driver. Every asset, not top-3.")
+
+
+def render_fleet_strip(
+    sih: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    key_prefix: str,
+    lead: bool = False,
+) -> None:
+    """Aviation fleet home: all tails, mission %, MissionAdvisory, go/no-go."""
+    if active_pack_id() != "aviation_uav_piston":
+        return
+    items = list((sih or {}).get("advisory_items") or [])
+    assets = list((bundle or {}).get("by_asset") or [])
+    if not items and not assets:
+        return
+    if lead:
+        st.subheader("Fleet health")
+        st.caption("SIH26054 ground health — every tail, not top-3. Isolation Forest stays default ML.")
+    health_map = {str(a.get("machine_id")): a for a in assets}
+    rows = []
+    for item in items:
+        mid = str(item.get("machine_id") or "")
+        health = health_map.get(mid) or {}
+        action = item.get("action") or "OK"
+        hi = item.get("health_index")
+        if hi is None:
+            hi = health.get("health_index")
+        mission = item.get("mission_success_pct")
+        if mission is None:
+            mission = health.get("mission_success_pct")
+        rows.append(
+            {
+                "tail": mid,
+                "mission %": mission,
+                "advisory": action,
+                "go/no-go": go_nogo(action, item.get("risk_level") or health.get("risk_level")),
+                "risk": item.get("risk_level") or health.get("risk_level") or "",
+                "health": hi,
+            }
+        )
+    if not rows:
+        for a in assets:
+            action = "OK"
+            rows.append(
+                {
+                    "tail": a.get("machine_id"),
+                    "mission %": a.get("mission_success_pct"),
+                    "advisory": action,
+                    "go/no-go": go_nogo(action, a.get("risk_level")),
+                    "risk": a.get("risk_level"),
+                    "health": a.get("health_index"),
+                }
+            )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, key=f"{key_prefix}_fleet_strip")
+    if (sih or {}).get("advisory"):
+        st.markdown(f"**MissionAdvisory** — {sih['advisory']}")
+    if (sih or {}).get("mission_line"):
+        st.caption(sih["mission_line"])
+
+
+def render_asset_work_orders(
+    df: pd.DataFrame | None,
+    sih: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    key_prefix: str,
+) -> list[dict[str, Any]]:
+    """Thin assets + work-order stubs on Dashboard (not a CMMS)."""
+    rows = build_asset_rows(
+        df,
+        pack_id=active_pack_id(),
+        predictions=list(st.session_state.get("predictions") or []),
+        by_asset=(bundle or {}).get("by_asset"),
+        advisory_items=(sih or {}).get("advisory_items"),
+        physics_rows=(sih or {}).get("physics_rows") or st.session_state.get("physics_summary"),
+    )
+    st.subheader("Assets + work-order stubs")
+    st.caption("Derived from machine_id. Open stub only — not a full CMMS.")
+    table = assets_table(rows)
+    if table.empty:
+        st.caption("No assets yet — load a CSV and run Anomaly & RUL.")
+        return rows
+    st.dataframe(table, use_container_width=True, key=f"{key_prefix}_assets_wo")
+    st.download_button(
+        "Export assets (JSON)",
+        assets_export_json(rows),
+        file_name=f"pdm_assets_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json",
+        key=f"{key_prefix}_assets_json",
+    )
+    return rows
+
+
+def render_health_event_export(
+    df: pd.DataFrame | None,
+    sih: dict[str, Any],
+    bundle: dict[str, Any],
+    *,
+    key_prefix: str,
+) -> None:
+    """Digital-thread JSON after physics + Detect. Export-only (no extra Render service)."""
+    events = build_health_events(
+        df,
+        pack_id=active_pack_id(),
+        predictions=list(st.session_state.get("predictions") or []),
+        physics_rows=(sih or {}).get("physics_rows") or st.session_state.get("physics_summary"),
+        advisory_items=(sih or {}).get("advisory_items"),
+        drivers=(sih or {}).get("drivers"),
+        by_asset=(bundle or {}).get("by_asset"),
+    )
+    if not events:
+        return
+    doc = health_events_document(events, pack_id=active_pack_id())
+    st.subheader("Health-event digital thread")
+    st.caption("Asset + sensors + physics + Isolation Forest / RUL + advisory + twin region. Export-only.")
+    with st.expander("Sample health-event JSON", expanded=False):
+        st.json(events[0])
+    st.download_button(
+        "Download health events (JSON)",
+        dumps_health_events(doc),
+        file_name=f"pdm_health_events_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json",
+        key=f"{key_prefix}_health_events_json",
+    )
+
+
+def render_ops_honesty() -> None:
+    cfg = dict(st.session_state.get("live_cfg") or {})
+    label = data_source_label(
+        data_source=str(st.session_state.get("data_source") or ""),
+        live_running=bool(st.session_state.get("live_running")),
+        live_source=str(st.session_state.get("live_source") or ""),
+        broker_host=str(cfg.get("host") or ""),
+    )
+    st.sidebar.caption(revision_caption(data_label=label))
+
+
+def render_cad_map_persist(pack_id: str, urn: str) -> None:
+    """Export / import CAD region map. Disk + session + optional CAD_MAP_JSON secret."""
+    doc = load_region_map()
+    st.session_state.cad_region_map_cache = doc
+    session_has = bool((doc.get("models") or {}) or st.session_state.get("cad_region_assign_log"))
+    status = map_persist_status(session_has=session_has)
+    st.caption(status["line"])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Export CAD region map (JSON)",
+            dumps_region_map(doc=doc),
+            file_name="cad_region_map.json",
+            mime="application/json",
+            key="cad_map_export_btn",
+            help="Download the pack+URN dbId map. Survives Render redeploys only if you keep this file (or CAD_MAP_JSON).",
+        )
+    with c2:
+        uploaded = st.file_uploader(
+            "Import CAD region map JSON",
+            type=["json"],
+            key="cad_map_import_file",
+            help="Merges into the saved map. Other models are kept. Does not wipe on pack switch.",
+        )
+    if uploaded is not None:
+        raw = uploaded.getvalue()
+        sig = (getattr(uploaded, "name", ""), len(raw or b""))
+        if st.session_state.get("_cad_map_import_sig") != sig:
+            st.session_state["_cad_map_import_sig"] = sig
+            result = import_region_map(raw, merge=True, write=True)
+            st.session_state.cad_region_map_cache = result.get("doc") or doc
+            if result.get("saved"):
+                st.success(result.get("message") or "Imported CAD region map.")
+            else:
+                st.warning(result.get("message") or "Imported into session; disk write failed.")
+                if result.get("error"):
+                    st.caption(result["error"])
+            st.rerun()
+    try:
+        components.html(cad_map_localstorage_html(doc), height=28)
+    except Exception:
+        pass
 
 
 def get_numeric_columns(df: pd.DataFrame) -> list[str]:
@@ -479,6 +685,7 @@ def render_pack_sidebar() -> None:
         help="One file → one pack. Plant is default. 3D mesh, KPIs, and extra sensor map follow the pack.",
     )
     pack = get_pack(picked)
+    save_last_session(picked)
     st.sidebar.caption(pack["label"] + (f" · {pack['sih']}" if pack.get("sih") else ""))
     df = get_active_df() if "cleaned_df" in st.session_state else None
     if df is None:
@@ -512,6 +719,8 @@ def load_pack_sample(pack_id: str):
     df = pd.read_csv(path, parse_dates=["timestamp"])
     st.session_state.raw_df = df
     st.session_state.data_loaded = True
+    st.session_state.data_source = "sample"
+    st.session_state.sih_path_banner = pack_id == "aviation_uav_piston"
     request_industry_pack(pack_id)
     st.session_state.cleaned_df = None
     st.session_state.predictions = []
@@ -791,6 +1000,10 @@ def page_upload_clean():
         f"Industrial ETL + {QUALITY_STAGE_COUNT}-stage quality checks on sensor CSVs. "
         "Load from file, cloud URL, or Kaggle. Next: map columns, then anomaly / RUL."
     )
+    if st.session_state.get("sih_path_banner") and active_pack_id() == "aviation_uav_piston":
+        st.info(
+            "SIH26054 path: clean → map → 4. Anomaly physics table → Detect → Dashboard fleet"
+        )
 
     tab_file, tab_url = st.tabs(["File upload", "From URL (cloud / DuckDB)"])
     with tab_file:
@@ -855,6 +1068,7 @@ def page_upload_clean():
                     register_table(stem, df)
                     st.session_state.raw_df = df
                     st.session_state.data_loaded = True
+                    st.session_state.data_source = "upload"
                     st.success(f"Loaded `{name}` → table `{stem}` ({len(df):,} rows)")
                     if used_member:
                         extra = f" · {member_count} tables in zip" if member_count > 1 else ""
@@ -1384,14 +1598,18 @@ def page_ml_predictions():
 
     if st.session_state.predictions:
         df_after = get_active_df()
-        _, sih_post = _sih_layer1(df_after, st.session_state.predictions, include_drivers=True)
+        bundle_post, sih_post = _sih_layer1(df_after, st.session_state.predictions, include_drivers=True)
+        render_fleet_strip(sih_post, bundle_post, key_prefix="anomaly_fleet", lead=True)
         render_mission_advisory(sih_post, key_prefix="anomaly_post")
         render_mission_reliability_card(sih_post, key_prefix="anomaly_post")
+        render_health_event_export(df_after, sih_post, bundle_post, key_prefix="anomaly")
         st.subheader("Failure Predictions")
-        for p in st.session_state.predictions:
-            risk_class = f"risk-{p['risk_level'].lower()}"
+        for p in st.session_state.get("predictions") or []:
+            risk = str(p.get("risk_level") or "Unknown")
+            risk_class = f"risk-{risk.lower()}"
+            message = p.get("message") or f"{p.get('machine_id') or 'asset'} — Risk: {risk}"
             st.markdown(
-                f"<p class='{risk_class}'>{p['message']} — Risk: {p['risk_level']}</p>",
+                f"<p class='{risk_class}'>{message} — Risk: {risk}</p>",
                 unsafe_allow_html=True,
             )
         if st.session_state.rul_predictor and st.session_state.rul_predictor.metrics:
@@ -1558,6 +1776,8 @@ def page_business_insights():
     polish = b2.button("Gemini polish (wording only)")
     brief = _refresh_brief(df)
     sih_ins = brief.get("sih") or {}
+    bundle_ins = st.session_state.get("pack_kpis") or {}
+    render_fleet_strip(sih_ins, bundle_ins, key_prefix="insights_fleet", lead=True)
     render_mission_advisory(sih_ins, key_prefix="insights_adv")
     render_mission_reliability_card(sih_ins, key_prefix="insights_mission")
     if refresh or st.session_state.insight_index is None:
@@ -1975,6 +2195,7 @@ def render_cad_region_assign(
         st.caption(f"Saved for this model: {summary['text']} ({summary['total']} part(s)).")
     else:
         st.caption(NO_ASSIGNMENT_MSG)
+    render_cad_map_persist(pack_id, urn)
 
 
 def render_cad_region_note(
@@ -2672,7 +2893,10 @@ def _live_body():
         st.info("Press **Start live** to begin streaming sensor data.")
         return
 
-    status = compute_live_status(buffer)
+    status = compute_live_status(
+        buffer,
+        stale_after_s=int((st.session_state.get("live_cfg") or {}).get("stale_after_s") or 30),
+    )
     st.session_state.live_asset_states = status
 
     worst = status[0] if status else None
@@ -2760,20 +2984,41 @@ def page_live_connect():
         cfg["poll_n"] = st.slider("Rows per poll", 5, 200, int(cfg.get("poll_n", 30)))
         cfg.setdefault("offset", 0)
     elif code == "mqtt":
+        defaults = mqtt_defaults()
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
-            cfg["host"] = st.text_input("Broker host", value=cfg.get("host", "127.0.0.1"))
+            cfg["host"] = st.text_input(
+                "Broker host",
+                value=cfg.get("host") or defaults["host"],
+                help="MQTT_BROKER env/secret, else 127.0.0.1 (this box — on Render that is the Render VM).",
+            )
         with c2:
-            cfg["port"] = int(st.number_input("Port", 1, 65535, int(cfg.get("port", 1883))))
+            cfg["port"] = int(
+                st.number_input("Port", 1, 65535, int(cfg.get("port") or defaults["port"]))
+            )
         with c3:
-            cfg["topic"] = st.text_input("Topic (wildcards OK)", value=cfg.get("topic", "pdm/sensors/#"))
-        c4, c5 = st.columns(2)
+            cfg["topic"] = st.text_input(
+                "Topic (wildcards OK)",
+                value=cfg.get("topic") or defaults["topic"],
+            )
+        c4, c5, c6 = st.columns(3)
         with c4:
             cfg["username"] = st.text_input("Username (optional)", value=cfg.get("username", ""))
         with c5:
             cfg["password"] = st.text_input(
                 "Password (optional)", value=cfg.get("password", ""), type="password"
             )
+        with c6:
+            cfg["stale_after_s"] = int(
+                st.number_input(
+                    "Stale after (seconds)",
+                    min_value=1,
+                    max_value=3600,
+                    value=int(cfg.get("stale_after_s") or defaults["stale_after_s"]),
+                    help="No message for N seconds → stale. MQTT_STALE_SECONDS / LIVE_STALE_SECONDS.",
+                )
+            )
+        st.caption(mqtt_broker_caption(cfg.get("host"), cfg.get("port"), cfg.get("topic") or defaults["topic"]))
         st.caption(
             'Expects JSON payloads like `{"machine_id":"M-001","temperature":72,"vibration":2.1,'
             '"pressure":100,"rpm":1500}`.'
@@ -2893,8 +3138,11 @@ def page_dashboard_builder():
                 }
             )
 
+    render_fleet_strip(sih, bundle, key_prefix="dash_fleet", lead=True)
     render_mission_reliability_card(sih, key_prefix="dash_mission")
     render_mission_advisory(sih, key_prefix="dash_adv")
+    asset_rows = render_asset_work_orders(df, sih, bundle, key_prefix="dash")
+    render_health_event_export(df, sih, bundle, key_prefix="dash")
 
     live_states = st.session_state.get("live_asset_states") or []
     twin_source = preds or live_states
@@ -2987,6 +3235,8 @@ def page_dashboard_builder():
         title=f"{pack['short']} reliability dashboard",
         mission_line=sih.get("mission_line") or "",
         advisory=sih.get("advisory") or "",
+        asset_rows=asset_rows,
+        fleet_items=sih.get("advisory_items") or [],
     )
     st.download_button(
         "Export dashboard (HTML) — KPIs + charts + 3D" + (" + CAD" if cad_status.get("ready") else " (CAD slot placeholder)"),
@@ -3108,6 +3358,7 @@ def main():
         st.sidebar.info(f"{len(st.session_state.predictions)} prediction(s)")
     if get_graph_folder():
         st.sidebar.info(f"{len(get_graph_folder())} graph(s) saved")
+    render_ops_honesty()
 
     pages[selection]()
 

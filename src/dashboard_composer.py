@@ -20,6 +20,7 @@ from src.aps_viewer import (
     resolve_cad_urn,
 )
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
+from src.assets import go_nogo
 from src.industry_packs import get_pack
 from src.twin3d import RISK_COLORS, build_twin_html, normalize_risk
 
@@ -158,6 +159,8 @@ def compose_dashboard_html(
     title: str = "Reliability dashboard",
     mission_line: str = "",
     advisory: str = "",
+    asset_rows: Optional[list[dict[str, Any]]] = None,
+    fleet_items: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Standalone HTML export (charts via Plotly CDN; 3D twin is inlined / offline)."""
     enabled = [t for t in (tiles or list(DEFAULT_TILES)) if t in DEFAULT_TILES]
@@ -175,6 +178,8 @@ def compose_dashboard_html(
         f"<p>{html.escape(pack['label'])} · generated {html.escape(datetime.now().strftime('%Y-%m-%d %H:%M'))}</p>",
         f"<p style='opacity:.75'>{html.escape(pack['scope'])}</p>",
     ]
+    if pack_id == "aviation_uav_piston" and (fleet_items or bundle.get("by_asset")):
+        parts.append(f"<div class='tile'>{_fleet_html(fleet_items or [], bundle)}</div>")
     if "kpis" in enabled:
         parts.append(
             f"<div class='tile'>{_kpi_strip_html(bundle, mission_line=mission_line, advisory=advisory)}</div>"
@@ -200,8 +205,53 @@ def compose_dashboard_html(
         else:
             parts.append(cad_placeholder_html(status=status, height=280))
         parts.append("</div>")
+    if asset_rows:
+        parts.append(f"<div class='tile'>{_assets_html(asset_rows)}</div>")
     parts.append("</div></body></html>")
     return "\n".join(parts)
+
+
+def _fleet_html(items: list[dict[str, Any]], bundle: dict[str, Any]) -> str:
+    health_map = {str(a.get("machine_id")): a for a in (bundle.get("by_asset") or [])}
+    rows = []
+    for item in items or []:
+        mid = str(item.get("machine_id") or "")
+        health = health_map.get(mid) or {}
+        action = item.get("action") or "OK"
+        mission = item.get("mission_success_pct")
+        if mission is None:
+            mission = health.get("mission_success_pct")
+        decision = go_nogo(action, item.get("risk_level") or health.get("risk_level"))
+        rows.append(
+            f"<tr><td>{html.escape(mid)}</td><td>{html.escape(str(mission if mission is not None else ''))}</td>"
+            f"<td>{html.escape(str(action))}</td><td><b>{html.escape(decision)}</b></td></tr>"
+        )
+    body = "".join(rows) or "<tr><td colspan='4'>No tails scored yet.</td></tr>"
+    return (
+        "<h2>Fleet health</h2>"
+        "<p>SIH26054 — every tail, mission %, MissionAdvisory, go/no-go (ground health, not FADEC).</p>"
+        "<table style='width:100%;border-collapse:collapse'>"
+        "<thead><tr><th align='left'>Tail</th><th align='left'>Mission %</th>"
+        "<th align='left'>Advisory</th><th align='left'>Go/no-go</th></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
+    )
+
+
+def _assets_html(rows: list[dict[str, Any]]) -> str:
+    bits = ["<h2>Assets + work-order stubs</h2>", "<p>Not a CMMS — open stubs from MissionAdvisory.</p><ul>"]
+    for row in rows:
+        wo = row.get("work_order") or {}
+        wo_id = (wo.get("id") if wo else "") or row.get("work_order_id") or ""
+        bits.append(
+            "<li>"
+            f"<b>{html.escape(str(row.get('machine_id')))}</b> · {html.escape(str(row.get('pack') or ''))} · "
+            f"risk {html.escape(str(row.get('risk_level')))} · mission {html.escape(str(row.get('mission_success_pct') or ''))}% · "
+            f"{html.escape(str(row.get('go_nogo') or ''))}"
+            + (f" · <code>{html.escape(str(wo_id))}</code> {html.escape(str((wo or {}).get('title') or row.get('advisory') or ''))} / open" if wo_id else "")
+            + "</li>"
+        )
+    bits.append("</ul>")
+    return "".join(bits)
 
 
 def board_twin_html(
