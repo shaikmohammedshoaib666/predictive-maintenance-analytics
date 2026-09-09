@@ -170,6 +170,12 @@ from src.ops_meta import (
     revision_caption,
 )
 from src.session_persist import restore_industry_pack, save_last_session
+from src.pipeline_flow import (
+    NUMBERED_LABELS,
+    can_detect_anomalies,
+    pipeline_circles_html,
+    pipeline_snapshot,
+)
 from src.graphs.pack_kpis import create_asset_health_chart, create_pack_kpi_bars
 from src.industry_packs import (
     AUTOMOTIVE_OEM_TRIM_EV_NOTE,
@@ -1193,6 +1199,11 @@ def page_map_sensors():
     c2.metric("Timestamp", "yes" if status["has_timestamp"] else "no")
     c3.metric("Asset id", "yes" if status["has_machine"] else "no")
     c4.metric("RUL label", "yes" if status["has_rul_label"] else "no")
+    if int(status["sensor_count"] or 0) == 0:
+        st.info(
+            "Detect stays locked until at least one of temperature / vibration / pressure / RPM is mapped. "
+            "Joins stay optional. Isolation Forest remains the default ML."
+        )
     if not status["has_rul_label"]:
         st.warning("No `failure_within_days` column — RUL will use a degradation proxy until you map a label.")
 
@@ -1505,8 +1516,9 @@ def page_ml_predictions():
         return
 
     status = mapping_status(df)
+    can_detect = can_detect_anomalies(df)
     if status["sensor_count"] == 0:
-        st.warning("No canonical sensor columns yet — open **Map sensors** or use sample data.")
+        st.warning("No canonical sensor columns yet — open **Map sensors** or use sample data. Detect stays locked.")
     if not status["has_rul_label"]:
         st.warning("No failure label column. RUL will train on a synthetic degradation proxy.")
 
@@ -1518,13 +1530,31 @@ def page_ml_predictions():
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        train = st.button("Detect anomalies + predict RUL", type="primary", use_container_width=True)
+        train = st.button(
+            "Detect anomalies + predict RUL",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_detect,
+            help=(
+                "Physics Layer 1, then Isolation Forest + RUL."
+                if can_detect
+                else "Map timestamp / asset / sensors first. Detect cannot run on an unmapped table."
+            ),
+        )
     with c2:
-        tune_rul = st.button("Optuna tune RUL", use_container_width=True)
+        tune_rul = st.button(
+            "Optuna tune RUL",
+            use_container_width=True,
+            disabled=not can_detect,
+        )
     with c3:
-        tune_iso = st.button("Optuna tune anomalies", use_container_width=True)
+        tune_iso = st.button(
+            "Optuna tune anomalies",
+            use_container_width=True,
+            disabled=not can_detect,
+        )
 
-    if train:
+    if train and can_detect:
         with st.spinner("Physics rules, then Isolation Forest + Random Forest RUL..."):
             try:
                 cont = config.ANOMALY_CONTAMINATION
@@ -1569,7 +1599,7 @@ def page_ml_predictions():
             "Do not treat predicted days as a production forecast."
         )
 
-    if tune_rul:
+    if tune_rul and can_detect:
         with st.spinner(f"Optuna RUL ({trials} trials)..."):
             try:
                 target = "failure_within_days" if "failure_within_days" in df.columns else None
@@ -1581,7 +1611,7 @@ def page_ml_predictions():
             except Exception as exc:
                 st.error(str(exc))
 
-    if tune_iso:
+    if tune_iso and can_detect:
         with st.spinner("Optuna anomaly contamination..."):
             try:
                 st.session_state.optuna_anomaly = tune_anomaly_contamination(df, n_trials=min(12, trials))
@@ -3359,6 +3389,19 @@ def main():
     if get_graph_folder():
         st.sidebar.info(f"{len(get_graph_folder())} graph(s) saved")
     render_ops_honesty()
+
+    if selection in NUMBERED_LABELS:
+        df_flow = get_active_df()
+        map_status = mapping_status(df_flow) if df_flow is not None else {}
+        stages = pipeline_snapshot(
+            data_loaded=bool(st.session_state.get("data_loaded") or st.session_state.get("raw_df") is not None),
+            has_working_table=df_flow is not None,
+            table_count=len(st.session_state.get("uploaded_tables") or {}),
+            sensor_count=int(map_status.get("sensor_count") or 0),
+            has_predictions=bool(st.session_state.get("predictions")),
+            current_page=selection,
+        )
+        st.markdown(pipeline_circles_html(stages, current_page=selection), unsafe_allow_html=True)
 
     pages[selection]()
 

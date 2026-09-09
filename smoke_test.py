@@ -2840,6 +2840,128 @@ def main() -> int:
         assert "not live hangar" in data_source_label(data_source="sample")
         assert "simulator" in data_source_label(live_running=True, live_source="sim")
 
+    def test_pipeline_flow_gating() -> None:
+        """Numbered circles + Detect lock. Left-nav page list is unchanged (13 labels)."""
+        import ast
+
+        from src.industry_packs import DEFAULT_PACK_ID, PACK_ORDER
+        from src.pipeline_flow import (
+            NUMBERED_LABELS,
+            can_detect_anomalies,
+            pipeline_circles_html,
+            pipeline_snapshot,
+        )
+
+        assert PACK_ORDER[0] == DEFAULT_PACK_ID
+        assert list(PACK_ORDER) == [
+            "plant_rotating",
+            "aviation_uav_piston",
+            "automotive_powertrain",
+            "oil_srp",
+        ]
+        messy = pd.DataFrame({"foo": [1.0], "bar": [2.0]})
+        assert can_detect_anomalies(None) is False
+        assert can_detect_anomalies(messy) is False
+        mapped = pd.DataFrame({"temperature": [70.0], "vibration": [1.2]})
+        assert can_detect_anomalies(mapped) is True
+
+        locked = pipeline_snapshot(
+            data_loaded=False,
+            has_working_table=False,
+            table_count=0,
+            sensor_count=0,
+            has_predictions=False,
+            current_page="4. Anomaly & RUL",
+        )
+        by_id = {r["id"]: r for r in locked}
+        assert by_id["4. Anomaly & RUL"]["state"] == "locked"
+        assert by_id["1. Upload & Clean"]["state"] == "ready" or by_id["1. Upload & Clean"]["locked"] is False
+
+        ready = pipeline_snapshot(
+            data_loaded=True,
+            has_working_table=True,
+            table_count=1,
+            sensor_count=3,
+            has_predictions=False,
+            current_page="4. Anomaly & RUL",
+        )
+        by_id = {r["id"]: r for r in ready}
+        assert by_id["4. Anomaly & RUL"]["state"] == "current"
+        assert by_id["3. Map sensors"]["done"] is True
+        assert by_id["6. Insights"]["locked"] is True
+
+        html = pipeline_circles_html(ready, current_page="4. Anomaly & RUL")
+        assert "border-radius:50%" in html
+        assert "Detect" in html and "Isolation Forest" in html
+
+        src = (ROOT / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        pages_keys: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "pages" and isinstance(node.value, ast.Dict):
+                        pages_keys = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+        expected = [
+            "1. Upload & Clean",
+            "2. Joins",
+            "3. Map sensors",
+            "4. Anomaly & RUL",
+            "5. Charts",
+            "6. Insights",
+            "3D Twin",
+            "CAD Twin (APS)",
+            "Live Connect",
+            "7. Dashboard",
+            "Email Report",
+            "Ask",
+            "SQL lab",
+        ]
+        assert pages_keys == expected, pages_keys
+        assert list(NUMBERED_LABELS) == [
+            "1. Upload & Clean",
+            "2. Joins",
+            "3. Map sensors",
+            "4. Anomaly & RUL",
+            "5. Charts",
+            "6. Insights",
+            "7. Dashboard",
+        ]
+        # Detect button must be disable-gated (not removed).
+        assert "disabled=not can_detect" in src
+        assert src.count("disabled=not can_detect") >= 3  # Detect + both Optuna buttons
+
+        from streamlit.testing.v1 import AppTest
+
+        def _errs(at) -> list[str]:
+            return [getattr(e, "message", str(e)) for e in at.exception]
+
+        at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+        at.run()
+        assert not _errs(at), "pipeline flow initial: " + "; ".join(_errs(at))
+        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+        assert list(radio.options) == expected, list(radio.options)
+        radio.set_value("4. Anomaly & RUL").run()
+        assert not _errs(at), "Anomaly empty: " + "; ".join(_errs(at))
+        assert not any(
+            (b.label or "") == "Detect anomalies + predict RUL" for b in at.button
+        ), "Detect must not appear before a working table exists"
+
+        at.session_state["cleaned_df"] = messy
+        at.session_state["data_loaded"] = True
+        at.run()
+        assert not _errs(at), "Anomaly unmapped: " + "; ".join(_errs(at))
+        detect = next(b for b in at.button if (b.label or "") == "Detect anomalies + predict RUL")
+        assert getattr(detect, "disabled", False) is True
+        warnings = " ".join(str(getattr(w, "value", "") or "") for w in at.warning)
+        assert "Detect stays locked" in warnings, warnings
+
+        at.session_state["cleaned_df"] = mapped
+        at.run()
+        assert not _errs(at), "Anomaly mapped: " + "; ".join(_errs(at))
+        detect = next(b for b in at.button if (b.label or "") == "Detect anomalies + predict RUL")
+        assert getattr(detect, "disabled", False) is False
+
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
     check("map_clean", test_map_clean)
@@ -2880,6 +3002,7 @@ def main() -> int:
     check("health_events_and_assets", test_health_events_and_assets)
     check("last_session_pack", test_last_session_pack)
     check("ops_revision", test_ops_revision)
+    check("pipeline_flow_gating", test_pipeline_flow_gating)
 
     if errors:
         print(f"\n{len(errors)} FAIL")
