@@ -24,7 +24,11 @@ def check(name: str, fn) -> None:
 
 
 def main() -> int:
+    import tempfile as _tf
     import pandas as pd
+
+    persist_dir = _tf.TemporaryDirectory(prefix="pdm_last_session_")
+    os.environ["PDM_LAST_SESSION_PATH"] = str(Path(persist_dir.name) / "last_session.json")
 
     import config
     from src.data_cleaner import clean_and_quality
@@ -294,10 +298,19 @@ def main() -> int:
         # The stressed machine should carry the highest anomaly rate → sorts first.
         assert status[0]["machine_id"] == "M-001"
         assert status[0]["risk_level"] in {"High", "Medium"}
+        assert "last_seen" in status[0] and "stale" in status[0]
+        from src.live_connect import last_seen_and_stale
+
+        fresh = last_seen_and_stale("2026-09-09T16:00:00Z", now=pd.Timestamp("2026-09-09T16:00:10Z"), stale_after_s=30)
+        assert fresh["stale"] is False and fresh["last_seen_age_s"] == 10.0
+        old = last_seen_and_stale("2026-09-09T16:00:00Z", now=pd.Timestamp("2026-09-09T16:02:00Z"), stale_after_s=30)
+        assert old["stale"] is True
+        missing = last_seen_and_stale(None, now=pd.Timestamp("2026-09-09T16:00:00Z"))
+        assert missing["stale"] is True and missing["last_seen"] == ""
 
     def test_live_sources() -> None:
         # Upgrade 2 — MQTT / OPC-UA helpers (gates + payload parsing, offline).
-        from src.live_sources import _coerce_row, mqtt_available, opcua_available, parse_node_map
+        from src.live_sources import _coerce_row, mqtt_available, mqtt_defaults, opcua_available, parse_node_map
 
         ok_m, _ = mqtt_available()
         ok_o, _ = opcua_available()
@@ -313,6 +326,26 @@ def main() -> int:
         assert row["machine_id"] == "M-9" and row["temperature"] == 70.5 and "timestamp" in row
         row2 = _coerce_row({"temperature": 10}, machine_field="machine_id", ts_field="timestamp", fallback_machine="fb")
         assert row2["machine_id"] == "fb"
+        prev = {k: os.environ.get(k) for k in ("MQTT_BROKER", "MQTT_PORT", "MQTT_TOPIC")}
+        try:
+            os.environ["MQTT_BROKER"] = "broker.example.test"
+            os.environ["MQTT_PORT"] = "1884"
+            os.environ["MQTT_TOPIC"] = "hangar/uav/#"
+            d = mqtt_defaults()
+            assert d["host"] == "broker.example.test" and d["port"] == 1884 and d["topic"] == "hangar/uav/#"
+        finally:
+            for k, val in prev.items():
+                if val is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = val
+        from src.ops_meta import is_loopback_host, mqtt_broker_caption
+
+        assert is_loopback_host("127.0.0.1") and is_loopback_host("localhost")
+        cap = mqtt_broker_caption("127.0.0.1", 1883, "pdm/sensors/#")
+        assert "not the hangar" in cap.lower() or "not hangar" in cap.lower()
+        public = mqtt_broker_caption("mqtt.example.com", 1883, "pdm/sensors/#")
+        assert "mqtt.example.com" in public and "127.0.0.1" not in public
 
     def test_polars_engine() -> None:
         from src.polars_clean import clean_with_polars, polars_available
@@ -918,8 +951,12 @@ def main() -> int:
             assigned_theme_plan,
             assignment_summary,
             clear_region_map,
+            dumps_region_map,
+            import_region_map,
             load_region_map,
+            map_persist_status,
             model_key,
+            parse_region_map_payload,
             region_label,
             regions_for_model,
         )
@@ -983,6 +1020,33 @@ def main() -> int:
 
             summary = assignment_summary(pack, urn, path=path)
             assert summary["total"] == 6
+
+            dumped = dumps_region_map(path=path)
+            roundtrip = parse_region_map_payload(dumped)
+            assert key in roundtrip["models"]
+            imported = import_region_map(dumped, path=path, merge=True, write=True)
+            assert imported["ok"] and imported["saved"]
+            other_pack = {
+                "version": 1,
+                "models": {
+                    "plant_rotating::dXJuOm90aGVy": {
+                        "pack_id": "plant_rotating",
+                        "urn": "dXJuOm90aGVy",
+                        "regions": {"other": [1]},
+                    }
+                },
+            }
+            merged = import_region_map(other_pack, path=path, merge=True, write=True)
+            assert key in (merged["doc"]["models"]) and "plant_rotating::dXJuOm90aGVy" in merged["doc"]["models"]
+            # Pack switch merge must keep the aviation assignments.
+            assert 412 in regions_for_model(pack, urn, path=path)["heads_exhaust"]
+
+            missing_path = Path(tmp) / "no_such_cad_region_map.json"
+            empty_doc = load_region_map(path=missing_path)
+            assert empty_doc["models"] == {}
+            st = map_persist_status(path=missing_path, session_has=False, render_ephemeral=True)
+            assert "not saved" in st["line"] and "Render disk resets" in st["line"]
+
             cleared = clear_region_map(pack, urn, path=path)
             assert cleared["cleared"] is True and cleared["had"] == 6
             blank = assigned_theme_plan(pack, urn, "High", "heads_exhaust", path=path)
@@ -1568,6 +1632,13 @@ def main() -> int:
         assert aliased.loc[0, "physics_fault"] == FAULT_LOW_OIL  # oil wins vs overheat vs vib
         assert "EGT high" in str(aliased.loc[0, "physics_rule"])
 
+        exhaust_alias = apply_physics_rules(
+            pd.DataFrame({"exhaust_temp": [900.0], "oil_pressure": [60.0]}),
+            "aviation_uav_piston",
+        )
+        assert exhaust_alias.loc[0, "physics_fault"] == FAULT_OVERHEATING
+        assert "EGT high" in str(exhaust_alias.loc[0, "physics_rule"])
+
         default_oil = apply_physics_rules(
             pd.DataFrame({"machine_id": ["ENG-01"], "oil_pressure": [30.0], "vibration": [1.0]}),
             "automotive_powertrain",
@@ -1621,6 +1692,17 @@ def main() -> int:
         text = format_mission_advisory(items)
         assert text == "UAV-01: Inspect oil · UAV-02: OK · UAV-03: Check cooling"
         assert {i["machine_id"] for i in items} == {"UAV-01", "UAV-02", "UAV-03"}
+
+        from src.physics_rules import valid_asset_id
+
+        assert valid_asset_id(None) == "" and valid_asset_id(float("nan")) == ""
+        empty_items = build_advisory_items(
+            machine_ids=["UAV-01", float("nan"), "", None],
+            predictions=[{"machine_id": float("nan"), "risk_level": "High"}],
+            physics_rows=[{"machine_id": "UAV-01", "physics_fault": FAULT_NONE}],
+        )
+        assert {i["machine_id"] for i in empty_items} == {"UAV-01"}
+        assert "nan" not in format_mission_advisory(empty_items)
 
         sample = pd.read_csv(ROOT / "sample_data" / "aviation_uav_piston.csv", parse_dates=["timestamp"])
         scored = apply_physics_rules(sample, "aviation_uav_piston")
@@ -1786,9 +1868,13 @@ def main() -> int:
             cad_html="",
             cad_status=status,
             title="test board",
+            fleet_items=[{"machine_id": "UAV-03", "action": "Inspect oil", "risk_level": "High", "mission_success_pct": 41}],
+            asset_rows=[{"machine_id": "UAV-03", "pack": "Aviation", "risk_level": "High", "mission_success_pct": 41, "go_nogo": "NO-GO", "work_order": {"id": "WO-UAV-03-OIL", "title": "Inspect oil", "status": "open"}}],
         )
         assert "test board" in html
         assert "SIH26054" in html or "Aviation" in html
+        assert "Fleet health" in html
+        assert "WO-UAV-03-OIL" in html
         assert '"kind": "aviation_uav"' in html or "aviation_uav" in html
         assert "jsdelivr" not in twin
         assert "Waiting for credentials" in html or "CAD TWIN" in html
@@ -2615,6 +2701,8 @@ def main() -> int:
         assert "MissionAdvisory" in dash, dash[:1200]
         assert "flies next mission" in dash, dash[:1200]
         assert "UAV-01:" in dash and "UAV-03:" in dash
+        assert "Fleet health" in dash, dash[:1200]
+        assert "go/no-go" in dash.lower() or "NO-GO" in dash or "GO" in dash
 
         radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
         radio.set_value("6. Insights").run()
@@ -2623,6 +2711,125 @@ def main() -> int:
         assert "MissionAdvisory" in ins, ins[:1200]
         assert "UAV-01:" in ins and "UAV-02:" in ins and "UAV-03:" in ins
         assert PACKS["aviation_uav_piston"]["sih"] == "SIH26054"
+
+    def test_cad_map_secret_seed() -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from src.cad_regions import load_region_map, seed_region_map_from_env
+
+        payload = {
+            "version": 1,
+            "models": {
+                "aviation_uav_piston::dXJuOmZha2U": {
+                    "pack_id": "aviation_uav_piston",
+                    "urn": "dXJuOmZha2U",
+                    "regions": {"oil_system": [531]},
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cad_region_map.json"
+            prev = os.environ.get("CAD_MAP_JSON")
+            os.environ["CAD_MAP_JSON"] = json.dumps(payload)
+            try:
+                result = seed_region_map_from_env(path=path)
+                assert result["seeded"] is True
+                doc = load_region_map(path=path)
+                assert 531 in doc["models"]["aviation_uav_piston::dXJuOmZha2U"]["regions"]["oil_system"]
+                again = seed_region_map_from_env(path=path)
+                assert again["seeded"] is False and again["reason"] == "disk_has_map"
+            finally:
+                if prev is None:
+                    os.environ.pop("CAD_MAP_JSON", None)
+                else:
+                    os.environ["CAD_MAP_JSON"] = prev
+
+    def test_health_events_and_assets() -> None:
+        from src.assets import build_asset_rows, work_order_id
+        from src.data_cleaner import clean_and_quality
+        from src.health_events import REQUIRED_KEYS, build_health_events, missing_required_keys
+        from src.ml.anomaly_detector import AnomalyDetector
+        from src.ml.rul_predictor import RULPredictor
+        from src.pack_kpis import compute_pack_kpis
+        from src.physics_rules import apply_physics_rules, build_sih_bundle
+
+        av = pd.read_csv(ROOT / "sample_data" / "aviation_uav_piston.csv", parse_dates=["timestamp"])
+        cleaned, _, _ = clean_and_quality(av, run_quality=False)
+        physics_df = apply_physics_rules(cleaned, "aviation_uav_piston")
+        det = AnomalyDetector(contamination=0.05)
+        det.fit(physics_df)
+        scored = det.annotate(physics_df)
+        preds = RULPredictor().fit(scored).predict_latest_per_machine(scored)
+        bundle = compute_pack_kpis("aviation_uav_piston", scored, preds)
+        sih = build_sih_bundle(scored, "aviation_uav_piston", preds, bundle.get("by_asset"))
+        events = build_health_events(
+            scored,
+            pack_id="aviation_uav_piston",
+            predictions=preds,
+            physics_rows=sih.get("physics_rows"),
+            advisory_items=sih.get("advisory_items"),
+            drivers=sih.get("drivers"),
+            by_asset=bundle.get("by_asset"),
+        )
+        assert events
+        tails = {e["asset"] for e in events}
+        assert {"UAV-01", "UAV-02", "UAV-03"} <= tails
+        for event in events:
+            missing = missing_required_keys(event)
+            assert not missing, missing
+            assert event["schema"] == "pdm.health_event.v1"
+            assert event["pack_id"] == "aviation_uav_piston"
+            assert "sensors" in event and isinstance(event["sensors"], dict)
+            assert "physics" in event and "fault" in event["physics"]
+            assert "iforest" in event and "anomaly_score" in event["iforest"]
+        rows = build_asset_rows(
+            scored,
+            pack_id="aviation_uav_piston",
+            predictions=preds,
+            by_asset=bundle.get("by_asset"),
+            advisory_items=sih.get("advisory_items"),
+            physics_rows=sih.get("physics_rows"),
+        )
+        by_id = {r["machine_id"]: r for r in rows}
+        assert "UAV-03" in by_id
+        u3 = by_id["UAV-03"]
+        assert u3["advisory"]
+        assert u3["mission_success_pct"] is not None
+        if u3["advisory"] != "OK":
+            assert u3["work_order_id"].startswith("WO-UAV-03-")
+            assert u3["work_order"]["status"] == "open"
+            assert u3["go_nogo"] in {"NO-GO", "CAUTION"}
+        assert work_order_id("UAV-03", "Inspect oil") == "WO-UAV-03-OIL"
+        assert work_order_id("UAV-01", "OK") == ""
+
+    def test_last_session_pack() -> None:
+        import tempfile
+        from pathlib import Path
+
+        from src.industry_packs import DEFAULT_PACK_ID
+        from src.session_persist import restore_industry_pack, save_last_session, saved_industry_pack
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "last_session.json"
+            assert restore_industry_pack(path=path) is None
+            assert saved_industry_pack(path=path) == DEFAULT_PACK_ID
+            saved = save_last_session("aviation_uav_piston", path=path)
+            assert saved["ok"] is True
+            assert restore_industry_pack(path=path) == "aviation_uav_piston"
+            save_last_session("not_a_pack", path=path)
+            assert saved_industry_pack(path=path) == DEFAULT_PACK_ID
+
+    def test_ops_revision() -> None:
+        from src.ops_meta import app_revision, data_source_label, revision_caption
+
+        sha = app_revision(short=True)
+        assert isinstance(sha, str)
+        cap = revision_caption(data_label="sample CSV (not live hangar telemetry)")
+        assert "rev" in cap and "sample" in cap
+        assert "not live hangar" in data_source_label(data_source="sample")
+        assert "simulator" in data_source_label(live_running=True, live_source="sim")
 
     check("python39_imports", test_python39_annotations)
     check("gemini_remap", test_gemini_remap)
@@ -2660,6 +2867,10 @@ def main() -> int:
     check("cad_twin_apptest_layout", test_cad_twin_apptest_layout)
     check("upload_load_buttons_apptest", test_upload_load_buttons_apptest)
     check("sih_physics_apptest", test_sih_physics_apptest)
+    check("cad_map_secret_seed", test_cad_map_secret_seed)
+    check("health_events_and_assets", test_health_events_and_assets)
+    check("last_session_pack", test_last_session_pack)
+    check("ops_revision", test_ops_revision)
 
     if errors:
         print(f"\n{len(errors)} FAIL")
