@@ -136,13 +136,20 @@ class RULPredictor:
         predictions = []
 
         if "machine_id" in df.columns:
+            from src.physics_rules import valid_asset_id
+
             for machine in df["machine_id"].unique():
+                mid = valid_asset_id(machine)
+                if not mid:
+                    continue
                 mdf = engineered[engineered["machine_id"] == machine]
+                if mdf.empty:
+                    continue
                 latest = mdf.iloc[[-1]]
                 X = latest[self.feature_columns].fillna(0)
                 rul = float(self.model.predict(X)[0])
                 rul = max(1, round(rul))
-                predictions.append(self._prediction_record(str(machine), rul))
+                predictions.append(self._prediction_record(mid, rul))
         else:
             latest = engineered.iloc[[-1]]
             X = latest[self.feature_columns].fillna(0)

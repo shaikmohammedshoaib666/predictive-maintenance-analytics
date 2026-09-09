@@ -181,6 +181,9 @@ def _asset_rows(
     if not latest.empty and "machine_id" in latest.columns:
         for _, rec in latest.iterrows():
             mid = str(rec["machine_id"])
+            key = str(mid).strip()
+            if not key or key.lower() in {"nan", "none", "null"}:
+                continue
             seen.add(mid)
             pred = _pred_for(predictions, mid)
             health = _health_from_row(rec, pred, high_bad=high_bad, low_bad=low_bad, df_full=df)

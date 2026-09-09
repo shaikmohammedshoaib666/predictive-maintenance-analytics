@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 SENSOR_COLS = ["temperature", "vibration", "pressure", "rpm"]
+DEFAULT_STALE_AFTER_S = 30
 
 # Healthy baseline (mean, std) per sensor.
 _BASE = {
@@ -95,7 +96,63 @@ def risk_from_rate(rate_pct: float) -> str:
     return "Low"
 
 
-def compute_live_status(buffer: pd.DataFrame, *, contamination: float = 0.08) -> list[dict[str, Any]]:
+def _iso_ts(value: Any) -> str:
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return ""
+        return pd.Timestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return ""
+
+
+def last_seen_and_stale(
+    last_ts: Any,
+    *,
+    now: Optional[pd.Timestamp] = None,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+) -> dict[str, Any]:
+    """Per-asset last-seen + stale flag. ``stale_after_s`` is wall-clock, not a hangar SLA."""
+    try:
+        window = int(stale_after_s)
+    except (TypeError, ValueError):
+        window = DEFAULT_STALE_AFTER_S
+    if window < 1:
+        window = DEFAULT_STALE_AFTER_S
+    clock = now if now is not None else pd.Timestamp.utcnow()
+    try:
+        ts = pd.to_datetime(last_ts, utc=True, errors="coerce")
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        return {
+            "last_seen": "",
+            "last_seen_age_s": None,
+            "stale": True,
+            "stale_after_s": window,
+        }
+    clock = pd.Timestamp(clock)
+    if clock.tzinfo is None:
+        clock = clock.tz_localize("UTC")
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    age = float((clock - ts).total_seconds())
+    return {
+        "last_seen": _iso_ts(ts),
+        "last_seen_age_s": round(age, 1),
+        "stale": bool(age > window),
+        "stale_after_s": window,
+    }
+
+
+def compute_live_status(
+    buffer: pd.DataFrame,
+    *,
+    contamination: float = 0.08,
+    now: Optional[pd.Timestamp] = None,
+    stale_after_s: int = DEFAULT_STALE_AFTER_S,
+) -> list[dict[str, Any]]:
     """Per-machine live status.
 
     IsolationForest is fit **jointly** across the whole buffer so a genuinely
@@ -121,9 +178,12 @@ def compute_live_status(buffer: pd.DataFrame, *, contamination: float = 0.08) ->
             rates = (work.groupby("machine_id")["_anom"].mean() * 100.0).round(2).to_dict()
 
     out: list[dict[str, Any]] = []
+    clock = now if now is not None else pd.Timestamp.utcnow()
     for m, grp in buffer.groupby("machine_id"):
         rate = float(rates.get(m, 0.0))
         last = grp.iloc[-1]
+        last_ts = last.get("timestamp") if "timestamp" in grp.columns else None
+        seen = last_seen_and_stale(last_ts, now=clock, stale_after_s=stale_after_s)
         out.append(
             {
                 "machine_id": str(m),
@@ -133,6 +193,10 @@ def compute_live_status(buffer: pd.DataFrame, *, contamination: float = 0.08) ->
                 "n_rows": int(len(grp)),
                 "last_temperature": _safe_float(last.get("temperature")),
                 "last_vibration": _safe_float(last.get("vibration")),
+                "last_seen": seen["last_seen"],
+                "last_seen_age_s": seen["last_seen_age_s"],
+                "stale": seen["stale"],
+                "stale_after_s": seen["stale_after_s"],
             }
         )
     order = {"High": 0, "Medium": 1, "Low": 2, "Unknown": 3}

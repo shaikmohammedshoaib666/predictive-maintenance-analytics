@@ -18,6 +18,23 @@ import pandas as pd
 from src.quality_checks import find_col
 from src.twin3d import normalize_risk
 
+_INVALID_ASSET_IDS = {"", "nan", "none", "null", "nat", "<na>"}
+
+
+def valid_asset_id(value: Any) -> str:
+    """Skip empty / NaN machine ids so MissionAdvisory never lists a ``nan`` tail."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in _INVALID_ASSET_IDS:
+        return ""
+    return text
+
 FLAG_ALERT = "physics_alert"
 FLAG_FAULT = "physics_fault"
 FLAG_RULE = "physics_rule"
@@ -61,7 +78,7 @@ LAYER1_CAPTION = (
 AVIATION_LIMITS: tuple[dict[str, Any], ...] = (
     {
         "id": "egt_high",
-        "names": ("egt", "exhaust_gas_temp", "egt_c", "egt_deg_c"),
+        "names": ("egt", "exhaust_gas_temp", "egt_c", "egt_deg_c", "exhaust_temp", "egt_celsius"),
         "op": "gt",
         "limit": 780.0,
         "rule": "EGT high",
@@ -70,7 +87,7 @@ AVIATION_LIMITS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "cht_high",
-        "names": ("cht", "cylinder_head_temp", "cht_c"),
+        "names": ("cht", "cylinder_head_temp", "cht_c", "cht_temp", "head_temp"),
         "op": "gt",
         "limit": 195.0,
         "rule": "CHT high",
@@ -88,7 +105,7 @@ AVIATION_LIMITS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "oil_low",
-        "names": ("oil_pressure", "oil_psi", "oil_press"),
+        "names": ("oil_pressure", "oil_psi", "oil_press", "oil_press_psi", "oilpressure"),
         "op": "lt",
         "limit": 45.0,
         "rule": "Oil pressure low",
@@ -111,7 +128,7 @@ AVIATION_LIMITS: tuple[dict[str, Any], ...] = (
 DEFAULT_LIMITS: tuple[dict[str, Any], ...] = (
     {
         "id": "egt_high",
-        "names": ("egt", "exhaust_gas_temp", "egt_c", "egt_deg_c"),
+        "names": ("egt", "exhaust_gas_temp", "egt_c", "egt_deg_c", "exhaust_temp", "egt_celsius"),
         "op": "gt",
         "limit": 800.0,
         "rule": "EGT high",
@@ -120,7 +137,7 @@ DEFAULT_LIMITS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "cht_high",
-        "names": ("cht", "cylinder_head_temp", "cht_c"),
+        "names": ("cht", "cylinder_head_temp", "cht_c", "cht_temp", "head_temp"),
         "op": "gt",
         "limit": 250.0,
         "rule": "CHT high",
@@ -138,7 +155,7 @@ DEFAULT_LIMITS: tuple[dict[str, Any], ...] = (
     },
     {
         "id": "oil_low",
-        "names": ("oil_pressure", "oil_psi", "oil_press"),
+        "names": ("oil_pressure", "oil_psi", "oil_press", "oil_press_psi", "oilpressure"),
         "op": "lt",
         "limit": 20.0,
         "rule": "Oil pressure low",
@@ -281,7 +298,9 @@ def summarize_physics(df: Optional[pd.DataFrame]) -> list[dict[str, Any]]:
         if not flagged.empty:
             hist_counts = flagged.groupby(flagged["machine_id"].astype(str)).size().to_dict()
     for _, rec in latest.iterrows():
-        mid = str(rec["machine_id"]) if has_mid else "asset"
+        mid = valid_asset_id(rec["machine_id"]) if has_mid else "asset"
+        if has_mid and not mid:
+            continue
         fault = str(rec.get(FLAG_FAULT) or FAULT_NONE)
         rule = str(rec.get(FLAG_RULE) or "")
         label = str(rec.get(FLAG_LABEL) or (RULE_LABELS.get(rule, fault) if rule else FAULT_NONE))
@@ -438,10 +457,14 @@ def build_advisory_items(
     drivers: Optional[dict[str, dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """One row per asset (full fleet, not top-3)."""
-    pred_map = {str(p.get("machine_id")): p for p in (predictions or []) if p.get("machine_id") is not None}
-    phys_map = {str(p.get("machine_id")): p for p in (physics_rows or []) if p.get("machine_id") is not None}
-    health_map = {str(a.get("machine_id")): a for a in (by_asset or []) if a.get("machine_id") is not None}
-    driver_map = {str(k): v for k, v in (drivers or {}).items()}
+    pred_map = {valid_asset_id(p.get("machine_id")): p for p in (predictions or [])}
+    pred_map.pop("", None)
+    phys_map = {valid_asset_id(p.get("machine_id")): p for p in (physics_rows or [])}
+    phys_map.pop("", None)
+    health_map = {valid_asset_id(a.get("machine_id")): a for a in (by_asset or [])}
+    health_map.pop("", None)
+    driver_map = {valid_asset_id(k): v for k, v in (drivers or {}).items()}
+    driver_map.pop("", None)
 
     ids: list[str] = []
     seen: set[str] = set()
@@ -450,7 +473,7 @@ def build_advisory_items(
             continue
         seq = source.keys() if isinstance(source, dict) else source
         for mid in seq:
-            key = str(mid)
+            key = valid_asset_id(mid)
             if key and key not in seen:
                 seen.add(key)
                 ids.append(key)
@@ -534,7 +557,7 @@ def build_sih_bundle(
     drivers = collect_drivers(annotated, predictions) if include_drivers else {}
     mids: list[str] = []
     if df is not None and isinstance(df, pd.DataFrame) and "machine_id" in df.columns:
-        mids = sorted({str(x) for x in df["machine_id"].dropna().unique()})
+        mids = sorted({valid_asset_id(x) for x in df["machine_id"].tolist()} - {""})
     items = build_advisory_items(
         machine_ids=mids,
         predictions=predictions,

@@ -92,6 +92,8 @@ class MqttSource:
         self.connected = False
         self.error: Optional[str] = None
         self.msg_count = 0
+        self.last_message_at: Optional[pd.Timestamp] = None
+        self.last_seen: dict[str, pd.Timestamp] = {}
 
     def start(self) -> None:
         import paho.mqtt.client as mqtt
@@ -121,6 +123,11 @@ class MqttSource:
             with self._lock:
                 self._buf.append(row)
                 self.msg_count += 1
+                now = pd.Timestamp.utcnow().floor("s")
+                self.last_message_at = now
+                mid = str(row.get("machine_id") or "")
+                if mid:
+                    self.last_seen[mid] = now
 
         client.on_connect = on_connect
         client.on_message = on_message
@@ -222,6 +229,13 @@ def stop_source(conn_id: Optional[str]) -> None:
         src.stop()
     _MQTT_CONNS.pop(conn_id, None)
     _OPCUA_CONNS.pop(conn_id, None)
+
+
+def mqtt_defaults() -> dict[str, Any]:
+    """Host/port/topic from MQTT_* env/secrets, localhost demo kept as default."""
+    from src.ops_meta import mqtt_defaults as _defaults
+
+    return _defaults()
 
 
 def parse_node_map(text: str) -> dict[str, str]:
