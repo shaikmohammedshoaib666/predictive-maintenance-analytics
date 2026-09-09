@@ -509,3 +509,226 @@ def assigned_theme_plan(
             "Assign the driver region's parts to see them tinted."
         )
     return base
+
+
+def dumps_region_map(*, path: Optional[Path] = None, doc: Optional[dict[str, Any]] = None) -> str:
+    """Pretty JSON for download. Always a valid document, even if the file is missing."""
+    payload = doc if isinstance(doc, dict) else load_region_map(path=path)
+    if "version" not in payload:
+        payload = {"version": 1, "models": payload.get("models") if isinstance(payload, dict) else {}}
+    if "models" not in payload or not isinstance(payload.get("models"), dict):
+        payload = {"version": int(payload.get("version") or 1), "models": {}}
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def parse_region_map_payload(raw: Any) -> dict[str, Any]:
+    """Sanitize imported JSON / dict. Missing or junk → empty map, never a crash."""
+    data: Any = raw
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except Exception:
+            return _empty_doc()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return _empty_doc()
+        try:
+            data = json.loads(text)
+        except Exception:
+            return _empty_doc()
+    if not isinstance(data, dict):
+        return _empty_doc()
+    models_raw = data.get("models")
+    if not isinstance(models_raw, dict):
+        # Allow a bare {pack::urn: {regions: …}} or a single-model regions dict.
+        if any(isinstance(v, dict) and ("regions" in v or any(k in REGION_IDS for k in v)) for v in data.values()):
+            models_raw = {k: v for k, v in data.items() if k not in {"version", "models"}}
+        else:
+            models_raw = {}
+    models: dict[str, Any] = {}
+    for key, row in models_raw.items():
+        if not isinstance(row, dict):
+            continue
+        regions = _clean_regions(row.get("regions") if "regions" in row else row)
+        if not regions:
+            continue
+        models[str(key)] = {
+            "regions": regions,
+            "updated_at": str(row.get("updated_at") or ""),
+            "pack_id": str(row.get("pack_id") or ""),
+            "urn": str(row.get("urn") or ""),
+        }
+    return {"version": int(data.get("version") or 1), "models": models}
+
+
+def merge_region_maps(base: Any, incoming: Any) -> dict[str, Any]:
+    """Union of models. Incoming wins per model key; other models stay (pack switch safe)."""
+    left = parse_region_map_payload(base)
+    right = parse_region_map_payload(incoming)
+    models = dict(left.get("models") or {})
+    models.update(dict(right.get("models") or {}))
+    return {"version": 1, "models": models}
+
+
+def import_region_map(
+    raw: Any,
+    *,
+    path: Optional[Path] = None,
+    merge: bool = True,
+    write: bool = True,
+) -> dict[str, Any]:
+    """Import JSON onto disk. Merge by default so a pack switch does not wipe other maps."""
+    incoming = parse_region_map_payload(raw)
+    p = Path(path) if path is not None else region_map_path()
+    existing = load_region_map(path=p)
+    doc = merge_region_maps(existing, incoming) if merge else incoming
+    n_models = len(doc.get("models") or {})
+    saved = False
+    err = ""
+    if write:
+        try:
+            _atomic_write(p, doc)
+            saved = True
+        except Exception as exc:
+            err = str(exc)
+    total_ids = sum(
+        len(ids)
+        for row in (doc.get("models") or {}).values()
+        for ids in ((row or {}).get("regions") or {}).values()
+    )
+    return {
+        "ok": True,
+        "saved": saved,
+        "merged": bool(merge),
+        "models": n_models,
+        "assigned_ids": total_ids,
+        "path": str(p),
+        "doc": doc,
+        "error": err,
+        "message": (
+            f"Imported {total_ids} assigned part(s) across {len(doc.get('models') or {})} model(s)"
+            + (" and wrote disk." if saved else " (disk write skipped or failed).")
+        ),
+    }
+
+
+def cad_map_secret_text() -> str:
+    """CAD_MAP_JSON env or Streamlit secret — JSON text or a file path."""
+    try:
+        import config as _cfg
+
+        text = str(_cfg._setting("CAD_MAP_JSON", "") or "").strip()
+    except Exception:
+        text = (os.getenv("CAD_MAP_JSON") or "").strip()
+    return text
+
+
+def load_cad_map_secret() -> dict[str, Any]:
+    """Parse CAD_MAP_JSON. File path or JSON string. Empty doc when unset."""
+    text = cad_map_secret_text()
+    if not text:
+        return _empty_doc()
+    try:
+        p = Path(text)
+        if p.is_file():
+            return parse_region_map_payload(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return parse_region_map_payload(text)
+
+
+def seed_region_map_from_env(*, path: Optional[Path] = None) -> dict[str, Any]:
+    """If disk is empty and CAD_MAP_JSON is set, write the secret map. Honest Render seed."""
+    p = Path(path) if path is not None else region_map_path()
+    disk = load_region_map(path=p)
+    disk_models = disk.get("models") or {}
+    secret = load_cad_map_secret()
+    secret_models = secret.get("models") or {}
+    if disk_models:
+        return {
+            "ok": True,
+            "seeded": False,
+            "reason": "disk_has_map",
+            "models": len(disk_models),
+            "path": str(p),
+        }
+    if not secret_models:
+        return {"ok": True, "seeded": False, "reason": "no_secret", "models": 0, "path": str(p)}
+    try:
+        _atomic_write(p, secret)
+        return {
+            "ok": True,
+            "seeded": True,
+            "reason": "secret",
+            "models": len(secret_models),
+            "path": str(p),
+        }
+    except Exception as exc:
+        return {"ok": False, "seeded": False, "reason": "write_failed", "error": str(exc), "path": str(p)}
+
+
+def map_persist_status(
+    *,
+    path: Optional[Path] = None,
+    session_has: bool = False,
+    render_ephemeral: Optional[bool] = None,
+) -> dict[str, Any]:
+    """One-line honesty: session / disk / secret / not saved (Render disk resets)."""
+    p = Path(path) if path is not None else region_map_path()
+    disk_doc = load_region_map(path=p)
+    disk_n = sum(
+        len(ids)
+        for row in (disk_doc.get("models") or {}).values()
+        for ids in ((row or {}).get("regions") or {}).values()
+    )
+    on_disk = bool(p.is_file() and disk_n)
+    secret = bool((load_cad_map_secret().get("models") or {}))
+    if render_ephemeral is None:
+        render_ephemeral = bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+    bits: list[str] = []
+    if session_has:
+        bits.append("in session")
+    if on_disk:
+        bits.append("on disk")
+    if secret:
+        bits.append("from secret")
+    if not bits:
+        bits.append("not saved")
+    if render_ephemeral:
+        bits.append("Render disk resets")
+    elif on_disk:
+        bits.append("local file (gitignored)")
+    else:
+        bits.append("export JSON to keep it")
+    return {
+        "session": bool(session_has),
+        "disk": on_disk,
+        "secret": secret,
+        "disk_ids": disk_n,
+        "path": str(p),
+        "ephemeral": bool(render_ephemeral),
+        "line": "Map " + " / ".join(bits),
+    }
+
+
+BROWSER_MAP_KEY = "pdm_cad_region_map_v1"
+
+
+def cad_map_localstorage_html(doc: Optional[dict[str, Any]] = None) -> str:
+    """Write the current map JSON into browser localStorage (CAD Twin backup)."""
+    payload = dumps_region_map(doc=doc or load_region_map())
+    safe = json.dumps(payload)
+    return f"""<!DOCTYPE html><html><body style="margin:0;font:12px system-ui,sans-serif;color:#6c757d">
+<script>
+(function(){{
+  var KEY = {json.dumps(BROWSER_MAP_KEY)};
+  try {{
+    localStorage.setItem(KEY, {safe});
+  }} catch (e) {{}}
+}})();
+</script>
+Browser backup key <code>{BROWSER_MAP_KEY}</code> — export JSON to restore after a new session.
+</body></html>
+"""
+

@@ -23,3 +23,12 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.6-flash
+      - key: MQTT_BROKER
+        value: "127.0.0.1"
+      - key: MQTT_PORT
+        value: "1883"
+      - key: MQTT_TOPIC
+        value: "pdm/sensors/#"
+      # Optional: paste exported cad_region_map.json (Render disk resets on redeploy).
+      - key: CAD_MAP_JSON
+        sync: false

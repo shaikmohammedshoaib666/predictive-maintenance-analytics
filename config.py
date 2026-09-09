@@ -67,3 +67,14 @@ RUL_HONESTY_CAPTION = (
     "a sensor-degradation proxy — treat days-to-fail as a demo, not a plant forecast."
 )
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+
+# Live Connect MQTT (localhost remains the demo default — on Render that is the Render VM)
+try:
+    MQTT_PORT = int(_setting("MQTT_PORT", "1883") or "1883")
+except (TypeError, ValueError):
+    MQTT_PORT = 1883
+MQTT_BROKER = _setting("MQTT_BROKER", "127.0.0.1")
+MQTT_TOPIC = _setting("MQTT_TOPIC", "pdm/sensors/#")
+
+# CAD region map seed (JSON string or file path). Honest Render path without a DB.
+# CAD_MAP_JSON=
