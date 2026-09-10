@@ -172,7 +172,14 @@ def compute_live_status(
             work[c] = pd.to_numeric(work[c], errors="coerce")
         work = work.dropna(subset=sensor_cols)
         if len(work) >= 12 and len(sensor_cols) >= 2:
-            iso = IsolationForest(contamination=contamination, random_state=42)
+            # Cap rows so the Live Connect fragment cannot freeze Streamlit's websocket.
+            if len(work) > 240:
+                work = work.tail(240)
+            iso = IsolationForest(
+                n_estimators=50,
+                contamination=contamination,
+                random_state=42,
+            )
             flagged = iso.fit_predict(work[sensor_cols].values) == -1
             work = work.assign(_anom=flagged)
             rates = (work.groupby("machine_id")["_anom"].mean() * 100.0).round(2).to_dict()

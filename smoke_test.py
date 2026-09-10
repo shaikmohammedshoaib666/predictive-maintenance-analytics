@@ -310,11 +310,24 @@ def main() -> int:
 
     def test_live_sources() -> None:
         # Upgrade 2 — MQTT / OPC-UA helpers (gates + payload parsing, offline).
-        from src.live_sources import _coerce_row, mqtt_available, mqtt_defaults, opcua_available, parse_node_map
+        from src.live_sources import (
+            _coerce_row,
+            get_source,
+            mqtt_available,
+            mqtt_defaults,
+            opcua_available,
+            parse_node_map,
+            probe_tcp,
+            start_mqtt,
+            start_sim,
+            stop_source,
+        )
 
         ok_m, _ = mqtt_available()
         ok_o, _ = opcua_available()
         assert isinstance(ok_m, bool) and isinstance(ok_o, bool)
+        bad_probe, why = probe_tcp("127.0.0.1", 9, timeout=0.3)
+        assert bad_probe is False and "127.0.0.1:9" in why
         nm = parse_node_map("temperature=ns=2;i=2, vibration=ns=2;i=3")
         assert nm == {"temperature": "ns=2;i=2", "vibration": "ns=2;i=3"}
         row = _coerce_row(
@@ -346,6 +359,26 @@ def main() -> int:
         assert "not the hangar" in cap.lower() or "not hangar" in cap.lower()
         public = mqtt_broker_caption("mqtt.example.com", 1883, "pdm/sensors/#")
         assert "mqtt.example.com" in public and "127.0.0.1" not in public
+        cid = start_sim(
+            {"machines": ["M-001", "M-002"], "failing": "M-001", "ramp_ticks": 8, "interval_s": 0.05}
+        )
+        try:
+            src = get_source(cid)
+            assert src is not None and src.connected is True
+            import time as _time
+
+            _time.sleep(0.12)
+            batch = src.drain()
+            assert not batch.empty
+            assert set(batch["machine_id"]) <= {"M-001", "M-002"}
+        finally:
+            stop_source(cid)
+            assert get_source(cid) is None
+        try:
+            start_mqtt({"host": "127.0.0.1", "port": 9, "topic": "pdm/sensors/#"})
+            raise AssertionError("start_mqtt must fail fast when no broker is on localhost")
+        except ConnectionError as exc:
+            assert "Simulator" in str(exc) or "broker" in str(exc).lower()
 
     def test_polars_engine() -> None:
         from src.polars_clean import clean_with_polars, polars_available

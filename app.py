@@ -56,16 +56,17 @@ from src.live_connect import (
     append_to_buffer,
     compute_live_status,
     default_machines,
-    poll_url_increment,
-    simulate_batch,
 )
 from src.live_sources import (
     get_source,
     mqtt_available,
     opcua_available,
     parse_node_map,
+    source_snapshot,
     start_mqtt,
     start_opcua,
+    start_poll,
+    start_sim,
     stop_source,
 )
 from src.url_ingest import (
@@ -281,7 +282,9 @@ def init_session_state():
         "live_cfg": {},
         "live_asset_states": [],
         "live_sensor_view": "temperature",
+        "live_source_radio": "Simulator",
         "live_conn_id": None,
+        "live_source_snap": {},
         # Cleaning engine (pandas | Polars)
         "clean_engine": "pandas",
         "dashboard_tiles": None,
@@ -1884,6 +1887,7 @@ def page_business_insights():
 # ── 3D Digital Twin (Layer 3) ─────────────────────────────────────────────────
 def page_twin_3d():
     pack = active_pack()
+    pump_live_into_session()
     st.markdown('<p class="main-header">3D Digital Twin</p>', unsafe_allow_html=True)
     st.markdown(
         f'<p class="sub-header">{pack["label"]}: rotatable 3D mesh. The '
@@ -2873,62 +2877,64 @@ def page_cad_twin():
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
-def _live_body():
-    cfg = dict(st.session_state.get("live_cfg") or {})
-    source = st.session_state.get("live_source")
-    if st.session_state.get("live_running"):
-        tick = int(st.session_state.get("live_tick") or 0)
-        batch = pd.DataFrame()
-        if source == "poll":
-            try:
-                batch, new_off = poll_url_increment(
-                    cfg.get("url", ""), UPLOAD_DIR, int(cfg.get("offset", 0)), int(cfg.get("poll_n", 30))
-                )
-                cfg["offset"] = new_off
-                st.session_state.live_cfg = cfg
-                if batch.empty:
-                    st.session_state.live_running = False
-                    st.info("Reached end of feed — stopped.")
-            except Exception as exc:
-                st.session_state.live_running = False
-                st.error(f"Poll failed: {exc}")
-        elif source in ("mqtt", "opcua"):
-            src = get_source(st.session_state.get("live_conn_id"))
-            if src is None:
-                st.session_state.live_running = False
-                st.warning("Live connection was lost (server restarted?). Press Start live again.")
-            else:
-                try:
-                    batch = src.drain() if source == "mqtt" else src.poll_once()
-                except Exception as exc:
-                    st.error(f"{source.upper()} read failed: {exc}")
-                if getattr(src, "error", None):
-                    st.caption(f"{source.upper()} note: {src.error}")
-        else:
-            ramp = max(1, int(cfg.get("ramp_ticks", 40)))
-            stress = min(1.0, tick / ramp)
-            batch = simulate_batch(
-                cfg.get("machines") or default_machines(),
-                tick,
-                failing=cfg.get("failing"),
-                stress=stress,
-                freq_seconds=int(cfg.get("freq", 5)),
-            )
-        if not batch.empty:
-            st.session_state.live_buffer = append_to_buffer(st.session_state.get("live_buffer"), batch)
-        st.session_state.live_tick = tick + 1
+LIVE_FRAGMENT_S = 3.0
 
+
+def pump_live_into_session() -> None:
+    """Drain the background live producer into session. Safe on any page.
+
+    Simulator / MQTT / poll / OPC-UA all run off the request thread so this
+    function must not open sockets.
+    """
+    if not st.session_state.get("live_running"):
+        return
+    src = get_source(st.session_state.get("live_conn_id"))
+    if src is None:
+        st.session_state.live_running = False
+        st.session_state.live_conn_id = None
+        return
+    snap = source_snapshot(src)
+    st.session_state.live_source_snap = snap
+    if snap.get("ended"):
+        st.session_state.live_running = False
+    try:
+        batch = src.drain()
+    except Exception as exc:
+        st.session_state.live_source_snap = {**snap, "error": str(exc)}
+        return
+    if batch is not None and not batch.empty:
+        st.session_state.live_buffer = append_to_buffer(st.session_state.get("live_buffer"), batch)
+        st.session_state.live_tick = int(st.session_state.get("live_tick") or 0) + 1
     buffer = st.session_state.get("live_buffer")
-    if buffer is None or buffer.empty:
-        st.info("Press **Start live** to begin streaming sensor data.")
+    if buffer is None or getattr(buffer, "empty", True):
+        return
+    cfg = st.session_state.get("live_cfg") or {}
+    st.session_state.live_asset_states = compute_live_status(
+        buffer,
+        stale_after_s=int(cfg.get("stale_after_s") or 30),
+    )
+
+
+def _live_body():
+    pump_live_into_session()
+    running = bool(st.session_state.get("live_running"))
+    buffer = st.session_state.get("live_buffer")
+    snap = st.session_state.get("live_source_snap") or {}
+    err = snap.get("error")
+    if err:
+        st.warning(str(err))
+
+    if buffer is None or getattr(buffer, "empty", True):
+        if running:
+            st.info(
+                "Live is running — waiting for the first readings. "
+                "Simulator should fill this in about a second. MQTT stays empty until JSON arrives."
+            )
+        else:
+            st.info("Press **Start live** with **Simulator** selected (no internet required).")
         return
 
-    status = compute_live_status(
-        buffer,
-        stale_after_s=int((st.session_state.get("live_cfg") or {}).get("stale_after_s") or 30),
-    )
-    st.session_state.live_asset_states = status
-
+    status = st.session_state.get("live_asset_states") or []
     worst = status[0] if status else None
     m1, m2, m3 = st.columns(3)
     m1.metric("Rows buffered", f"{len(buffer):,}")
@@ -2947,7 +2953,7 @@ def _live_body():
     if sensor in buffer.columns and "timestamp" in buffer.columns:
         import plotly.express as px
 
-        recent = buffer.tail(300)
+        recent = buffer.tail(200)
         fig = px.line(
             recent,
             x="timestamp",
@@ -2956,18 +2962,19 @@ def _live_body():
             title=f"Live {sensor} (last {len(recent)} readings)",
         )
         fig.update_layout(height=340, margin=dict(l=40, r=20, t=48, b=40))
-        st.plotly_chart(
-            fig, use_container_width=True, key=f"live_chart_{sensor}_{st.session_state.get('live_tick')}"
-        )
+        # Stable key — a new key every tick remounted Plotly and killed the websocket.
+        st.plotly_chart(fig, use_container_width=True, key="live_stream_chart")
 
-    st.caption(f"tick {st.session_state.get('live_tick')} · live risk feeds Insights + 3D Twin")
+    tick = st.session_state.get("live_tick")
+    nmsg = snap.get("msg_count")
+    st.caption(f"tick {tick} · producer messages {nmsg} · live risk feeds Insights + 3D Twin")
 
 
 def page_live_connect():
     st.markdown('<p class="main-header">Live Connect</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Streaming ingest into the PdM pipeline. Simulate live assets or poll a '
-        "remote CSV feed; live risk drives the 3D Twin in near-real-time.</p>",
+        '<p class="sub-header">Streaming ingest into the PdM pipeline. Simulator runs on this server '
+        "(no hangar, no internet). MQTT/OPC-UA need a reachable broker — they must not freeze the page.</p>",
         unsafe_allow_html=True,
     )
 
@@ -2984,35 +2991,47 @@ def page_live_connect():
         "MQTT (live)": "mqtt",
         "OPC-UA (live)": "opcua",
     }
-    code_to_label = {v: k for k, v in label_to_code.items()}
-    cur_label = code_to_label.get(st.session_state.get("live_source", "sim"), "Simulator")
-    if cur_label not in source_labels:
-        cur_label = "Simulator"
-    source = st.radio("Source", source_labels, horizontal=True, index=source_labels.index(cur_label))
-    st.session_state.live_source = label_to_code[source]
+    if st.session_state.get("live_source_radio") not in source_labels:
+        st.session_state.live_source_radio = "Simulator"
+    source = st.radio("Source", source_labels, horizontal=True, key="live_source_radio")
+    st.session_state.live_source = label_to_code.get(source, "sim")
     code = st.session_state.live_source
-    st.caption(f"Real-protocol sources — MQTT: {'✓ ' + mq_msg if mq_ok else 'unavailable'} · OPC-UA: {'✓ ' + op_msg if op_ok else 'unavailable'}")
+    st.caption(
+        "Demo: keep **Simulator** and press Start — Wi‑Fi is not required. "
+        f"MQTT: {'✓ ' + mq_msg if mq_ok else 'unavailable'} · OPC-UA: {'✓ ' + op_msg if op_ok else 'unavailable'}"
+    )
 
     cfg = dict(st.session_state.get("live_cfg") or {})
     if code == "sim":
         c1, c2, c3 = st.columns(3)
         with c1:
-            n_machines = st.slider("Machines", 2, 8, int(cfg.get("n_machines", 4)))
+            n_machines = st.slider("Machines", 2, 8, int(cfg.get("n_machines", 4)), key="live_n_machines")
         machines = default_machines(n_machines)
         with c2:
-            fail_idx = machines.index(cfg["failing"]) if cfg.get("failing") in machines else 0
-            failing = st.selectbox("Failing asset (drifts to failure)", machines, index=fail_idx)
+            if st.session_state.get("live_failing") not in machines:
+                st.session_state.live_failing = cfg["failing"] if cfg.get("failing") in machines else machines[0]
+            failing = st.selectbox(
+                "Failing asset (drifts to failure)",
+                machines,
+                key="live_failing",
+            )
         with c3:
-            ramp = st.slider("Ramp ticks to failure", 10, 120, int(cfg.get("ramp_ticks", 40)))
+            ramp = st.slider(
+                "Ramp ticks to failure", 10, 120, int(cfg.get("ramp_ticks", 40)), key="live_ramp"
+            )
         cfg.update(
             {"n_machines": n_machines, "machines": machines, "failing": failing, "ramp_ticks": ramp, "freq": 5}
         )
     elif code == "poll":
         cfg["url"] = st.text_input(
-            "CSV feed URL", value=cfg.get("url", "http://localhost:8000/sensor_readings.csv")
+            "CSV feed URL",
+            value=cfg.get("url", "http://localhost:8000/sensor_readings.csv"),
+            key="live_poll_url",
         )
-        cfg["poll_n"] = st.slider("Rows per poll", 5, 200, int(cfg.get("poll_n", 30)))
+        cfg["poll_n"] = st.slider("Rows per poll", 5, 200, int(cfg.get("poll_n", 30)), key="live_poll_n")
         cfg.setdefault("offset", 0)
+        cfg["cache_dir"] = UPLOAD_DIR
+        st.caption("Poll runs in a background thread. localhost with no CSV server will error, not freeze.")
     elif code == "mqtt":
         defaults = mqtt_defaults()
         c1, c2, c3 = st.columns([2, 1, 2])
@@ -3020,23 +3039,32 @@ def page_live_connect():
             cfg["host"] = st.text_input(
                 "Broker host",
                 value=cfg.get("host") or defaults["host"],
+                key="live_mqtt_host",
                 help="MQTT_BROKER env/secret, else 127.0.0.1 (this box — on Render that is the Render VM).",
             )
         with c2:
             cfg["port"] = int(
-                st.number_input("Port", 1, 65535, int(cfg.get("port") or defaults["port"]))
+                st.number_input(
+                    "Port", 1, 65535, int(cfg.get("port") or defaults["port"]), key="live_mqtt_port"
+                )
             )
         with c3:
             cfg["topic"] = st.text_input(
                 "Topic (wildcards OK)",
                 value=cfg.get("topic") or defaults["topic"],
+                key="live_mqtt_topic",
             )
         c4, c5, c6 = st.columns(3)
         with c4:
-            cfg["username"] = st.text_input("Username (optional)", value=cfg.get("username", ""))
+            cfg["username"] = st.text_input(
+                "Username (optional)", value=cfg.get("username", ""), key="live_mqtt_user"
+            )
         with c5:
             cfg["password"] = st.text_input(
-                "Password (optional)", value=cfg.get("password", ""), type="password"
+                "Password (optional)",
+                value=cfg.get("password", ""),
+                type="password",
+                key="live_mqtt_password",
             )
         with c6:
             cfg["stale_after_s"] = int(
@@ -3045,37 +3073,47 @@ def page_live_connect():
                     min_value=1,
                     max_value=3600,
                     value=int(cfg.get("stale_after_s") or defaults["stale_after_s"]),
+                    key="live_mqtt_stale",
                     help="No message for N seconds → stale. MQTT_STALE_SECONDS / LIVE_STALE_SECONDS.",
                 )
             )
         st.caption(mqtt_broker_caption(cfg.get("host"), cfg.get("port"), cfg.get("topic") or defaults["topic"]))
         st.caption(
             'Expects JSON payloads like `{"machine_id":"M-001","temperature":72,"vibration":2.1,'
-            '"pressure":100,"rpm":1500}`.'
+            '"pressure":100,"rpm":1500}`. No broker on localhost → Start fails in ~1s; use Simulator.'
         )
     elif code == "opcua":
         cfg["endpoint"] = st.text_input(
-            "OPC-UA endpoint", value=cfg.get("endpoint", "opc.tcp://127.0.0.1:4840/freeopcua/server/")
+            "OPC-UA endpoint",
+            value=cfg.get("endpoint", "opc.tcp://127.0.0.1:4840/freeopcua/server/"),
+            key="live_opcua_endpoint",
         )
         cfg["node_map_text"] = st.text_area(
             "Node map — `sensor=node_id`, comma-separated",
             value=cfg.get("node_map_text", "temperature=ns=2;i=2, vibration=ns=2;i=3"),
             height=80,
+            key="live_opcua_nodes",
         )
-        cfg["machine_id"] = st.text_input("Machine id label", value=cfg.get("machine_id", "opcua-asset"))
-        st.caption("Each poll reads the listed node IDs. Example node id: `ns=2;i=2`.")
+        cfg["machine_id"] = st.text_input(
+            "Machine id label", value=cfg.get("machine_id", "opcua-asset"), key="live_opcua_machine"
+        )
+        st.caption("Connect runs in a background thread. Empty endpoint will error, not freeze the tab.")
     st.session_state.live_cfg = cfg
 
     ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
     with ctrl1:
-        if st.button("▶ Start live", type="primary", use_container_width=True):
+        if st.button("▶ Start live", type="primary", use_container_width=True, key="live_start"):
             stop_source(st.session_state.get("live_conn_id"))
             st.session_state.live_conn_id = None
             started = True
             try:
-                if code == "poll":
+                if code == "sim":
+                    st.session_state.live_conn_id = start_sim(cfg)
+                elif code == "poll":
                     cfg["offset"] = 0
+                    cfg["cache_dir"] = UPLOAD_DIR
                     st.session_state.live_cfg = cfg
+                    st.session_state.live_conn_id = start_poll(cfg)
                 elif code == "mqtt":
                     st.session_state.live_conn_id = start_mqtt(cfg)
                 elif code == "opcua":
@@ -3090,45 +3128,46 @@ def page_live_connect():
             if started:
                 st.session_state.live_buffer = None
                 st.session_state.live_tick = 0
+                st.session_state.live_asset_states = []
+                st.session_state.live_source_snap = {}
                 st.session_state.live_running = True
+                pump_live_into_session()
                 st.rerun()
     with ctrl2:
-        if st.button("⏸ Stop", use_container_width=True):
+        if st.button("⏸ Stop", use_container_width=True, key="live_stop"):
             st.session_state.live_running = False
             stop_source(st.session_state.get("live_conn_id"))
             st.session_state.live_conn_id = None
             st.rerun()
     with ctrl3:
-        if st.button("Reset buffer", use_container_width=True):
+        if st.button("Reset buffer", use_container_width=True, key="live_reset"):
             st.session_state.live_buffer = None
             st.session_state.live_tick = 0
             st.session_state.live_asset_states = []
             st.rerun()
     with ctrl4:
-        st.session_state.live_sensor_view = st.selectbox(
-            "Live chart",
-            ["temperature", "vibration", "pressure", "rpm"],
-            index=["temperature", "vibration", "pressure", "rpm"].index(
-                st.session_state.get("live_sensor_view", "temperature")
-            ),
-        )
+        live_chart_opts = ["temperature", "vibration", "pressure", "rpm"]
+        if st.session_state.get("live_sensor_view") not in live_chart_opts:
+            st.session_state.live_sensor_view = "temperature"
+        st.selectbox("Live chart", live_chart_opts, key="live_sensor_view")
 
     running = bool(st.session_state.get("live_running"))
-    st.caption(("🟢 streaming (auto-refresh ~2s)" if running else "⚪ stopped") + " — open **3D Twin** to see risk in 3D")
+    st.caption(
+        ("🟢 streaming (background producer, UI refresh ~3s)" if running else "⚪ stopped")
+        + " — Simulator needs no internet. Leaving this page no longer kills the producer."
+    )
 
-    interval = 2.0 if running else None
-    if hasattr(st, "fragment"):
-        st.fragment(run_every=interval)(_live_body)()
+    if running and hasattr(st, "fragment"):
+        st.fragment(run_every=LIVE_FRAGMENT_S)(_live_body)()
     else:
         _live_body()
-        if running:
-            st.warning("Auto-refresh needs Streamlit ≥1.37; click Start again to advance a tick.")
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def page_dashboard_builder():
     st.markdown('<p class="main-header">7. Dashboard</p>', unsafe_allow_html=True)
     pack = active_pack()
+    pump_live_into_session()
     st.markdown(
         f'<p class="sub-header">Reliability board for <b>{pack["label"]}</b> — KPI strip, charts, '
         "insights, 3D twin, CAD slot. Toggle tiles like a Power BI canvas, then export HTML.</p>",
