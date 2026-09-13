@@ -298,6 +298,7 @@ def main() -> int:
         # The stressed machine should carry the highest anomaly rate → sorts first.
         assert status[0]["machine_id"] == "M-001"
         assert status[0]["risk_level"] in {"High", "Medium"}
+        assert status[0]["predicted_rul_days"] is not None and status[0]["predicted_rul_days"] >= 1
         assert "last_seen" in status[0] and "stale" in status[0]
         from src.live_connect import last_seen_and_stale
 
@@ -307,6 +308,55 @@ def main() -> int:
         assert old["stale"] is True
         missing = last_seen_and_stale(None, now=pd.Timestamp("2026-09-09T16:00:00Z"))
         assert missing["stale"] is True and missing["last_seen"] == ""
+
+        from src.ata100 import ata_label
+        from src.live_schema import coerce_live_payload, MAVLINK_EFI_STATUS_225
+
+        assert default_machines(3, "aviation_uav_piston") == ["UAV-01", "UAV-02", "UAV-03"]
+        av_buf = None
+        for tick in range(36):
+            stress = min(1.0, tick / 18.0)
+            batch = simulate_batch(
+                ["UAV-01", "UAV-02", "UAV-03"],
+                tick,
+                failing="UAV-03",
+                stress=stress,
+                freq_seconds=1,
+                pack_id="aviation_uav_piston",
+            )
+            assert "cht" in batch.columns and "egt" in batch.columns
+            assert list(batch["machine_id"]) == ["UAV-01", "UAV-02", "UAV-03"]
+            av_buf = append_to_buffer(av_buf, batch, max_rows=500)
+        av_status = compute_live_status(av_buf, pack_id="aviation_uav_piston")
+        by_id = {s["machine_id"]: s for s in av_status}
+        assert by_id["UAV-03"]["go_nogo"] in {"NO-GO", "CAUTION"}
+        assert by_id["UAV-03"]["predicted_rul_days"] is not None
+        assert by_id["UAV-03"]["ata_chapter"] != "—"
+        assert by_id["UAV-03"]["last_cht"] is not None
+        assert "75-00" in ata_label("Overheating", "CHT high") or "72-00" in ata_label("Overheating", "EGT high")
+        assert "79-00" in ata_label("Low oil", "Oil pressure low")
+        bar = coerce_live_payload(
+            {
+                "uav_id": "UAV-01",
+                "cht": 145,
+                "egt": 685,
+                "oil_pressure": 4.2,
+                "oil_pressure_unit": "bar",
+                "rpm": 5200,
+                "vibration": 0.22,
+                "fuel_flow": 2.8,
+            },
+            pack_id="aviation_uav_piston",
+        )
+        assert bar["machine_id"] == "UAV-01"
+        assert bar["cht"] == 145
+        assert bar["temperature"] == 145
+        assert 55 < float(bar["oil_pressure"]) < 70  # 4.2 bar → psi
+        assert "rpm" in MAVLINK_EFI_STATUS_225 and MAVLINK_EFI_STATUS_225["cylinder_head_temperature"] == "cht"
+        from src.live_connect import flight_log_frame
+
+        log = flight_log_frame(av_buf)
+        assert "raw" not in log.columns and "cht" in log.columns
 
     def test_live_sources() -> None:
         # Upgrade 2 — MQTT / OPC-UA helpers (gates + payload parsing, offline).
@@ -339,13 +389,16 @@ def main() -> int:
         assert row["machine_id"] == "M-9" and row["temperature"] == 70.5 and "timestamp" in row
         row2 = _coerce_row({"temperature": 10}, machine_field="machine_id", ts_field="timestamp", fallback_machine="fb")
         assert row2["machine_id"] == "fb"
-        prev = {k: os.environ.get(k) for k in ("MQTT_BROKER", "MQTT_PORT", "MQTT_TOPIC")}
+        prev = {k: os.environ.get(k) for k in ("MQTT_BROKER", "MQTT_PORT", "MQTT_TOPIC", "MQTT_USER", "MQTT_PASS")}
         try:
             os.environ["MQTT_BROKER"] = "broker.example.test"
             os.environ["MQTT_PORT"] = "1884"
             os.environ["MQTT_TOPIC"] = "hangar/uav/#"
+            os.environ["MQTT_USER"] = "gcs"
+            os.environ["MQTT_PASS"] = "secret"
             d = mqtt_defaults()
             assert d["host"] == "broker.example.test" and d["port"] == 1884 and d["topic"] == "hangar/uav/#"
+            assert d["username"] == "gcs" and d["password"] == "secret"
         finally:
             for k, val in prev.items():
                 if val is None:
@@ -1743,7 +1796,12 @@ def main() -> int:
         assert by_asset["UAV-01"]["physics_fault"] == FAULT_NONE
         assert by_asset["UAV-02"]["physics_fault"] == FAULT_NONE
         assert by_asset["UAV-03"]["physics_fault"] in {FAULT_LOW_OIL, FAULT_OVERHEATING, FAULT_HIGH_VIB}
-        assert "CHT high" in by_asset["UAV-03"]["physics_rule"] or "Oil pressure low" in by_asset["UAV-03"]["physics_rule"]
+        from src.physics_rules import physics_table_rows
+
+        table = physics_table_rows(summarize_physics(scored))
+        assert "ATA-100" in table.columns
+        u3 = table[table["asset"] == "UAV-03"].iloc[0]
+        assert str(u3["ATA-100"]) != "—"
 
         det = AnomalyDetector(contamination=0.08)
         det.fit(scored)

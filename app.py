@@ -56,6 +56,7 @@ from src.live_connect import (
     append_to_buffer,
     compute_live_status,
     default_machines,
+    flight_log_frame,
 )
 from src.live_sources import (
     get_source,
@@ -742,6 +743,26 @@ def load_pack_sample(pack_id: str):
     if pack_id == DEFAULT_PACK_ID and costs.exists():
         register_table("costs", pd.read_csv(costs))
     return df
+
+
+def load_flight_log_into_pipeline(buffer: pd.DataFrame) -> pd.DataFrame:
+    """Bloodstream → brain: stored live rows become the working table."""
+    df = flight_log_frame(buffer)
+    if df is None or df.empty:
+        raise ValueError("Live buffer is empty — start Simulator or MQTT first.")
+    pack_id = active_pack_id()
+    mapping = suggest_mapping(list(df.columns), pack_id=pack_id)
+    mapped = apply_mapping(df, mapping)
+    st.session_state.raw_df = mapped
+    st.session_state.cleaned_df = mapped
+    st.session_state.sensor_mapping = mapping
+    st.session_state.data_loaded = True
+    st.session_state.data_source = "live"
+    st.session_state.predictions = []
+    st.session_state.pack_kpis = {}
+    register_table("sensors", mapped)
+    register_table("live_flight_log", mapped)
+    return mapped
 
 
 # PdM app domain — drives which URL SQL slice presets are offered.
@@ -2903,7 +2924,11 @@ def pump_live_into_session() -> None:
         st.session_state.live_source_snap = {**snap, "error": str(exc)}
         return
     if batch is not None and not batch.empty:
-        st.session_state.live_buffer = append_to_buffer(st.session_state.get("live_buffer"), batch)
+        st.session_state.live_buffer = append_to_buffer(
+            st.session_state.get("live_buffer"),
+            batch,
+            max_rows=int(getattr(config, "LIVE_BUFFER_MAX", 20000) or 20000),
+        )
         st.session_state.live_tick = int(st.session_state.get("live_tick") or 0) + 1
     buffer = st.session_state.get("live_buffer")
     if buffer is None or getattr(buffer, "empty", True):
@@ -2912,6 +2937,9 @@ def pump_live_into_session() -> None:
     st.session_state.live_asset_states = compute_live_status(
         buffer,
         stale_after_s=int(cfg.get("stale_after_s") or 30),
+        pack_id=active_pack_id(),
+        anomaly_detector=st.session_state.get("anomaly_detector"),
+        rul_predictor=st.session_state.get("rul_predictor"),
     )
 
 
@@ -2936,20 +2964,78 @@ def _live_body():
 
     status = st.session_state.get("live_asset_states") or []
     worst = status[0] if status else None
-    m1, m2, m3 = st.columns(3)
+    pack_id = active_pack_id()
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Rows buffered", f"{len(buffer):,}")
     m2.metric("Machines", buffer["machine_id"].nunique() if "machine_id" in buffer.columns else 0)
     if worst:
         m3.metric(
             "Worst asset",
-            f"{worst['machine_id']} · {worst['risk_level']}",
-            f"{worst['anomaly_rate_pct']}% anomalies",
+            f"{worst['machine_id']} · {worst.get('go_nogo') or worst['risk_level']}",
+            f"health {worst.get('health_index', '—')} · {worst['anomaly_rate_pct']}% IF",
+        )
+        hours = worst.get("predicted_rul_hours")
+        days = worst.get("predicted_rul_days")
+        m4.metric(
+            "RUL (proxy / model)",
+            f"{hours} h" if hours is not None else "—",
+            f"~{days} days duty-cycle" if days is not None else None,
+        )
+
+    if worst:
+        st.subheader("Live telemetry (worst / selected stream)")
+        g1, g2, g3, g4, g5, g6 = st.columns(6)
+        g1.metric("RPM", worst.get("last_rpm") if worst.get("last_rpm") is not None else "—")
+        g2.metric("CHT °C", worst.get("last_cht") if worst.get("last_cht") is not None else "—")
+        g3.metric("EGT °C", worst.get("last_egt") if worst.get("last_egt") is not None else "—")
+        g4.metric(
+            "Oil P",
+            worst.get("last_oil_pressure") if worst.get("last_oil_pressure") is not None else "—",
+        )
+        g5.metric("Vibration", worst.get("last_vibration") if worst.get("last_vibration") is not None else "—")
+        g6.metric(
+            "Fuel flow",
+            worst.get("last_fuel_flow") if worst.get("last_fuel_flow") is not None else "—",
+        )
+        st.caption(
+            f"Health **{worst.get('health_index')}** · {worst.get('go_nogo')} · "
+            f"Anomaly {worst.get('risk_level')} ({worst.get('anomaly_rate_pct')}%) · "
+            f"{worst.get('physics_rule') or 'no physics red-line'} · ATA-100 {worst.get('ata_chapter') or '—'}. "
+            "Same physics + Isolation Forest + RUL as **4. Anomaly & RUL** — not a second model."
         )
 
     st.subheader("Live asset status")
-    st.dataframe(pd.DataFrame(status), use_container_width=True)
+    table = pd.DataFrame(status)
+    show_cols = [
+        c
+        for c in (
+            "machine_id",
+            "go_nogo",
+            "health_index",
+            "risk_level",
+            "predicted_rul_hours",
+            "predicted_rul_days",
+            "ata_chapter",
+            "physics_rule",
+            "advisory",
+            "last_cht",
+            "last_egt",
+            "last_oil_pressure",
+            "last_rpm",
+            "anomaly_rate_pct",
+            "stale",
+            "last_seen",
+        )
+        if c in table.columns
+    ]
+    st.dataframe(table[show_cols] if show_cols else table, use_container_width=True)
 
-    sensor = st.session_state.get("live_sensor_view", "temperature")
+    from src.live_schema import live_chart_metrics
+
+    opts = live_chart_metrics(list(buffer.columns), pack_id)
+    sensor = st.session_state.get("live_sensor_view")
+    if sensor not in opts and opts:
+        sensor = opts[0]
     if sensor in buffer.columns and "timestamp" in buffer.columns:
         import plotly.express as px
 
@@ -2962,20 +3048,27 @@ def _live_body():
             title=f"Live {sensor} (last {len(recent)} readings)",
         )
         fig.update_layout(height=340, margin=dict(l=40, r=20, t=48, b=40))
-        # Stable key — a new key every tick remounted Plotly and killed the websocket.
         st.plotly_chart(fig, use_container_width=True, key="live_stream_chart")
 
     tick = st.session_state.get("live_tick")
     nmsg = snap.get("msg_count")
-    st.caption(f"tick {tick} · producer messages {nmsg} · live risk feeds Insights + 3D Twin")
+    st.caption(
+        f"tick {tick} · producer messages {nmsg} · flight log {len(buffer):,} rows "
+        "(feeds Insights + 3D Twin + **Use flight log in pipeline**)"
+    )
 
 
 def page_live_connect():
     st.markdown('<p class="main-header">Live Connect</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Streaming ingest into the PdM pipeline. Simulator runs on this server '
-        "(no hangar, no internet). MQTT/OPC-UA need a reachable broker — they must not freeze the page.</p>",
+        '<p class="sub-header">Ingestion bloodstream into the same PdM brain. Simulator = HIL replay '
+        "(no hangar). MQTT = Mosquitto broker + Paho subscriber. Map / physics / IF / RUL are not rebuilt.</p>",
         unsafe_allow_html=True,
+    )
+    st.caption(
+        "SIH26054: live packet → canonical JSON → physics + Isolation Forest + RUL → GCS gauges. "
+        "Store the sortie (1–4 PM) then **Use flight log in pipeline** for Charts / Dashboard. "
+        "ATA-100 tags sit on physics faults (75 cooling, 79 oil, 72 engine, 73 fuel)."
     )
 
     source_labels = ["Simulator", "Poll CSV URL"]
@@ -3002,14 +3095,19 @@ def page_live_connect():
     )
 
     cfg = dict(st.session_state.get("live_cfg") or {})
+    pack_id = active_pack_id()
+    cfg["pack_id"] = pack_id
     if code == "sim":
         c1, c2, c3 = st.columns(3)
         with c1:
             n_machines = st.slider("Machines", 2, 8, int(cfg.get("n_machines", 4)), key="live_n_machines")
-        machines = default_machines(n_machines)
+        machines = default_machines(n_machines, pack_id)
         with c2:
             if st.session_state.get("live_failing") not in machines:
-                st.session_state.live_failing = cfg["failing"] if cfg.get("failing") in machines else machines[0]
+                prefer = "UAV-03" if "UAV-03" in machines else machines[-1]
+                st.session_state.live_failing = (
+                    cfg["failing"] if cfg.get("failing") in machines else prefer
+                )
             failing = st.selectbox(
                 "Failing asset (drifts to failure)",
                 machines,
@@ -3019,9 +3117,23 @@ def page_live_connect():
             ramp = st.slider(
                 "Ramp ticks to failure", 10, 120, int(cfg.get("ramp_ticks", 40)), key="live_ramp"
             )
+        interval = 1.0 if pack_id == "aviation_uav_piston" else 2.0
         cfg.update(
-            {"n_machines": n_machines, "machines": machines, "failing": failing, "ramp_ticks": ramp, "freq": 5}
+            {
+                "n_machines": n_machines,
+                "machines": machines,
+                "failing": failing,
+                "ramp_ticks": ramp,
+                "freq": 1 if pack_id == "aviation_uav_piston" else 5,
+                "interval_s": interval,
+                "pack_id": pack_id,
+            }
         )
+        if pack_id == "aviation_uav_piston":
+            st.caption(
+                "Aviation HIL: publishes UAV-01… JSON (`uav_id`, CHT, EGT, oil, fuel_flow) through the "
+                "same schema gate as MQTT. Switch pack in the sidebar if you need plant M-001."
+            )
     elif code == "poll":
         cfg["url"] = st.text_input(
             "CSV feed URL",
@@ -3057,14 +3169,18 @@ def page_live_connect():
         c4, c5, c6 = st.columns(3)
         with c4:
             cfg["username"] = st.text_input(
-                "Username (optional)", value=cfg.get("username", ""), key="live_mqtt_user"
+                "Username (optional)",
+                value=cfg.get("username") or defaults.get("username") or "",
+                key="live_mqtt_user",
+                help="MQTT_USER env — never commit .env.",
             )
         with c5:
             cfg["password"] = st.text_input(
                 "Password (optional)",
-                value=cfg.get("password", ""),
+                value=cfg.get("password") or defaults.get("password") or "",
                 type="password",
                 key="live_mqtt_password",
+                help="MQTT_PASS env.",
             )
         with c6:
             cfg["stale_after_s"] = int(
@@ -3077,10 +3193,15 @@ def page_live_connect():
                     help="No message for N seconds → stale. MQTT_STALE_SECONDS / LIVE_STALE_SECONDS.",
                 )
             )
+        cfg["pack_id"] = pack_id
         st.caption(mqtt_broker_caption(cfg.get("host"), cfg.get("port"), cfg.get("topic") or defaults["topic"]))
         st.caption(
-            'Expects JSON payloads like `{"machine_id":"M-001","temperature":72,"vibration":2.1,'
-            '"pressure":100,"rpm":1500}`. No broker on localhost → Start fails in ~1s; use Simulator.'
+            "Paho subscribes here. Expect JSON like "
+            '`{"uav_id":"UAV-01","rpm":5200,"egt":685,"cht":145,"oil_pressure":4.2,'
+            '"oil_pressure_unit":"bar","vibration":0.22,"fuel_flow":2.8}`. '
+            "Schema gate maps uav_id→machine_id and bar→psi. "
+            "No broker on localhost → Start fails in ~1s; use Simulator (same JSON). "
+            "HIL publisher: `python hil_mqtt_publisher.py`."
         )
     elif code == "opcua":
         cfg["endpoint"] = st.text_input(
@@ -3146,10 +3267,39 @@ def page_live_connect():
             st.session_state.live_asset_states = []
             st.rerun()
     with ctrl4:
-        live_chart_opts = ["temperature", "vibration", "pressure", "rpm"]
+        from src.live_schema import live_chart_metrics as _live_metrics
+
+        buf_now = st.session_state.get("live_buffer")
+        cols = list(buf_now.columns) if buf_now is not None and hasattr(buf_now, "columns") else []
+        live_chart_opts = _live_metrics(cols, pack_id) or ["temperature", "vibration", "pressure", "rpm"]
         if st.session_state.get("live_sensor_view") not in live_chart_opts:
-            st.session_state.live_sensor_view = "temperature"
+            st.session_state.live_sensor_view = live_chart_opts[0]
         st.selectbox("Live chart", live_chart_opts, key="live_sensor_view")
+
+    log1, log2 = st.columns([1, 2])
+    with log1:
+        if st.button("Use flight log in pipeline", use_container_width=True, key="live_to_pipeline"):
+            buf = st.session_state.get("live_buffer")
+            try:
+                n = len(load_flight_log_into_pipeline(buf))
+                st.success(
+                    f"Loaded {n:,} live rows into Upload/Map/Detect. Open **3. Map sensors** then **4. Anomaly & RUL**."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+    with log2:
+        buf = st.session_state.get("live_buffer")
+        if buf is not None and not getattr(buf, "empty", True):
+            csv_bytes = flight_log_frame(buf).to_csv(index=False)
+            st.download_button(
+                "Download flight log CSV",
+                data=csv_bytes,
+                file_name="live_flight_log.csv",
+                mime="text/csv",
+                key="live_download_log",
+            )
+        else:
+            st.caption("Flight log empty until Start live.")
 
     running = bool(st.session_state.get("live_running"))
     st.caption(

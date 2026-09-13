@@ -75,6 +75,14 @@ except (TypeError, ValueError):
     MQTT_PORT = 1883
 MQTT_BROKER = _setting("MQTT_BROKER", "127.0.0.1")
 MQTT_TOPIC = _setting("MQTT_TOPIC", "pdm/sensors/#")
+MQTT_USER = _setting("MQTT_USER", "")
+MQTT_PASS = _setting("MQTT_PASS", "")
+try:
+    LIVE_BUFFER_MAX = int(_setting("LIVE_BUFFER_MAX", "20000") or "20000")
+except (TypeError, ValueError):
+    LIVE_BUFFER_MAX = 20000
+if LIVE_BUFFER_MAX < 500:
+    LIVE_BUFFER_MAX = 20000
 
 # CAD region map seed (JSON string or file path). Honest Render path without a DB.
 # CAD_MAP_JSON=

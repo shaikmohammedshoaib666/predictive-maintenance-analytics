@@ -59,22 +59,26 @@ def probe_tcp(host: str, port: int, timeout: float = LOOPBACK_PROBE_S) -> tuple[
         return False, f"{h}:{p} — {exc.__class__.__name__}: {exc}"
 
 
-def _coerce_row(payload: Any, *, machine_field: str, ts_field: str, fallback_machine: str) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        payload = {"value": payload}
-    row: dict[str, Any] = {}
-    ts = payload.get(ts_field)
-    row["timestamp"] = pd.to_datetime(ts, errors="coerce") if ts else pd.Timestamp.utcnow().floor("s")
-    if pd.isna(row["timestamp"]):
-        row["timestamp"] = pd.Timestamp.utcnow().floor("s")
-    mid = payload.get(machine_field)
-    row["machine_id"] = str(mid) if mid not in (None, "") else fallback_machine
-    for c in SENSOR_COLS:
-        if c in payload:
-            try:
-                row[c] = float(payload[c])
-            except (TypeError, ValueError):
-                pass
+def _coerce_row(
+    payload: Any,
+    *,
+    machine_field: str,
+    ts_field: str,
+    fallback_machine: str,
+    pack_id: Optional[str] = None,
+    topic_fallback: Optional[str] = None,
+) -> dict[str, Any]:
+    from src.live_schema import coerce_live_payload
+
+    row = coerce_live_payload(
+        payload,
+        machine_field=machine_field,
+        ts_field=ts_field,
+        fallback_machine=fallback_machine,
+        pack_id=pack_id,
+        topic_fallback=topic_fallback or fallback_machine,
+    )
+    row.pop("raw", None)
     return row
 
 
@@ -97,12 +101,14 @@ class SimSource:
         freq_seconds: int = 5,
         interval_s: float = LIVE_TICK_S,
         max_buffer: int = 5000,
+        pack_id: Optional[str] = None,
     ):
         self.machines = list(machines) or ["M-001"]
         self.failing = failing or self.machines[0]
         self.ramp_ticks = max(1, int(ramp_ticks))
         self.freq_seconds = int(freq_seconds)
         self.interval_s = float(interval_s)
+        self.pack_id = pack_id
         self.connected = True
         self.error: Optional[str] = None
         self.msg_count = 0
@@ -122,6 +128,7 @@ class SimSource:
             failing=self.failing,
             stress=stress,
             freq_seconds=self.freq_seconds,
+            pack_id=self.pack_id,
         )
         rows = batch.to_dict(orient="records")
         with self._lock:
@@ -233,6 +240,7 @@ class MqttSource:
         machine_field: str = "machine_id",
         ts_field: str = "timestamp",
         max_buffer: int = 5000,
+        pack_id: Optional[str] = None,
     ):
         self.host = host
         self.port = int(port)
@@ -241,6 +249,7 @@ class MqttSource:
         self.password = password
         self.machine_field = machine_field
         self.ts_field = ts_field
+        self.pack_id = pack_id
         self._buf: deque[dict[str, Any]] = deque(maxlen=max_buffer)
         self._lock = threading.Lock()
         self._client = None
@@ -290,6 +299,8 @@ class MqttSource:
                 machine_field=self.machine_field,
                 ts_field=self.ts_field,
                 fallback_machine=(msg.topic.split("/")[-1] or "mqtt-asset"),
+                pack_id=self.pack_id,
+                topic_fallback=(msg.topic.split("/")[-1] or "mqtt-asset"),
             )
             with self._lock:
                 self._buf.append(row)
@@ -398,13 +409,17 @@ def _register(prefix: str, src: Any) -> str:
 def start_sim(cfg: dict[str, Any]) -> str:
     from src.live_connect import default_machines
 
-    machines = list(cfg.get("machines") or default_machines(int(cfg.get("n_machines") or 4)))
+    machines = list(
+        cfg.get("machines")
+        or default_machines(int(cfg.get("n_machines") or 4), cfg.get("pack_id"))
+    )
     src = SimSource(
         machines,
         failing=cfg.get("failing"),
         ramp_ticks=int(cfg.get("ramp_ticks") or 40),
         freq_seconds=int(cfg.get("freq") or 5),
         interval_s=float(cfg.get("interval_s") or LIVE_TICK_S),
+        pack_id=cfg.get("pack_id"),
     )
     src.start()
     return _register("sim", src)
@@ -432,6 +447,7 @@ def start_mqtt(cfg: dict[str, Any]) -> str:
         username=cfg.get("username", ""),
         password=cfg.get("password", ""),
         machine_field=cfg.get("machine_field", "machine_id"),
+        pack_id=cfg.get("pack_id"),
     )
     src.start()
     return _register("mqtt", src)

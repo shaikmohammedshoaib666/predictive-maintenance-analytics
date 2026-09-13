@@ -137,4 +137,13 @@ def mqtt_defaults() -> dict[str, Any]:
         stale = 30
     if stale < 1:
         stale = 30
-    return {"host": host, "port": port, "topic": topic, "stale_after_s": stale}
+    user = _setting("MQTT_USER", "") or ""
+    password = _setting("MQTT_PASS", "") or _setting("MQTT_PASSWORD", "") or ""
+    return {
+        "host": host,
+        "port": port,
+        "topic": topic,
+        "stale_after_s": stale,
+        "username": user,
+        "password": password,
+    }

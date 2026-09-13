@@ -69,7 +69,8 @@ RULE_LABELS = {
 LAYER1_CAPTION = (
     "Physics rules = known red-line (deterministic piston limits). "
     "Isolation Forest = slow degradation. Forest is still the default ML — "
-    "rules do not replace it."
+    "rules do not replace it. ATA-100 chapters (75 cooling, 79 oil, 72 engine) "
+    "are ground-health tags, not a certified AMM."
 )
 
 # Aviation pack — demo CSV scales (see module docstring). User e.g. EGT>800,
@@ -326,14 +327,19 @@ def physics_fault_region(fault: Optional[str]) -> str:
 
 
 def physics_table_rows(summary: Optional[list[dict[str, Any]]] = None) -> pd.DataFrame:
-    """UI table: asset → rule fired → human label."""
+    """UI table: asset → rule fired → human label → ATA-100."""
+    from src.ata100 import ata_label
+
     rows = []
     for item in summary or []:
+        rule = item.get(FLAG_RULE) or "—"
+        fault = item.get(FLAG_FAULT) or FAULT_NONE
         rows.append(
             {
                 "asset": item.get("machine_id"),
-                "rule fired": item.get(FLAG_RULE) or "—",
+                "rule fired": rule,
                 "human label": item.get(FLAG_LABEL) or FAULT_NONE,
+                "ATA-100": ata_label(fault, item.get(FLAG_RULE)),
             }
         )
     return pd.DataFrame(rows)
