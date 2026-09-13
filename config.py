@@ -83,6 +83,12 @@ except (TypeError, ValueError):
     LIVE_BUFFER_MAX = 20000
 if LIVE_BUFFER_MAX < 500:
     LIVE_BUFFER_MAX = 20000
+try:
+    LIVE_REFRESH_SECONDS = int(_setting("LIVE_REFRESH_SECONDS", "0") or "0")
+except (TypeError, ValueError):
+    LIVE_REFRESH_SECONDS = 0
+if LIVE_REFRESH_SECONDS < 0:
+    LIVE_REFRESH_SECONDS = 0
 
 # CAD region map seed (JSON string or file path). Honest Render path without a DB.
 # CAD_MAP_JSON=

@@ -1165,7 +1165,7 @@ PAGE_LIVE: list[tuple[str, str, str, str]] = [
     (
         "Live {sensor} (last N readings)",
         "Chart",
-        "Native line_chart of the selected sensor (last 80 rows). Buffer updates continuously; screen auto-refreshes every 60s (stable @st.fragment at module level) or click Refresh live. Never st.fragment(run_every=x)(_live_body)().",
+        "Native line_chart of the selected sensor (last 80 rows). Buffer updates in background; click Refresh live to redraw (auto-refresh off unless LIVE_REFRESH_SECONDS set). Never st.fragment(run_every=x)(_live_body)().",
         "_live_body() · app.py",
     ),
 ]

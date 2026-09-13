@@ -2904,9 +2904,11 @@ def page_cad_twin():
 # HTTP 429 was NOT “simulator too fast”. The reconnect storm was:
 #     st.fragment(run_every=3)(_live_body)()
 # inside the page — a NEW fragment id on every parent rerun.
-# Official pattern only: @st.fragment(run_every=N) on a function defined ONCE
-# at module level, then call _live_body(). LIVE_REFRESH_SECONDS default 60;
-# 0 = Refresh-button only. Never default 3. Producer still ticks ~LIVE_TICK_S.
+# Official pattern only: @st.fragment(run_every=N) on a named function defined
+# ONCE at module level, then call _live_body(). NEVER st.fragment(...)(_fn)().
+# LIVE_REFRESH_SECONDS default 0 (Refresh-button only) so Render free can finish
+# first paint before the proxy timeout. Fragment only when env > 0.
+# Producer still ticks ~LIVE_TICK_S in the background.
 
 
 _LIVE_REFRESH_S = live_refresh_seconds()
@@ -2935,11 +2937,10 @@ def pump_live_into_session() -> None:
         st.session_state.live_source_snap = {**snap, "error": str(exc)}
         return
     if batch is not None and not batch.empty:
-        # Cap like the last stable Live Connect (concat of a huge log freezes the tab).
         st.session_state.live_buffer = append_to_buffer(
             st.session_state.get("live_buffer"),
             batch,
-            max_rows=1500,
+            max_rows=int(getattr(config, "LIVE_BUFFER_MAX", 20000) or 20000),
         )
         st.session_state.live_tick = int(st.session_state.get("live_tick") or 0) + 1
     buffer = st.session_state.get("live_buffer")
@@ -3353,14 +3354,14 @@ def page_live_connect():
     )
     if _LIVE_REFRESH_S > 0:
         st.caption(
-            f"{status} — buffer updates continuously; screen auto-refreshes every "
-            f"{_LIVE_REFRESH_S}s or click **Refresh live**. "
+            f"{status} — buffer updates in background; click **Refresh live** to redraw "
+            f"(auto-refresh every {_LIVE_REFRESH_S}s via `LIVE_REFRESH_SECONDS`). "
             "MQTT connects only on Start live, never on page load."
         )
     else:
         st.caption(
-            f"{status} — buffer updates continuously; click **Refresh live**. "
-            "Auto-refresh is off (`LIVE_REFRESH_SECONDS=0`). "
+            f"{status} — buffer updates in background; click **Refresh live** to redraw "
+            "(auto-refresh off unless `LIVE_REFRESH_SECONDS` is set). "
             "MQTT connects only on Start live, never on page load."
         )
 

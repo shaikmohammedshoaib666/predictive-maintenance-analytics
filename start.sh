@@ -7,6 +7,12 @@ PORT="${PORT:-10000}"
 export STREAMLIT_SERVER_PORT="${PORT}"
 export STREAMLIT_SERVER_ADDRESS="0.0.0.0"
 export STREAMLIT_SERVER_HEADLESS="true"
+# Refresh-button only unless the operator set a non-default interval.
+# A leftover LIVE_REFRESH_SECONDS=60 from the old blueprint 504s Live Connect.
+if [ "${LIVE_REFRESH_SECONDS:-0}" = "60" ]; then
+  export LIVE_REFRESH_SECONDS=0
+fi
+export LIVE_REFRESH_SECONDS="${LIVE_REFRESH_SECONDS:-0}"
 
 exec streamlit run app.py \
   --server.port "${PORT}" \

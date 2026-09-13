@@ -357,11 +357,14 @@ def main() -> int:
 
         log = flight_log_frame(av_buf)
         assert "raw" not in log.columns and "cht" in log.columns
-        assert live_refresh_seconds({}) == 60
+        assert live_refresh_seconds({}) == 0
         assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "0"}) == 0
         assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "60"}) == 60
-        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "bogus"}) == 60
+        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "60", "RENDER": "true"}) == 0
+        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "bogus"}) == 0
         import src.live_connect as live_mod
+
+        assert live_mod.DEFAULT_LIVE_REFRESH_S == 0
 
         assert hasattr(live_mod, "go_nogo") and hasattr(live_mod, "ata_label")
         assert "cht" in LIVE_SCORE_SENSORS or "temperature" in LIVE_SCORE_SENSORS
@@ -2825,7 +2828,8 @@ def main() -> int:
         from streamlit.testing.v1 import AppTest
 
         # Regression: inline st.fragment(run_every=...)(_live_body)() remounts every
-        # parent rerun → HTTP 429. Module-level @st.fragment(run_every=_LIVE_REFRESH_S) is OK.
+        # parent rerun → HTTP 429. If auto-refresh is on, only a stable module-level
+        # @st.fragment(run_every=_LIVE_REFRESH_S) is allowed — never inside the page.
         live_src = (ROOT / "app.py").read_text(encoding="utf-8")
         code_only = "\n".join(
             ln for ln in live_src.splitlines() if not ln.lstrip().startswith("#")
@@ -2833,9 +2837,14 @@ def main() -> int:
         assert ")(_live_body)()" not in code_only
         assert "_run_live_fragment" not in live_src
         assert "st.fragment(run_every=_LIVE_REFRESH_S)" in live_src
+        assert "if _LIVE_REFRESH_S > 0" in live_src
         page_src = live_src.split("def page_live_connect", 1)[-1]
         assert "st.fragment(" not in page_src
+        render_src = (ROOT / "render.yaml").read_text(encoding="utf-8")
+        assert "LIVE_REFRESH_SECONDS" in render_src
+        assert 'value: "0"' in render_src.split("LIVE_REFRESH_SECONDS", 1)[1][:80]
 
+        # AppTest must not sit on a fragment timer (default is already 0).
         prev_refresh = os.environ.get("LIVE_REFRESH_SECONDS")
         os.environ["LIVE_REFRESH_SECONDS"] = "0"
 

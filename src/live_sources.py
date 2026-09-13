@@ -265,13 +265,16 @@ class MqttSource:
 
         from src.ops_meta import is_loopback_host
 
-        if is_loopback_host(self.host):
-            ok, why = probe_tcp(self.host, self.port, timeout=LOOPBACK_PROBE_S)
-            if not ok:
-                raise ConnectionError(
-                    f"No MQTT broker on {self.host}:{self.port} ({why}). "
-                    "Use **Simulator** — localhost is this app box, not hangar telemetry."
-                )
+        ok, why = probe_tcp(self.host, self.port, timeout=LOOPBACK_PROBE_S)
+        if not ok:
+            hint = (
+                "Use **Simulator** — localhost is this app box, not hangar telemetry."
+                if is_loopback_host(self.host)
+                else "Use **Simulator** (no broker required) or a reachable hangar broker."
+            )
+            raise ConnectionError(
+                f"No MQTT broker on {self.host}:{self.port} ({why}). {hint}"
+            )
 
         client = mqtt.Client(client_id=f"pdm-{uuid.uuid4().hex[:8]}", clean_session=True)
         if self.username:

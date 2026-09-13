@@ -33,12 +33,14 @@ DEFAULT_STALE_AFTER_S = 30
 AVIATION_PACK = "aviation_uav_piston"
 # Keep IF + physics off the growing flight log so the Streamlit fragment cannot freeze.
 LIVE_SCORE_TAIL = 240
-# UI auto-refresh only. Simulator/MQTT still tick on LIVE_TICK_S (~2s). 0 = Refresh button only.
-DEFAULT_LIVE_REFRESH_S = 60
+# UI auto-refresh only. Simulator/MQTT still tick on LIVE_TICK_S (~2s).
+# Default 0 = Refresh live button only (required on Render free — a fragment
+# websocket + gauges/IF/table can exceed the proxy timeout → Chrome 504).
+DEFAULT_LIVE_REFRESH_S = 0
 
 
 def live_refresh_seconds(env: Optional[Any] = None) -> int:
-    """Seconds between *screen* refreshes. Default 60. ``0`` disables auto-refresh.
+    """Seconds between *screen* refreshes. Default 0 (Refresh button only).
 
     Never default to 3 — that was confused with the HTTP 429 reconnect storm
     (``st.fragment(run_every=3)(_live_body)()`` minting a new fragment each parent rerun).
@@ -64,6 +66,16 @@ def live_refresh_seconds(env: Optional[Any] = None) -> int:
         n = DEFAULT_LIVE_REFRESH_S
     if n < 0:
         return 0
+    # Previous blueprint shipped 60, which holds a fragment websocket and can
+    # 504 Live Connect on Render free. Treat leftover dashboard 60 as off.
+    if n == 60:
+        render = ""
+        if hasattr(source, "get"):
+            render = str(source.get("RENDER", "") or "")
+        if not render:
+            render = os.environ.get("RENDER", "")
+        if str(render).lower() in {"true", "1"}:
+            return 0
     return n
 
 
@@ -332,7 +344,6 @@ def compute_live_status(
 
     counts = buffer.groupby("machine_id").size().to_dict()
     window = buffer.tail(LIVE_SCORE_TAIL) if len(buffer) > LIVE_SCORE_TAIL else buffer
-    latest = window
     if "timestamp" in window.columns:
         latest = window.sort_values("timestamp").groupby("machine_id", as_index=False).tail(1)
     else:
@@ -351,7 +362,7 @@ def compute_live_status(
     if "machine_id" in annotated.columns:
         for _, rec in annotated.iterrows():
             phys_by_id[str(rec.get("machine_id"))] = rec
-    for m, grp in buffer.groupby("machine_id"):
+    for m, grp in window.groupby("machine_id"):
         rate = float(rates.get(m, 0.0))
         raw = grp.iloc[-1]
         last = phys_by_id.get(str(m), raw)

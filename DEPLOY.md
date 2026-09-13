@@ -51,6 +51,7 @@ Same pattern as Analytics Forge v2. Free instance has enough RAM to `pip install
    - `PYTHON_VERSION` = `3.11.9`
    - `GEMINI_API_KEY` = your key
    - `GEMINI_MODEL` = `gemini-3.6-flash`
+   - `LIVE_REFRESH_SECONDS` = `0` (Refresh live only — do **not** set `3`)
 5. Create Web Service. Wait 5–15 minutes on the free plan.
 
 ### New Blueprint (uses root `render.yaml`)
@@ -71,10 +72,14 @@ After it is live, the URL looks like: `https://predictive-maintenance-analytics.
 2. **Branch** = `main` (not a stale feature branch)
 3. **Auto-Deploy** = **Yes**
 4. **Start Command** = `bash start.sh` (not `streamlit run app.py` — `$PORT` would miss)
-5. **Environment** includes `LIVE_REFRESH_SECONDS=60` (do **not** set `3`)
+5. **Environment** includes `LIVE_REFRESH_SECONDS=0` (do **not** set `3`; do not default `60` on free)
 6. If Auto-Deploy is off or stuck: **Manual Deploy** → **Deploy latest commit**
 
 Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s.
+
+**Live Connect on Render free:** first paint must finish without a Streamlit fragment websocket. `LIVE_REFRESH_SECONDS=0` is Refresh-button only; the simulator still ticks in the background. A remaining **504** on Chrome with a good network is the Render proxy timeout (not Wi‑Fi). Demo path: Aviation pack → **Live Connect** → Simulator → **Start live** → **Refresh live**. MQTT `127.0.0.1` is the Render VM — Start MQTT fail-fasts; use Simulator.
+
+**Streamlit Community Cloud:** often more reliable for Streamlit websockets on the free tier (no Render 504 proxy). This repo’s full pip stack (LlamaIndex / Optuna / sklearn) can **OOM** there on Python 3.14, so Render remains the recommended public host for the complete ML app. If Live Connect 504s persist on Render free, Community Cloud is the lighter Live demo host — trim extras or accept a slimmer install.
 
 ### Start command
 
@@ -136,6 +141,8 @@ APS_MODEL_URN=...
 | Gemini 404 | Use **Test Gemini**. Default model is `gemini-3.6-flash`; old aliases remap. |
 | RUL looks too confident | Need a real `failure_within_days` label; sample labels are simulated |
 | Port scan timeout | Start command must be `bash start.sh` (not `streamlit run app.py`) |
+| Live Connect Connecting / Chrome 504 | Confirm `LIVE_REFRESH_SECONDS=0`. Do not use inline `st.fragment(...)(_fn)()`. Click **Refresh live**. Remaining 504 on Render free = host proxy timeout. |
+| MQTT Start hangs / localhost | Render `127.0.0.1` is the VM, not the hangar. Start MQTT fail-fasts; use Simulator. |
 | Build OOM / Python 3.14 | Confirm `PYTHON_VERSION=3.11.9`; do not use Streamlit Cloud for this repo |
 | Email still in demo mode | Set env above and `EMAIL_DEMO_MODE=false` |
 | CAD upload fails around 200 MB | Streamlit default was 200 MB; this repo sets `server.maxUploadSize = 300` in `.streamlit/config.toml`. If Render/proxy still blocks, zip the STEP and upload the zip, or export a lighter STEP from Fusion. |
