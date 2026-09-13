@@ -2934,13 +2934,16 @@ def pump_live_into_session() -> None:
     if buffer is None or getattr(buffer, "empty", True):
         return
     cfg = st.session_state.get("live_cfg") or {}
-    st.session_state.live_asset_states = compute_live_status(
-        buffer,
-        stale_after_s=int(cfg.get("stale_after_s") or 30),
-        pack_id=active_pack_id(),
-        anomaly_detector=st.session_state.get("anomaly_detector"),
-        rul_predictor=st.session_state.get("rul_predictor"),
-    )
+    try:
+        st.session_state.live_asset_states = compute_live_status(
+            buffer,
+            stale_after_s=int(cfg.get("stale_after_s") or 30),
+            pack_id=active_pack_id(),
+            anomaly_detector=None,
+            rul_predictor=None,
+        )
+    except Exception as exc:
+        st.session_state.live_source_snap = {**snap, "error": f"live score: {exc}"}
 
 
 def _live_body():
@@ -2964,7 +2967,6 @@ def _live_body():
 
     status = st.session_state.get("live_asset_states") or []
     worst = status[0] if status else None
-    pack_id = active_pack_id()
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Rows buffered", f"{len(buffer):,}")
     m2.metric("Machines", buffer["machine_id"].nunique() if "machine_id" in buffer.columns else 0)
@@ -3028,27 +3030,37 @@ def _live_body():
         )
         if c in table.columns
     ]
-    st.dataframe(table[show_cols] if show_cols else table, use_container_width=True)
+    df_kw: dict[str, Any] = {
+        "use_container_width": True,
+        "key": "live_asset_table",
+    }
+    try:
+        import inspect
 
-    from src.live_schema import live_chart_metrics
+        if "on_select" in inspect.signature(st.dataframe).parameters:
+            df_kw["on_select"] = "ignore"
+    except Exception:
+        pass
+    st.dataframe(table[show_cols] if show_cols else table, **df_kw)
 
-    opts = live_chart_metrics(list(buffer.columns), pack_id)
-    sensor = st.session_state.get("live_sensor_view")
-    if sensor not in opts and opts:
-        sensor = opts[0]
-    if sensor in buffer.columns and "timestamp" in buffer.columns:
-        import plotly.express as px
-
-        recent = buffer.tail(200)
-        fig = px.line(
-            recent,
-            x="timestamp",
-            y=sensor,
-            color="machine_id",
-            title=f"Live {sensor} (last {len(recent)} readings)",
-        )
-        fig.update_layout(height=340, margin=dict(l=40, r=20, t=48, b=40))
-        st.plotly_chart(fig, use_container_width=True, key="live_stream_chart")
+    sensor = st.session_state.get("live_sensor_view") or "temperature"
+    if sensor not in buffer.columns:
+        for cand in ("cht", "temperature", "egt", "vibration", "rpm"):
+            if cand in buffer.columns:
+                sensor = cand
+                break
+    if sensor in buffer.columns and "timestamp" in buffer.columns and "machine_id" in buffer.columns:
+        recent = buffer.tail(80)[["timestamp", "machine_id", sensor]].copy()
+        recent[sensor] = pd.to_numeric(recent[sensor], errors="coerce")
+        try:
+            piv = (
+                recent.dropna(subset=[sensor])
+                .drop_duplicates(subset=["timestamp", "machine_id"], keep="last")
+                .pivot(index="timestamp", columns="machine_id", values=sensor)
+            )
+            st.line_chart(piv, height=320)
+        except Exception:
+            st.caption(f"Live {sensor} — waiting for a clean window.")
 
     tick = st.session_state.get("live_tick")
     nmsg = snap.get("msg_count")
@@ -3056,6 +3068,18 @@ def _live_body():
         f"tick {tick} · producer messages {nmsg} · flight log {len(buffer):,} rows "
         "(feeds Insights + 3D Twin + **Use flight log in pipeline**)"
     )
+
+
+def _run_live_fragment() -> None:
+    """Stable fragment entry — do not wrap `_live_body` inline (new wrapper → reconnect loop)."""
+    _live_body()
+
+
+if hasattr(st, "fragment"):
+    try:
+        _run_live_fragment = st.fragment(run_every=LIVE_FRAGMENT_S)(_run_live_fragment)
+    except Exception:
+        pass
 
 
 def page_live_connect():
@@ -3253,7 +3277,6 @@ def page_live_connect():
                 st.session_state.live_source_snap = {}
                 st.session_state.live_running = True
                 pump_live_into_session()
-                st.rerun()
     with ctrl2:
         if st.button("⏸ Stop", use_container_width=True, key="live_stop"):
             st.session_state.live_running = False
@@ -3267,13 +3290,11 @@ def page_live_connect():
             st.session_state.live_asset_states = []
             st.rerun()
     with ctrl4:
-        from src.live_schema import live_chart_metrics as _live_metrics
-
-        buf_now = st.session_state.get("live_buffer")
-        cols = list(buf_now.columns) if buf_now is not None and hasattr(buf_now, "columns") else []
-        live_chart_opts = _live_metrics(cols, pack_id) or ["temperature", "vibration", "pressure", "rpm"]
-        if st.session_state.get("live_sensor_view") not in live_chart_opts:
-            st.session_state.live_sensor_view = live_chart_opts[0]
+        live_chart_opts = (
+            ["cht", "egt", "oil_pressure", "vibration", "rpm", "temperature", "fuel_flow"]
+            if pack_id == "aviation_uav_piston"
+            else ["temperature", "vibration", "pressure", "rpm"]
+        )
         st.selectbox("Live chart", live_chart_opts, key="live_sensor_view")
 
     log1, log2 = st.columns([1, 2])
@@ -3308,7 +3329,7 @@ def page_live_connect():
     )
 
     if running and hasattr(st, "fragment"):
-        st.fragment(run_every=LIVE_FRAGMENT_S)(_live_body)()
+        _run_live_fragment()
     else:
         _live_body()
 

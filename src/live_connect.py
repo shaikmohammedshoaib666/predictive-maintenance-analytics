@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.ata100 import ata_label
+from src.assets import go_nogo
 from src.live_schema import LIVE_SCORE_SENSORS, coerce_live_payload
 from src.pack_kpis import remaining_mission_hours, risk_to_health
 from src.physics_rules import (
@@ -30,6 +31,8 @@ from src.physics_rules import (
 SENSOR_COLS = ["temperature", "vibration", "pressure", "rpm"]
 DEFAULT_STALE_AFTER_S = 30
 AVIATION_PACK = "aviation_uav_piston"
+# Keep IF + physics off the growing flight log so the Streamlit fragment cannot freeze.
+LIVE_SCORE_TAIL = 240
 
 # Healthy baseline (mean, std) per sensor — plant pack.
 _BASE = {
@@ -250,9 +253,10 @@ def _score_anomaly_rates(
     from sklearn.ensemble import IsolationForest
 
     iso = IsolationForest(
-        n_estimators=50,
+        n_estimators=30,
         contamination=contamination,
         random_state=42,
+        n_jobs=1,
     )
     flagged = iso.fit_predict(work[sensor_cols].values) == -1
     work = work.assign(_anom=flagged)
@@ -293,20 +297,32 @@ def compute_live_status(
     if buffer is None or buffer.empty or "machine_id" not in buffer.columns:
         return []
 
-    annotated = apply_physics_rules(buffer, pack_id)
+    counts = buffer.groupby("machine_id").size().to_dict()
+    window = buffer.tail(LIVE_SCORE_TAIL) if len(buffer) > LIVE_SCORE_TAIL else buffer
+    latest = window
+    if "timestamp" in window.columns:
+        latest = window.sort_values("timestamp").groupby("machine_id", as_index=False).tail(1)
+    else:
+        latest = window.groupby("machine_id", as_index=False).tail(1)
+    annotated = apply_physics_rules(latest, pack_id)
     rates = _score_anomaly_rates(
-        annotated,
+        window,
         contamination=contamination,
         detector=anomaly_detector,
     )
-    rul_map = _rul_lookup(annotated, rul_predictor)
+    rul_map = _rul_lookup(window, rul_predictor)
 
     out: list[dict[str, Any]] = []
     clock = now if now is not None else pd.Timestamp.utcnow()
-    for m, grp in annotated.groupby("machine_id"):
+    phys_by_id: dict[str, Any] = {}
+    if "machine_id" in annotated.columns:
+        for _, rec in annotated.iterrows():
+            phys_by_id[str(rec.get("machine_id"))] = rec
+    for m, grp in buffer.groupby("machine_id"):
         rate = float(rates.get(m, 0.0))
-        last = grp.iloc[-1]
-        last_ts = last.get("timestamp") if "timestamp" in grp.columns else None
+        raw = grp.iloc[-1]
+        last = phys_by_id.get(str(m), raw)
+        last_ts = raw.get("timestamp") if "timestamp" in grp.columns else None
         seen = last_seen_and_stale(last_ts, now=clock, stale_after_s=stale_after_s)
         fault = str(last.get(FLAG_FAULT) or FAULT_NONE)
         rule = str(last.get(FLAG_RULE) or "")
@@ -318,8 +334,6 @@ def compute_live_status(
         if alert and rate >= 12:
             risk = "High"
         action = advisory_action(risk_level=risk, physics_fault=fault)
-        from src.assets import go_nogo
-
         decision = go_nogo(action, risk)
         rul_days = rul_map.get(str(m))
         if rul_days is None:
@@ -344,17 +358,17 @@ def compute_live_status(
                 "physics_label": label,
                 "ata_chapter": ata_label(fault, rule),
                 "advisory": action,
-                "n_rows": int(len(grp)),
-                "last_temperature": _safe_float(last.get("temperature")),
-                "last_vibration": _safe_float(last.get("vibration")),
-                "last_rpm": _safe_float(last.get("rpm")),
-                "last_cht": _safe_float(last.get("cht") if "cht" in last else last.get("temperature")),
-                "last_egt": _safe_float(last.get("egt")),
+                "n_rows": int(counts.get(m, len(grp))),
+                "last_temperature": _safe_float(raw.get("temperature")),
+                "last_vibration": _safe_float(raw.get("vibration")),
+                "last_rpm": _safe_float(raw.get("rpm")),
+                "last_cht": _safe_float(raw.get("cht") if "cht" in raw.index else raw.get("temperature")),
+                "last_egt": _safe_float(raw.get("egt")),
                 "last_oil_pressure": _safe_float(
-                    last.get("oil_pressure") if "oil_pressure" in last else last.get("pressure")
+                    raw.get("oil_pressure") if "oil_pressure" in raw.index else raw.get("pressure")
                 ),
-                "last_oil_temp": _safe_float(last.get("oil_temp")),
-                "last_fuel_flow": _safe_float(last.get("fuel_flow")),
+                "last_oil_temp": _safe_float(raw.get("oil_temp")),
+                "last_fuel_flow": _safe_float(raw.get("fuel_flow")),
                 "last_seen": seen["last_seen"],
                 "last_seen_age_s": seen["last_seen_age_s"],
                 "stale": seen["stale"],
