@@ -2812,6 +2812,42 @@ def main() -> int:
         assert "UAV-01:" in ins and "UAV-02:" in ins and "UAV-03:" in ins
         assert PACKS["aviation_uav_piston"]["sih"] == "SIH26054"
 
+    def test_live_connect_apptest() -> None:
+        """Aviation pack → Live Connect Simulator → UAV JSON + health/ATA in session."""
+        from streamlit.testing.v1 import AppTest
+
+        def _errs(at) -> list[str]:
+            return [getattr(e, "message", str(e)) for e in at.exception]
+
+        app_path = str(ROOT / "app.py")
+        at = AppTest.from_file(app_path, default_timeout=120)
+        at.run()
+        assert not _errs(at), "initial: " + "; ".join(_errs(at))
+        next(b for b in at.button if b.label == "Load pack demo").click().run()
+        assert at.session_state["industry_pack"] == "aviation_uav_piston"
+        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+        radio.set_value("Live Connect").run()
+        assert not _errs(at), "Live nav: " + "; ".join(_errs(at))
+        start = next(b for b in at.button if "Start live" in (b.label or ""))
+        start.click().run()
+        assert not _errs(at), "Start live: " + "; ".join(_errs(at))
+        assert at.session_state["live_running"] is True
+        buf = at.session_state["live_buffer"]
+        assert buf is not None and len(buf) >= 2
+        ids = set(buf["machine_id"].astype(str))
+        assert {"UAV-01", "UAV-02"} <= ids or any(str(i).startswith("UAV-") for i in ids)
+        assert "cht" in buf.columns and "egt" in buf.columns
+        states = at.session_state["live_asset_states"]
+        assert states
+        assert all("go_nogo" in s and "health_index" in s for s in states)
+        assert any(s.get("predicted_rul_days") not in (None, "") for s in states)
+        to_pipe = next(b for b in at.button if "flight log" in (b.label or "").lower())
+        to_pipe.click().run()
+        assert not _errs(at), "flight log: " + "; ".join(_errs(at))
+        cleaned = at.session_state["cleaned_df"]
+        assert cleaned is not None and "cht" in cleaned.columns
+        assert at.session_state["data_source"] == "live"
+
     def test_cad_map_secret_seed() -> None:
         import json
         import tempfile
@@ -3089,6 +3125,7 @@ def main() -> int:
     check("cad_twin_apptest_layout", test_cad_twin_apptest_layout)
     check("upload_load_buttons_apptest", test_upload_load_buttons_apptest)
     check("sih_physics_apptest", test_sih_physics_apptest)
+    check("live_connect_apptest", test_live_connect_apptest)
     check("cad_map_secret_seed", test_cad_map_secret_seed)
     check("health_events_and_assets", test_health_events_and_assets)
     check("last_session_pack", test_last_session_pack)
