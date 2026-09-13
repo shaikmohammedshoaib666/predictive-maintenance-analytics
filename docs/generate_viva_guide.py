@@ -1165,7 +1165,7 @@ PAGE_LIVE: list[tuple[str, str, str, str]] = [
     (
         "Live {sensor} (last N readings)",
         "Chart",
-        "Plotly line of the selected sensor, last 300 rows, colored by machine_id. Auto-refresh ~2 s via st.fragment when running.",
+        "Native line_chart of the selected sensor (last 80 rows). Click Refresh live to drain the background producer — no st.fragment auto-reload.",
         "_live_body() · app.py",
     ),
 ]

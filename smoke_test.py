@@ -2816,6 +2816,10 @@ def main() -> int:
         """Aviation pack → Live Connect Simulator → UAV JSON + health/ATA in session."""
         from streamlit.testing.v1 import AppTest
 
+        # Regression: inline st.fragment(run_every=...) remounts every parent rerun → HTTP 429.
+        live_src = (ROOT / "app.py").read_text(encoding="utf-8")
+        assert "st.fragment(" not in live_src
+
         def _errs(at) -> list[str]:
             return [getattr(e, "message", str(e)) for e in at.exception]
 
@@ -2832,6 +2836,9 @@ def main() -> int:
         start.click().run()
         assert not _errs(at), "Start live: " + "; ".join(_errs(at))
         assert at.session_state["live_running"] is True
+        refresh = next(b for b in at.button if (b.label or "") == "Refresh live")
+        refresh.click().run()
+        assert not _errs(at), "Refresh live: " + "; ".join(_errs(at))
         buf = at.session_state["live_buffer"]
         assert buf is not None and len(buf) >= 2
         ids = set(buf["machine_id"].astype(str))

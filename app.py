@@ -2899,7 +2899,10 @@ def page_cad_twin():
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
-LIVE_FRAGMENT_S = 3.0
+# Do NOT auto-refresh this page. Decorating the live body with Streamlit
+# fragments + run_every mints a new fragment id on every parent rerun, then
+# reconnects on a timer until Render/proxy returns HTTP 429
+# (browser: Connecting… / CONNECTION FAILED).
 
 
 def pump_live_into_session() -> None:
@@ -3235,7 +3238,7 @@ def page_live_connect():
         st.caption("Connect runs in a background thread. Empty endpoint will error, not freeze the tab.")
     st.session_state.live_cfg = cfg
 
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1, 1, 1, 1, 1.4])
     with ctrl1:
         if st.button("▶ Start live", type="primary", use_container_width=True, key="live_start"):
             stop_source(st.session_state.get("live_conn_id"))
@@ -3281,6 +3284,10 @@ def page_live_connect():
             st.session_state.live_asset_states = []
             st.rerun()
     with ctrl4:
+        if st.button("Refresh live", use_container_width=True, key="live_refresh"):
+            pump_live_into_session()
+            st.rerun()
+    with ctrl5:
         live_chart_opts = (
             ["cht", "egt", "oil_pressure", "vibration", "rpm", "temperature", "fuel_flow"]
             if pack_id == "aviation_uav_piston"
@@ -3317,18 +3324,17 @@ def page_live_connect():
                 key="live_download_log",
             )
         else:
-            st.caption("Start live, then Prepare CSV. File is built once — not on every 3s refresh.")
+            st.caption("Start live, then Prepare CSV. File is built once — not on every page load.")
 
     running = bool(st.session_state.get("live_running"))
     st.caption(
-        ("🟢 streaming (background producer, UI refresh ~3s)" if running else "⚪ stopped")
-        + " — Simulator needs no internet. Leaving this page no longer kills the producer."
+        ("🟢 streaming (background producer)" if running else "⚪ stopped")
+        + " — click **Refresh live** to pull new ticks into the gauges. "
+        "No auto-reload (that looped the websocket until the host returned HTTP 429). "
+        "Simulator needs no internet. Leaving this page does not kill the producer."
     )
 
-    if running and hasattr(st, "fragment"):
-        st.fragment(run_every=LIVE_FRAGMENT_S)(_live_body)()
-    else:
-        _live_body()
+    _live_body()
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
