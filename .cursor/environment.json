@@ -1,0 +1,17 @@
+{
+  "name": "Predictive Maintenance Analytics",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "streamlit",
+      "command": "source .venv/bin/activate && streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true",
+      "description": "Streamlit dev server for the PdM app on http://localhost:8501"
+    }
+  ],
+  "ports": [
+    {
+      "name": "streamlit",
+      "port": 8501
+    }
+  ]
+}

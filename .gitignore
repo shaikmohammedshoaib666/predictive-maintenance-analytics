@@ -15,7 +15,10 @@ data/*
 !data/cad_region_map.example.json
 *.db
 .DS_Store
-.cursor/
+.cursor/*
+!.cursor/settings.json
+!.cursor/environment.json
+!.cursor/install.sh
 .streamlit/secrets.toml
 docs/*.pdf
 !docs/PdM_SIH26054_Student_Viva_Guide.pdf
