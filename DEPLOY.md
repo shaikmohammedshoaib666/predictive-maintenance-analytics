@@ -65,6 +65,15 @@ Same pattern as Analytics Forge v2. Free instance has enough RAM to `pip install
 
 After it is live, the URL looks like: `https://predictive-maintenance-analytics.onrender.com`
 
+**Auto-deploy:** Render must track **`main`**. Pushing `main` (this repo’s Git auto-deploy path) should start a new deploy. If the public site is still on an old SHA (for example `cbe5382` while Live Connect 429/SIH lives at `80ca09c`+):
+
+1. Dashboard → **predictive-maintenance-analytics** → **Settings** → **Build & Deploy**
+2. **Branch** = `main` (not a stale feature branch)
+3. **Auto-Deploy** = **Yes**
+4. **Start Command** = `bash start.sh` (not `streamlit run app.py` — `$PORT` would miss)
+5. **Environment** includes `LIVE_REFRESH_SECONDS=60` (do **not** set `3`)
+6. If Auto-Deploy is off or stuck: **Manual Deploy** → **Deploy latest commit**
+
 Free tier sleeps after ~15 min idle; first open after sleep can take ~30–60s.
 
 ### Start command

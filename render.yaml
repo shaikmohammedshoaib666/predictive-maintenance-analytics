@@ -1,7 +1,7 @@
 # Render Blueprint — public host for Predictive Maintenance Analytics
 # Deploy: https://dashboard.render.com/blueprints → New Blueprint Instance
 # Repo: shaikmohammedshoaib666/predictive-maintenance-analytics
-# Branch: main
+# Branch: main (Git auto-deploy). Do not point this service at Streamlit Community Cloud.
 # Full stack (LlamaIndex, Optuna, sklearn, Gemini) — use Render, not Streamlit Cloud.
 
 services:
@@ -11,6 +11,7 @@ services:
     plan: free
     region: oregon
     branch: main
+    autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: bash start.sh
     healthCheckPath: /_stcore/health
@@ -29,6 +30,14 @@ services:
         value: "1883"
       - key: MQTT_TOPIC
         value: "pdm/sensors/#"
+      - key: MQTT_USER
+        sync: false
+      - key: MQTT_PASS
+        sync: false
+      - key: LIVE_REFRESH_SECONDS
+        value: "60"
+      - key: LIVE_BUFFER_MAX
+        value: "20000"
       # Optional: paste exported cad_region_map.json (Render disk resets on redeploy).
       - key: CAD_MAP_JSON
         sync: false
