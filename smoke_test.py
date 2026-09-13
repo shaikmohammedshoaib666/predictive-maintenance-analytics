@@ -353,10 +353,18 @@ def main() -> int:
         assert bar["temperature"] == 145
         assert 55 < float(bar["oil_pressure"]) < 70  # 4.2 bar → psi
         assert "rpm" in MAVLINK_EFI_STATUS_225 and MAVLINK_EFI_STATUS_225["cylinder_head_temperature"] == "cht"
-        from src.live_connect import flight_log_frame
+        from src.live_connect import LIVE_SCORE_SENSORS, flight_log_frame, live_refresh_seconds
 
         log = flight_log_frame(av_buf)
         assert "raw" not in log.columns and "cht" in log.columns
+        assert live_refresh_seconds({}) == 60
+        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "0"}) == 0
+        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "60"}) == 60
+        assert live_refresh_seconds({"LIVE_REFRESH_SECONDS": "bogus"}) == 60
+        import src.live_connect as live_mod
+
+        assert hasattr(live_mod, "go_nogo") and hasattr(live_mod, "ata_label")
+        assert "cht" in LIVE_SCORE_SENSORS or "temperature" in LIVE_SCORE_SENSORS
 
     def test_live_sources() -> None:
         # Upgrade 2 — MQTT / OPC-UA helpers (gates + payload parsing, offline).
@@ -2816,44 +2824,61 @@ def main() -> int:
         """Aviation pack → Live Connect Simulator → UAV JSON + health/ATA in session."""
         from streamlit.testing.v1 import AppTest
 
-        # Regression: inline st.fragment(run_every=...) remounts every parent rerun → HTTP 429.
+        # Regression: inline st.fragment(run_every=...)(_live_body)() remounts every
+        # parent rerun → HTTP 429. Module-level @st.fragment(run_every=_LIVE_REFRESH_S) is OK.
         live_src = (ROOT / "app.py").read_text(encoding="utf-8")
-        assert "st.fragment(" not in live_src
+        code_only = "\n".join(
+            ln for ln in live_src.splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert ")(_live_body)()" not in code_only
+        assert "_run_live_fragment" not in live_src
+        assert "st.fragment(run_every=_LIVE_REFRESH_S)" in live_src
+        page_src = live_src.split("def page_live_connect", 1)[-1]
+        assert "st.fragment(" not in page_src
+
+        prev_refresh = os.environ.get("LIVE_REFRESH_SECONDS")
+        os.environ["LIVE_REFRESH_SECONDS"] = "0"
 
         def _errs(at) -> list[str]:
             return [getattr(e, "message", str(e)) for e in at.exception]
 
-        app_path = str(ROOT / "app.py")
-        at = AppTest.from_file(app_path, default_timeout=120)
-        at.run()
-        assert not _errs(at), "initial: " + "; ".join(_errs(at))
-        next(b for b in at.button if b.label == "Load pack demo").click().run()
-        assert at.session_state["industry_pack"] == "aviation_uav_piston"
-        radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
-        radio.set_value("Live Connect").run()
-        assert not _errs(at), "Live nav: " + "; ".join(_errs(at))
-        start = next(b for b in at.button if "Start live" in (b.label or ""))
-        start.click().run()
-        assert not _errs(at), "Start live: " + "; ".join(_errs(at))
-        assert at.session_state["live_running"] is True
-        refresh = next(b for b in at.button if (b.label or "") == "Refresh live")
-        refresh.click().run()
-        assert not _errs(at), "Refresh live: " + "; ".join(_errs(at))
-        buf = at.session_state["live_buffer"]
-        assert buf is not None and len(buf) >= 2
-        ids = set(buf["machine_id"].astype(str))
-        assert {"UAV-01", "UAV-02"} <= ids or any(str(i).startswith("UAV-") for i in ids)
-        assert "cht" in buf.columns and "egt" in buf.columns
-        states = at.session_state["live_asset_states"]
-        assert states
-        assert all("go_nogo" in s and "health_index" in s for s in states)
-        assert any(s.get("predicted_rul_days") not in (None, "") for s in states)
-        to_pipe = next(b for b in at.button if "flight log" in (b.label or "").lower())
-        to_pipe.click().run()
-        assert not _errs(at), "flight log: " + "; ".join(_errs(at))
-        cleaned = at.session_state["cleaned_df"]
-        assert cleaned is not None and "cht" in cleaned.columns
-        assert at.session_state["data_source"] == "live"
+        try:
+            app_path = str(ROOT / "app.py")
+            at = AppTest.from_file(app_path, default_timeout=120)
+            at.run()
+            assert not _errs(at), "initial: " + "; ".join(_errs(at))
+            next(b for b in at.button if b.label == "Load pack demo").click().run()
+            assert at.session_state["industry_pack"] == "aviation_uav_piston"
+            radio = next(r for r in at.radio if "Pipeline" in (r.label or ""))
+            radio.set_value("Live Connect").run()
+            assert not _errs(at), "Live nav: " + "; ".join(_errs(at))
+            start = next(b for b in at.button if "Start live" in (b.label or ""))
+            start.click().run()
+            assert not _errs(at), "Start live: " + "; ".join(_errs(at))
+            assert at.session_state["live_running"] is True
+            refresh = next(b for b in at.button if (b.label or "") == "Refresh live")
+            refresh.click().run()
+            assert not _errs(at), "Refresh live: " + "; ".join(_errs(at))
+            buf = at.session_state["live_buffer"]
+            assert buf is not None and len(buf) >= 2
+            ids = set(buf["machine_id"].astype(str))
+            assert {"UAV-01", "UAV-02"} <= ids or any(str(i).startswith("UAV-") for i in ids)
+            assert "cht" in buf.columns and "egt" in buf.columns
+            states = at.session_state["live_asset_states"]
+            assert states
+            assert all("go_nogo" in s and "health_index" in s for s in states)
+            assert any(s.get("predicted_rul_days") not in (None, "") for s in states)
+            to_pipe = next(b for b in at.button if "flight log" in (b.label or "").lower())
+            to_pipe.click().run()
+            assert not _errs(at), "flight log: " + "; ".join(_errs(at))
+            cleaned = at.session_state["cleaned_df"]
+            assert cleaned is not None and "cht" in cleaned.columns
+            assert at.session_state["data_source"] == "live"
+        finally:
+            if prev_refresh is None:
+                os.environ.pop("LIVE_REFRESH_SECONDS", None)
+            else:
+                os.environ["LIVE_REFRESH_SECONDS"] = prev_refresh
 
     def test_cad_map_secret_seed() -> None:
         import json

@@ -30,6 +30,7 @@ LIVE_TICK_S = 2.0
 
 
 def mqtt_available() -> tuple[bool, str]:
+    """Import-only gate. Does **not** open a broker socket (that happens on Start live)."""
     try:
         import paho.mqtt  # noqa: F401
     except Exception as exc:

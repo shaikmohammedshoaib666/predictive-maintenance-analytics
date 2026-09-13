@@ -33,6 +33,39 @@ DEFAULT_STALE_AFTER_S = 30
 AVIATION_PACK = "aviation_uav_piston"
 # Keep IF + physics off the growing flight log so the Streamlit fragment cannot freeze.
 LIVE_SCORE_TAIL = 240
+# UI auto-refresh only. Simulator/MQTT still tick on LIVE_TICK_S (~2s). 0 = Refresh button only.
+DEFAULT_LIVE_REFRESH_S = 60
+
+
+def live_refresh_seconds(env: Optional[Any] = None) -> int:
+    """Seconds between *screen* refreshes. Default 60. ``0`` disables auto-refresh.
+
+    Never default to 3 — that was confused with the HTTP 429 reconnect storm
+    (``st.fragment(run_every=3)(_live_body)()`` minting a new fragment each parent rerun).
+    """
+    import os
+
+    source = env if env is not None else os.environ
+    raw = ""
+    if hasattr(source, "get"):
+        raw = str(source.get("LIVE_REFRESH_SECONDS", "") or "")
+    if not raw and env is None:
+        try:
+            import config as _cfg
+
+            raw = str(_cfg._setting("LIVE_REFRESH_SECONDS", "") or "")
+        except Exception:
+            raw = ""
+    if not raw:
+        raw = str(DEFAULT_LIVE_REFRESH_S)
+    try:
+        n = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        n = DEFAULT_LIVE_REFRESH_S
+    if n < 0:
+        return 0
+    return n
+
 
 # Healthy baseline (mean, std) per sensor — plant pack.
 _BASE = {

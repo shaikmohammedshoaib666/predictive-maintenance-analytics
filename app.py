@@ -57,8 +57,10 @@ from src.live_connect import (
     compute_live_status,
     default_machines,
     flight_log_frame,
+    live_refresh_seconds,
 )
 from src.live_sources import (
+    LIVE_TICK_S,
     get_source,
     mqtt_available,
     opcua_available,
@@ -2899,10 +2901,15 @@ def page_cad_twin():
 
 
 # ── Live Connect (Layer 4) ────────────────────────────────────────────────────
-# Do NOT auto-refresh this page. Decorating the live body with Streamlit
-# fragments + run_every mints a new fragment id on every parent rerun, then
-# reconnects on a timer until Render/proxy returns HTTP 429
-# (browser: Connecting… / CONNECTION FAILED).
+# HTTP 429 was NOT “simulator too fast”. The reconnect storm was:
+#     st.fragment(run_every=3)(_live_body)()
+# inside the page — a NEW fragment id on every parent rerun.
+# Official pattern only: @st.fragment(run_every=N) on a function defined ONCE
+# at module level, then call _live_body(). LIVE_REFRESH_SECONDS default 60;
+# 0 = Refresh-button only. Never default 3. Producer still ticks ~LIVE_TICK_S.
+
+
+_LIVE_REFRESH_S = live_refresh_seconds()
 
 
 def pump_live_into_session() -> None:
@@ -2951,7 +2958,7 @@ def pump_live_into_session() -> None:
         st.session_state.live_source_snap = {**snap, "error": f"live score: {exc}"}
 
 
-def _live_body():
+def _render_live_body() -> None:
     pump_live_into_session()
     running = bool(st.session_state.get("live_running"))
     buffer = st.session_state.get("live_buffer")
@@ -3075,6 +3082,18 @@ def _live_body():
     )
 
 
+if _LIVE_REFRESH_S > 0:
+
+    @st.fragment(run_every=_LIVE_REFRESH_S)
+    def _live_body() -> None:
+        _render_live_body()
+
+else:
+
+    def _live_body() -> None:
+        _render_live_body()
+
+
 def page_live_connect():
     st.markdown('<p class="main-header">Live Connect</p>', unsafe_allow_html=True)
     st.markdown(
@@ -3134,7 +3153,7 @@ def page_live_connect():
             ramp = st.slider(
                 "Ramp ticks to failure", 10, 120, int(cfg.get("ramp_ticks", 40)), key="live_ramp"
             )
-        interval = 1.0 if pack_id == "aviation_uav_piston" else 2.0
+        interval = float(LIVE_TICK_S)
         cfg.update(
             {
                 "n_machines": n_machines,
@@ -3327,12 +3346,23 @@ def page_live_connect():
             st.caption("Start live, then Prepare CSV. File is built once — not on every page load.")
 
     running = bool(st.session_state.get("live_running"))
-    st.caption(
-        ("🟢 streaming (background producer)" if running else "⚪ stopped")
-        + " — click **Refresh live** to pull new ticks into the gauges. "
-        "No auto-reload (that looped the websocket until the host returned HTTP 429). "
-        "Simulator needs no internet. Leaving this page does not kill the producer."
+    status = (
+        f"🟢 streaming (background producer ~{LIVE_TICK_S:.0f}s ticks)"
+        if running
+        else "⚪ stopped"
     )
+    if _LIVE_REFRESH_S > 0:
+        st.caption(
+            f"{status} — buffer updates continuously; screen auto-refreshes every "
+            f"{_LIVE_REFRESH_S}s or click **Refresh live**. "
+            "MQTT connects only on Start live, never on page load."
+        )
+    else:
+        st.caption(
+            f"{status} — buffer updates continuously; click **Refresh live**. "
+            "Auto-refresh is off (`LIVE_REFRESH_SECONDS=0`). "
+            "MQTT connects only on Start live, never on page load."
+        )
 
     _live_body()
 
