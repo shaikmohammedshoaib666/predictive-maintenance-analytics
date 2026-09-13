@@ -286,6 +286,7 @@ def init_session_state():
         "live_source_radio": "Simulator",
         "live_conn_id": None,
         "live_source_snap": {},
+        "live_csv": "",
         # Cleaning engine (pandas | Polars)
         "clean_engine": "pandas",
         "dashboard_tiles": None,
@@ -2924,10 +2925,11 @@ def pump_live_into_session() -> None:
         st.session_state.live_source_snap = {**snap, "error": str(exc)}
         return
     if batch is not None and not batch.empty:
+        # Cap like the last stable Live Connect (concat of a huge log freezes the tab).
         st.session_state.live_buffer = append_to_buffer(
             st.session_state.get("live_buffer"),
             batch,
-            max_rows=int(getattr(config, "LIVE_BUFFER_MAX", 20000) or 20000),
+            max_rows=1500,
         )
         st.session_state.live_tick = int(st.session_state.get("live_tick") or 0) + 1
     buffer = st.session_state.get("live_buffer")
@@ -3068,18 +3070,6 @@ def _live_body():
         f"tick {tick} · producer messages {nmsg} · flight log {len(buffer):,} rows "
         "(feeds Insights + 3D Twin + **Use flight log in pipeline**)"
     )
-
-
-def _run_live_fragment() -> None:
-    """Stable fragment entry — do not wrap `_live_body` inline (new wrapper → reconnect loop)."""
-    _live_body()
-
-
-if hasattr(st, "fragment"):
-    try:
-        _run_live_fragment = st.fragment(run_every=LIVE_FRAGMENT_S)(_run_live_fragment)
-    except Exception:
-        pass
 
 
 def page_live_connect():
@@ -3277,6 +3267,7 @@ def page_live_connect():
                 st.session_state.live_source_snap = {}
                 st.session_state.live_running = True
                 pump_live_into_session()
+                st.rerun()
     with ctrl2:
         if st.button("⏸ Stop", use_container_width=True, key="live_stop"):
             st.session_state.live_running = False
@@ -3309,9 +3300,15 @@ def page_live_connect():
             except Exception as exc:
                 st.error(str(exc))
     with log2:
-        buf = st.session_state.get("live_buffer")
-        if buf is not None and not getattr(buf, "empty", True):
-            csv_bytes = flight_log_frame(buf).to_csv(index=False)
+        if st.button("Prepare flight log CSV", use_container_width=True, key="live_prep_csv"):
+            buf = st.session_state.get("live_buffer")
+            try:
+                st.session_state.live_csv = flight_log_frame(buf).to_csv(index=False)
+            except Exception as exc:
+                st.session_state.live_csv = ""
+                st.error(str(exc))
+        csv_bytes = st.session_state.get("live_csv") or ""
+        if csv_bytes:
             st.download_button(
                 "Download flight log CSV",
                 data=csv_bytes,
@@ -3320,7 +3317,7 @@ def page_live_connect():
                 key="live_download_log",
             )
         else:
-            st.caption("Flight log empty until Start live.")
+            st.caption("Start live, then Prepare CSV. File is built once — not on every 3s refresh.")
 
     running = bool(st.session_state.get("live_running"))
     st.caption(
@@ -3329,7 +3326,7 @@ def page_live_connect():
     )
 
     if running and hasattr(st, "fragment"):
-        _run_live_fragment()
+        st.fragment(run_every=LIVE_FRAGMENT_S)(_live_body)()
     else:
         _live_body()
 
