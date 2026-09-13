@@ -2841,8 +2841,7 @@ def main() -> int:
         page_src = live_src.split("def page_live_connect", 1)[-1]
         assert "st.fragment(" not in page_src
         render_src = (ROOT / "render.yaml").read_text(encoding="utf-8")
-        assert "LIVE_REFRESH_SECONDS" in render_src
-        assert 'value: "0"' in render_src.split("LIVE_REFRESH_SECONDS", 1)[1][:80]
+        assert '- key: LIVE_REFRESH_SECONDS\n        value: "0"' in render_src
 
         # AppTest must not sit on a fragment timer (default is already 0).
         prev_refresh = os.environ.get("LIVE_REFRESH_SECONDS")
